@@ -1,0 +1,8 @@
+# Dependencies
+/node_modules/
+
+# Local tools
+/Tools/
+
+# Local profile
+/.messenger-playwright-profile/
