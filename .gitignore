@@ -4,5 +4,29 @@
 # Local tools
 /Tools/
 
-# Local profile
+# Build and test output
+/dist/
+/coverage/
+
+# Local runtime state and browser profiles
+/.runtime/
+/runtime/
+/state/
 /.messenger-playwright-profile/
+
+# Local credentials and session data
+.env
+.env.*
+!.env.example
+*.local
+*.session
+*.session.*
+*.pin
+*.key
+*.pem
+*api-key*
+*api_key*
+*credentials*
+*secrets*
+*recovery-pin*
+*recovery_pin*

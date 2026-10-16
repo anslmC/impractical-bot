@@ -2,49 +2,59 @@
 
 ## Status and Scope
 
-This is a provisional design baseline for an experimental project, not a fixed specification. Keep implementation incremental and minimal; update this document when implementation evidence or practical constraints justify a change. The initial version is intended to run as one local Node.js process and one bot instance. It does not require a server, database, dashboard, or plugin system.
+This document describes intended architecture, not implemented behavior. M0 establishes the Node.js and TypeScript development foundation. The repository does not yet implement CLI commands, browser discovery or lifecycle management, configuration persistence, bot orchestration, message automation, or AI integration.
 
-## Proposed Flow
+The application is intended to be a local Node.js CLI, initially running as one local process and one bot instance. It does not require a server, database, or plugin system. A terminal status dashboard may be added for bot operation.
 
-1. Playwright connects over CDP to an already-running Brave instance, using the dedicated profile planned at `%LOCALAPPDATA%\impractical-bot\brave-profile`. The existing experiments use `http://127.0.0.1:9222`.
-2. The browser-interaction responsibility identifies and retains the intended Facebook Messages tab and conversation. It must not silently switch either.
-3. The message-scanning responsibility reads rendered messages and determines sender and direction. If either is unknown, bot logic must not generate or send a response to that message.
-4. Bot logic determines whether a response is appropriate and prepares input for generation.
-5. AI integration requests a draft from the planned NVIDIA API. This integration does not exist yet.
-6. Response validation and the approval/safety responsibility check the draft before sending. The exact validation rules and approval workflow remain undecided.
-7. The sending responsibility interacts with the composer only for the verified conversation. If a send may have occurred but its outcome is uncertain, do not automatically retry.
+## Intended Responsibilities
 
-These are logical responsibilities, not a commitment to separate modules or files. The implementation should follow the smallest structure that preserves the boundaries and safety rules.
+- **CLI (`src/cli/`, `bin/`):** route commands and present terminal interaction; it does not own browser discovery or bot policy.
+- **Configuration (`src/config/`):** load and validate local settings. Configuration, credentials, and runtime state belong outside the repository, under the user's local application-data directory.
+- **Browser (`src/browser/`):** discover Brave, Google Chrome, or Microsoft Edge, prepare a dedicated profile, launch the selected browser with remote debugging bound to loopback, and connect Playwright through that CDP endpoint. Firefox is out of scope.
+- **Bot (`src/bot/`):** coordinate bot lifecycle and the message/AI workflow without taking ownership of browser-discovery details.
+- **Messages (`src/messages/`):** identify the intended conversation, gather rendered messages, and apply message identity and freshness checks.
+- **AI (`src/ai/`):** eventually request a response draft from an AI service. This component must not independently access browser controls, files, or secrets; access to necessary data must be mediated by its caller.
+
+These are responsibility boundaries, not a commitment to speculative modules or extra processes. Keep implementation incremental and minimal.
+
+## Intended Command Flow
+
+1. `impbot init` will discover a supported browser, prepare its dedicated profile and runtime environment, launch it with the appropriate loopback debugging configuration, then automatically open the terminal configuration menu.
+2. `impbot config` will open the same menu on demand, stopping the active bot first when necessary.
+3. `impbot start` will provide the manual bot-start command and eventually establish a terminal status dashboard.
+4. `impbot stop` will stop the bot and the browser process launched and managed by this application. It must not terminate unrelated browser instances.
+5. The browser responsibility will connect Playwright to the managed browser through its loopback-only CDP endpoint. It will retain the intended tab and conversation and will not silently switch either.
+6. Message handling will only provide context when message identity and direction are sufficiently known. AI generation, when added, will produce a proposal; it will not authorize sending.
+7. A separate validation and approval step must precede sending. If a send may have occurred but the outcome is uncertain, the application must not retry automatically.
 
 ## Safety Invariants
 
-- Never automatically retry a send after an uncertain outcome; doing so could duplicate a message.
-- Do not respond when sender or message direction is unknown.
+- Track ownership of the browser process launched by the application; never stop unrelated browser instances.
+- Keep CDP bound to loopback and connect only to the managed browser.
 - Do not silently switch browser tabs or conversations.
-- Validate generated responses before sending; generation alone is not authorization to send.
-- Keep the initial deployment to a single local bot instance.
+- Do not act on messages with unknown sender, direction, or conversation identity.
+- Discard or revalidate stale proposals when the conversation or relevant message context changes.
+- Require validation and approval before sending; AI output alone is not authorization.
+- Never automatically retry a send after an uncertain outcome, to avoid duplicate messages.
+- Keep credentials, recovery PINs, API keys, session data, and runtime state outside the repository.
+- The AI component must not independently access browser controls, files, or secrets.
 
 ## Milestones
 
-The sequence below is a provisional plan. M1 is the next milestone; later milestone scope may be revised as the browser and Messenger behavior are verified.
-
-- **M1 - Browser connection:** connect to the existing Brave instance through Playwright CDP.
+- **M0 - Project foundation:** establish TypeScript, linting, Node's built-in test runner, repository structure, and accurate project documentation.
+- **M1 - Browser and CLI lifecycle:** implement supported-browser discovery and managed launch, local configuration foundations, and the `init`, `config`, `start`, and `stop` command flows with process ownership safeguards.
 - **M2 - Conversation identity:** identify the intended tab and conversation and detect unexpected changes.
-- **M3 - Message scanning:** read rendered messages and classify sender and direction.
-- **M4 - Bot logic:** decide when a response is appropriate and prepare generation context.
-- **M5 - AI integration:** add NVIDIA API response generation.
-- **M6 - Safety and sending:** validate generated text, apply approval/safety checks, and send through the verified composer.
-- **M7 - End-to-end hardening:** exercise the integrated workflow and failure handling before expanding use.
+- **M3 - Message handling:** gather rendered messages and classify sender and direction; do not act on unknown identity.
+- **M4 - Bot orchestration:** decide when to prepare a response and ensure proposals are tied to current context.
+- **M5 - AI integration:** add NVIDIA integration and AI response generation. Dynamic message gathering and AI response generation remain future work.
+- **M6 - Safety and sending:** validate proposals, apply the approval gate, and send only through the verified conversation; do not automatically retry uncertain sends.
+- **M7 - End-to-end hardening:** verify the integrated workflow and failure handling before expanding use.
 
-## Existing Evidence
+## Existing Experiments and Open Questions
 
-Local experiments in `Tools/test-backread.js` and `Tools/test-composer.js` attach to `127.0.0.1:9222`, look for an already-open Facebook Messages page, and inspect rendered message elements. The backread experiment collects message IDs, labels, and text with bounded scrolling. The composer experiment fills a draft and requires an explicit `SEND` confirmation before it attempts to click a uniquely matched, visible, enabled send control. These experiments are not production components; `Tools/` is currently ignored by Git.
+The JavaScript scripts in `Tools/` are independent experiments, not production components. They connect to an already-running browser at `127.0.0.1:9222`; navigation, PIN entry, composer, and bounded backread experiments provide limited source-level examples. They do not verify managed browser startup, process ownership, complete history retrieval, or production behavior.
 
-## Limitations and Open Questions
-
-- Messenger DOM selectors and accessible labels may change; the experiments only inspect currently rendered elements and do not establish complete history retrieval.
-- Brave CDP startup, profile ownership, and behavior when Brave is unavailable or has multiple relevant tabs need to be established in M1.
-- Reliable conversation identity, message completeness/order, and sender/direction classification need verification beyond the current experiments.
-- NVIDIA API details, credentials handling, request limits, and failure behavior are not defined or implemented.
-- Response validation criteria and the approval workflow are not defined. A successful click is not proof of message delivery.
-- Setup, operation, recovery after uncertain sends, and production-level test strategy remain to be defined.
+- Messenger selectors and accessible labels may change. Conversation identity, message completeness and ordering, sender/direction classification, approval criteria, and recovery after uncertain sends require implementation and verification.
+- Browser installation discovery, dedicated-profile behavior, browser-process ownership, and recovery when a supported browser is unavailable remain to be implemented and verified.
+- NVIDIA API details, credential handling, request limits, and failure behavior are not defined or implemented. Dynamic message gathering and AI response generation remain future work.
+- A successful send-control click is not proof of message delivery. Setup, operation, and production-level failure testing remain to be defined.
