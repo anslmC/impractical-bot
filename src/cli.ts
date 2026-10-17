@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { loadConfiguration } from './config/configuration.js';
 
 type Output = (message: string) => void;
 
@@ -16,20 +17,57 @@ Options:
   -h, --help     Show this help
   -v, --version  Show the version`;
 
-function handleInit(writeOutput: Output): void {
-  writeOutput('The init command is not implemented yet.');
+function handleInit(writeError: Output): number {
+  writeError(
+    'Initialization is unavailable: browser discovery is not implemented. No configuration was written.',
+  );
+  return 1;
 }
 
-function handleConfig(writeOutput: Output): void {
-  writeOutput('The config command is not implemented yet.');
+function handleConfig(writeOutput: Output, writeError: Output, filePath?: string): number {
+  let result;
+  try {
+    result = loadConfiguration(filePath);
+  } catch (error) {
+    writeError(
+      `Unable to load configuration: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return 1;
+  }
+
+  if (result.status === 'missing') {
+    writeOutput('Configuration has not been initialized. No configuration file was found.');
+    return 0;
+  }
+  if (result.status === 'malformed') {
+    writeError(`Configuration is malformed: ${result.message}`);
+    return 1;
+  }
+  if (result.status === 'unsupported-version') {
+    writeError(`Configuration schema version ${result.version} is not supported.`);
+    return 1;
+  }
+
+  const configuration = result.configuration;
+  writeOutput([
+    'Current configuration:',
+    `  Version: ${configuration.version}`,
+    `  Browser: ${configuration.browser}`,
+    `  Executable: ${configuration.executablePath}`,
+    `  Profile: ${configuration.profilePath}`,
+    `  CDP port: ${configuration.cdpPort ?? 'not configured'}`,
+  ].join('\n'));
+  return 0;
 }
 
-function handleStart(writeOutput: Output): void {
+function handleStart(writeOutput: Output): number {
   writeOutput('The start command is not implemented yet.');
+  return 0;
 }
 
-function handleStop(writeOutput: Output): void {
+function handleStop(writeOutput: Output): number {
   writeOutput('The stop command is not implemented yet.');
+  return 0;
 }
 
 function getVersion(): string {
@@ -44,6 +82,7 @@ export function runCli(
   args: string[],
   writeOutput: Output = message => console.log(message),
   writeError: Output = message => console.error(message),
+  configurationFilePath?: string,
 ): number {
   const [command, ...remainingArgs] = args;
 
@@ -62,11 +101,11 @@ export function runCli(
     return 1;
   }
 
-  const handlers: Record<string, (output: Output) => void> = {
-    init: handleInit,
-    config: handleConfig,
-    start: handleStart,
-    stop: handleStop,
+  const handlers: Record<string, () => number> = {
+    init: () => handleInit(writeError),
+    config: () => handleConfig(writeOutput, writeError, configurationFilePath),
+    start: () => handleStart(writeOutput),
+    stop: () => handleStop(writeOutput),
   };
   const handler = command ? handlers[command] : undefined;
 
@@ -75,8 +114,7 @@ export function runCli(
     return 1;
   }
 
-  handler(writeOutput);
-  return 0;
+  return handler();
 }
 
 if (require.main === module) {
