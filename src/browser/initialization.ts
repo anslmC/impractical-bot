@@ -1,4 +1,5 @@
 import { statSync } from 'node:fs';
+import { randomInt } from 'node:crypto';
 import { win32 } from 'node:path';
 import {
   CONFIGURATION_VERSION,
@@ -147,6 +148,8 @@ function configurationForSelection(
     browser,
     executablePath: candidate.executablePath,
     profilePath,
+    cdpPort: randomInt(20_000, 60_000),
+    startupUrl: 'https://www.facebook.com',
   };
 }
 
@@ -187,6 +190,15 @@ export async function initializeConfiguration(
   if (saved.status === 'valid') {
     const candidate = candidateForConfiguration(saved.configuration);
     if (isExecutableAvailable(candidate.executablePath, fileExists)) {
+      if (saved.configuration.cdpPort === undefined || saved.configuration.startupUrl === undefined) {
+        saveConfiguration({
+          ...saved.configuration,
+          cdpPort: saved.configuration.cdpPort ?? randomInt(20_000, 60_000),
+          startupUrl: saved.configuration.startupUrl ?? 'https://www.facebook.com',
+        }, configurationFilePath);
+        writeOutput('Existing configuration updated with the CDP port and startup URL.');
+        return 'saved';
+      }
       writeOutput(
         `Existing browser selection preserved: ${candidate.displayName} (${candidate.executablePath}).`,
       );

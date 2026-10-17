@@ -1,11 +1,8 @@
 import { execFile, spawn, type SpawnOptions } from 'node:child_process';
-import { mkdir, readFile, stat, unlink } from 'node:fs/promises';
+import { createConnection } from 'node:net';
+import { mkdir } from 'node:fs/promises';
 import { win32 } from 'node:path';
-import {
-  chromium,
-  type Browser,
-  type ConnectOverCDPOptions,
-} from 'playwright';
+import { chromium, type Browser, type ConnectOverCDPOptions } from 'playwright';
 import { validateConfiguration, type Configuration } from '../config/configuration.js';
 
 export interface BrowserProcessHandle {
@@ -15,14 +12,11 @@ export interface BrowserProcessHandle {
     event: 'exit',
     listener: (code: number | null, signal: NodeJS.Signals | null) => void,
   ): this;
-  kill(signal?: NodeJS.Signals | number): boolean;
+  unref(): void;
 }
 
 export interface BrowserLaunchFileSystem {
   mkdir(path: string, options: { recursive: true }): Promise<unknown>;
-  readFile(path: string, encoding: 'utf8'): Promise<string>;
-  stat(path: string): Promise<{ mtimeMs: number }>;
-  unlink(path: string): Promise<void>;
 }
 
 export interface BrowserLaunchOptions {
@@ -40,213 +34,159 @@ export interface BrowserLaunchOptions {
     endpoint: string,
     options: ConnectOverCDPOptions,
   ) => Promise<Browser>;
-  terminateProcessTree?: (process: BrowserProcessHandle) => Promise<void>;
-  runTaskkill?: (pid: number) => Promise<void>;
+  findProfileProcesses?: (executablePath: string, profilePath: string) => Promise<number[]>;
   now?: () => number;
   delay?: (milliseconds: number) => Promise<void>;
 }
 
 export interface BrowserLaunchSession {
-  browser: Browser;
-  process: BrowserProcessHandle;
   endpoint: string;
   browserVersion: string;
   disconnect(): Promise<void>;
 }
 
-interface BrowserProcessState {
-  failure?: Error;
+interface ChildState {
   exited: boolean;
-  spawnFailed: boolean;
-  cleanupInProgress: boolean;
-  cleanupIncomplete: boolean;
-  sessionReturned: boolean;
-}
-
-interface MarkerSnapshot {
-  content: string;
-  mtimeMs: number;
-}
-
-interface DevToolsEndpoint {
-  port: number;
-  websocketPath: string;
-  url: string;
+  failure?: Error;
 }
 
 const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
 const DEFAULT_POLL_INTERVAL_MS = 100;
 const DEFAULT_CONNECTION_TIMEOUT_MS = 10_000;
+const defaultFileSystem: BrowserLaunchFileSystem = { mkdir };
 
-const defaultFileSystem: BrowserLaunchFileSystem = {
-  mkdir,
-  readFile,
-  stat,
-  unlink,
-};
-
-const activeProfilePaths = new Set<string>();
-
-function reserveProfile(profilePath: string): () => void {
-  const normalizedPath = win32.normalize(profilePath);
-  const root = win32.parse(normalizedPath).root;
-  const pathWithoutTrailingSeparators = normalizedPath.length > root.length
-    ? normalizedPath.replace(/[\\/]+$/, '')
-    : normalizedPath;
-  const key = pathWithoutTrailingSeparators.toLowerCase();
-  if (activeProfilePaths.has(key)) {
-    throw new Error('A browser launch is already using this profile.');
+function findProfileProcesses(executablePath: string, profilePath: string): Promise<number[]> {
+  const script = `
+$ErrorActionPreference = 'Stop'
+$profile = $env:IMPBOT_PROFILE_PATH.TrimEnd([char]92)
+$needle = '--user-data-dir=' + $profile
+$comparison = [System.StringComparison]::OrdinalIgnoreCase
+$matchingProcessIds = @(Get-CimInstance Win32_Process -Filter "Name='$env:IMPBOT_BROWSER_NAME'" | Where-Object {
+  $commandLine = [string]$_.CommandLine
+  $index = $commandLine.IndexOf($needle, $comparison)
+  if ($index -lt 0 -or -not [System.String]::Equals($_.ExecutablePath, $env:IMPBOT_BROWSER_PATH, $comparison)) {
+    return $false
   }
+  $end = $index + $needle.Length
+  $end -eq $commandLine.Length -or [char]::IsWhiteSpace($commandLine[$end]) -or $commandLine[$end] -eq '"' -or $commandLine[$end] -eq [char]92
+} | ForEach-Object { [int]$_.ProcessId })
+if ($matchingProcessIds.Count -eq 0) { '[]' } else { ConvertTo-Json -InputObject $matchingProcessIds -Compress }
+`;
 
-  activeProfilePaths.add(key);
-  let released = false;
-  return () => {
-    if (!released) {
-      released = true;
-      activeProfilePaths.delete(key);
-    }
-  };
+  return new Promise((resolve, reject) => {
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', script],
+      {
+        encoding: 'utf8',
+        windowsHide: true,
+        env: {
+          ...process.env,
+          IMPBOT_BROWSER_NAME: win32.basename(executablePath),
+          IMPBOT_BROWSER_PATH: executablePath,
+          IMPBOT_PROFILE_PATH: profilePath,
+        },
+      },
+      (error, stdout) => {
+        if (error) {
+          reject(new Error('Unable to check whether the configured browser profile is already in use.', {
+            cause: error,
+          }));
+          return;
+        }
+        try {
+          const parsed = JSON.parse(stdout.trim() || '[]') as unknown;
+          const processIds = Array.isArray(parsed) ? parsed : [parsed];
+          if (!processIds.every(processId => Number.isInteger(processId) && processId > 0)) {
+            throw new Error('Browser profile process query returned invalid process IDs.');
+          }
+          resolve(processIds as number[]);
+        } catch (error) {
+          reject(new Error('Unable to parse the browser profile process query result.', { cause: error }));
+        }
+      },
+    );
+  });
 }
 
-async function clearActivePortMarker(
-  fileSystem: BrowserLaunchFileSystem,
-  markerPath: string,
-): Promise<void> {
-  try {
-    await fileSystem.unlink(markerPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      throw new Error('Unable to remove stale DevToolsActivePort marker.', { cause: error });
-    }
-  }
-}
+function assertPortAvailable(port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection({ host: '127.0.0.1', port });
+    let settled = false;
+    const finish = (error?: Error): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.destroy();
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
 
-function parseDevToolsEndpoint(content: string): DevToolsEndpoint {
-  const lines = content.trim().split(/\r?\n/);
-  if (lines.length !== 2) {
-    throw new Error('DevToolsActivePort must contain a port and a browser WebSocket path.');
-  }
-
-  const port = Number(lines[0]);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error('DevToolsActivePort contains an invalid port.');
-  }
-
-  const websocketPath = lines[1];
-  if (!/^\/devtools\/browser\/[A-Za-z0-9._-]+$/.test(websocketPath)) {
-    throw new Error('DevToolsActivePort contains an invalid browser WebSocket path.');
-  }
-
-  return {
-    port,
-    websocketPath,
-    url: `ws://127.0.0.1:${port}${websocketPath}`,
-  };
-}
-
-async function readMarker(
-  fileSystem: BrowserLaunchFileSystem,
-  markerPath: string,
-): Promise<MarkerSnapshot | undefined> {
-  try {
-    const [content, metadata] = await Promise.all([
-      fileSystem.readFile(markerPath, 'utf8'),
-      fileSystem.stat(markerPath),
-    ]);
-    return { content, mtimeMs: metadata.mtimeMs };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      return undefined;
-    }
-    throw error;
-  }
+    socket.once('connect', () => finish(new Error(`CDP port ${port} is already in use; refusing to attach.`)));
+    socket.once('error', error => {
+      if ((error as NodeJS.ErrnoException).code === 'ECONNREFUSED') {
+        finish();
+      } else {
+        finish(new Error(`Unable to verify that CDP port ${port} is available.`, { cause: error }));
+      }
+    });
+    socket.setTimeout(1_000);
+    socket.once('timeout', () => finish(new Error(`Timed out checking whether CDP port ${port} is available.`)));
+  });
 }
 
 function defaultDelay(milliseconds: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
 }
 
-function defaultTaskkill(pid: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    execFile(
-      'taskkill.exe',
-      ['/PID', String(pid), '/T', '/F'],
-      { windowsHide: true },
-      error => error ? reject(error) : resolve(),
-    );
-  });
-}
-
-async function defaultTerminateProcessTree(
-  process: BrowserProcessHandle,
-  runTaskkill: (pid: number) => Promise<void>,
-  isExited: () => boolean,
-): Promise<void> {
-  if (process.pid === undefined) {
-    throw new Error('Browser process-tree cleanup incomplete: spawned process has no PID.');
-  }
-  if (isExited()) {
-    throw new Error('Browser process-tree cleanup incomplete: owned process exited before taskkill.');
-  }
-
-  try {
-    await runTaskkill(process.pid);
-  } catch (error) {
-    let fallbackResult = 'direct-child signal was not sent';
-    if (!isExited()) {
-      try {
-        fallbackResult = process.kill()
-          ? 'direct-child signal was sent, but descendant termination is unverified'
-          : 'direct-child signal was not sent';
-      } catch {
-        fallbackResult = 'direct-child signal failed';
-      }
-    }
-    throw new Error(
-      `Browser process-tree cleanup incomplete: taskkill failed and ${fallbackResult}.`,
-      { cause: error },
-    );
-  }
-}
-
-function isProcessFailure(
-  failure: Error | undefined,
-  exited: boolean,
-): Error | undefined {
-  if (failure) {
-    return failure;
-  }
-  if (exited) {
-    return new Error('Browser process exited before its CDP endpoint became ready.');
-  }
-  return undefined;
-}
-
 async function waitForEndpoint(
-  markerPath: string,
-  process: BrowserProcessHandle,
-  processState: { failure?: Error; exited: boolean },
-  fileSystem: BrowserLaunchFileSystem,
+  port: number,
+  childState: ChildState,
   now: () => number,
   delay: (milliseconds: number) => Promise<void>,
   startupTimeoutMs: number,
   pollIntervalMs: number,
-): Promise<DevToolsEndpoint> {
+): Promise<string> {
+  const endpointUrl = `http://127.0.0.1:${port}/json/version`;
   const deadline = now() + startupTimeoutMs;
-  let malformedEndpoint = false;
 
   while (now() <= deadline) {
-    const processFailure = isProcessFailure(processState.failure, processState.exited);
-    if (processFailure) {
-      throw processFailure;
+    if (childState.failure) {
+      throw childState.failure;
+    }
+    if (childState.exited) {
+      throw new Error('Browser process exited before its CDP endpoint became ready.');
     }
 
-    const marker = await readMarker(fileSystem, markerPath);
-    if (marker) {
-      try {
-        return parseDevToolsEndpoint(marker.content);
-      } catch {
-        malformedEndpoint = true;
+    try {
+      const response = await fetch(endpointUrl, { signal: AbortSignal.timeout(1_000) });
+      if (!response.ok) {
+        throw new Error(`CDP endpoint returned HTTP ${response.status}.`);
+      }
+      const result = await response.json() as { webSocketDebuggerUrl?: unknown };
+      if (typeof result.webSocketDebuggerUrl !== 'string') {
+        throw new Error('CDP endpoint did not return a browser WebSocket URL.');
+      }
+      const websocketUrl = new URL(result.webSocketDebuggerUrl);
+      if (
+        websocketUrl.protocol !== 'ws:' ||
+        !['127.0.0.1', 'localhost'].includes(websocketUrl.hostname) ||
+        websocketUrl.port !== String(port) ||
+        !websocketUrl.pathname.startsWith('/devtools/browser/')
+      ) {
+        throw new Error('CDP endpoint returned a WebSocket URL outside the configured loopback endpoint.');
+      }
+      if (childState.exited) {
+        throw new Error('Browser process exited before its CDP connection was accepted.');
+      }
+      return websocketUrl.href;
+    } catch (error) {
+      if (error instanceof Error && !('cause' in error) && /CDP endpoint/.test(error.message)) {
+        throw error;
       }
     }
 
@@ -257,48 +197,13 @@ async function waitForEndpoint(
     await delay(Math.min(pollIntervalMs, remaining));
   }
 
-  if (isProcessFailure(processState.failure, processState.exited)) {
-    throw isProcessFailure(processState.failure, processState.exited);
+  if (childState.failure) {
+    throw childState.failure;
   }
-  if (malformedEndpoint) {
-    throw new Error('Browser wrote malformed DevToolsActivePort data before startup timed out.');
+  if (childState.exited) {
+    throw new Error('Browser process exited before its CDP endpoint became ready.');
   }
   throw new Error('Timed out waiting for the browser CDP endpoint.');
-}
-
-async function cleanupFailedLaunch(
-  process: BrowserProcessHandle,
-  browser: Browser | undefined,
-  processState: BrowserProcessState,
-  terminateProcessTree: (process: BrowserProcessHandle) => Promise<void>,
-): Promise<Error[]> {
-  const errors: Error[] = [];
-
-  if (browser?.isConnected()) {
-    try {
-      await browser.close();
-    } catch (error) {
-      errors.push(error instanceof Error ? error : new Error(String(error)));
-    }
-  }
-
-  if (processState.spawnFailed) {
-    return errors;
-  }
-
-  if (processState.exited) {
-    errors.push(new Error('Browser process-tree cleanup incomplete: descendants could not be verified after process exit.'));
-  } else if (process.pid === undefined) {
-    errors.push(new Error('Browser process-tree cleanup incomplete: spawned process has no PID.'));
-  } else {
-    try {
-      await terminateProcessTree(process);
-    } catch (error) {
-      errors.push(error instanceof Error ? error : new Error(String(error)));
-    }
-  }
-
-  return errors;
 }
 
 export async function launchConfiguredBrowser(
@@ -311,6 +216,10 @@ export async function launchConfiguredBrowser(
   }
 
   const validatedConfiguration = validateConfiguration(configuration);
+  if (validatedConfiguration.cdpPort === undefined || !validatedConfiguration.startupUrl) {
+    throw new Error('Configuration is missing its CDP port or startup URL. Run `impbot init` to update it.');
+  }
+
   const startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const connectionTimeoutMs = options.connectionTimeoutMs ?? DEFAULT_CONNECTION_TIMEOUT_MS;
@@ -318,147 +227,89 @@ export async function launchConfiguredBrowser(
     throw new Error('Browser startup, polling, and connection timeouts must be positive.');
   }
 
+  const getProfileProcesses = options.findProfileProcesses ?? findProfileProcesses;
+  const existingProcesses = await getProfileProcesses(
+    validatedConfiguration.executablePath,
+    validatedConfiguration.profilePath,
+  );
+  if (existingProcesses.length > 0) {
+    throw new Error(
+      `Browser process(es) ${existingProcesses.join(', ')} already use the configured profile; refusing to launch another tab.`,
+    );
+  }
+  await assertPortAvailable(validatedConfiguration.cdpPort);
+
   const fileSystem = options.fileSystem ?? defaultFileSystem;
-  const now = options.now ?? Date.now;
-  const delay = options.delay ?? defaultDelay;
-  const releaseProfile = reserveProfile(validatedConfiguration.profilePath);
+  await fileSystem.mkdir(validatedConfiguration.profilePath, { recursive: true });
   const spawnProcess = options.spawnProcess ?? ((executablePath, args, spawnOptions) =>
     spawn(executablePath, args, spawnOptions));
-  const connectOverCDP = options.connectOverCDP ?? ((endpoint, connectOptions) =>
-    chromium.connectOverCDP(endpoint, connectOptions));
-  const runTaskkill = options.runTaskkill ?? defaultTaskkill;
-  let terminateProcessTree = options.terminateProcessTree;
-  const markerPath = win32.join(validatedConfiguration.profilePath, 'DevToolsActivePort');
-  let child: BrowserProcessHandle | undefined;
-  const processState: BrowserProcessState = {
-    exited: false,
-    spawnFailed: false,
-    cleanupInProgress: false,
-    cleanupIncomplete: false,
-    sessionReturned: false,
-  };
-  let browser: Browser | undefined;
+  const child = spawnProcess(
+    validatedConfiguration.executablePath,
+    [
+      '--remote-debugging-address=127.0.0.1',
+      `--remote-debugging-port=${validatedConfiguration.cdpPort}`,
+      `--user-data-dir=${validatedConfiguration.profilePath}`,
+      validatedConfiguration.startupUrl,
+    ],
+    { detached: true, shell: false, windowsHide: false, stdio: 'ignore' },
+  );
+  const childState: ChildState = { exited: false };
+  child.once('error', error => {
+    childState.failure = error;
+  });
+  child.once('exit', () => {
+    childState.exited = true;
+  });
+  child.unref();
+
+  const now = options.now ?? Date.now;
+  const delay = options.delay ?? defaultDelay;
+  const endpoint = await waitForEndpoint(
+    validatedConfiguration.cdpPort,
+    childState,
+    now,
+    delay,
+    startupTimeoutMs,
+    pollIntervalMs,
+  );
+  const ownerProcessIds = await getProfileProcesses(
+    validatedConfiguration.executablePath,
+    validatedConfiguration.profilePath,
+  );
+  if (child.pid === undefined || !ownerProcessIds.includes(child.pid) || childState.exited) {
+    throw new Error('Unable to verify that the launched process owns the configured CDP endpoint; refusing to attach.');
+  }
+
+  const connectOverCDP = options.connectOverCDP ?? ((url, connectOptions) =>
+    chromium.connectOverCDP(url, connectOptions));
+  const browser = await connectOverCDP(endpoint, {
+    isLocal: true,
+    noDefaults: true,
+    timeout: connectionTimeoutMs,
+  });
+
   try {
-    await fileSystem.mkdir(validatedConfiguration.profilePath, { recursive: true });
-    await clearActivePortMarker(fileSystem, markerPath);
-    child = spawnProcess(
-      validatedConfiguration.executablePath,
-      [
-        `--user-data-dir=${validatedConfiguration.profilePath}`,
-        '--remote-debugging-address=127.0.0.1',
-        '--remote-debugging-port=0',
-      ],
-      {
-        shell: false,
-        windowsHide: false,
-        stdio: 'ignore',
-      },
-    );
-    child.once('error', error => {
-      processState.failure = error;
-      processState.spawnFailed = child?.pid === undefined;
-      if (processState.spawnFailed && !processState.cleanupInProgress) {
-        releaseProfile();
-      }
-    });
-    child.once('exit', (code, signal) => {
-      processState.exited = true;
-      processState.failure = new Error(
-        `Browser process exited before its CDP endpoint became ready (code ${code ?? 'null'}, signal ${signal ?? 'none'}).`,
-      );
-      if (
-        processState.sessionReturned &&
-        !processState.cleanupInProgress &&
-        !processState.cleanupIncomplete
-      ) {
-        releaseProfile();
-      }
-    });
-    terminateProcessTree ??= ownedProcess => defaultTerminateProcessTree(
-      ownedProcess,
-      runTaskkill,
-      () => processState.exited,
-    );
-
-    const endpoint = await waitForEndpoint(
-      markerPath,
-      child,
-      processState,
-      fileSystem,
-      now,
-      delay,
-      startupTimeoutMs,
-      pollIntervalMs,
-    );
-    const processFailure = isProcessFailure(processState.failure, processState.exited);
-    if (processFailure) {
-      throw processFailure;
-    }
-    browser = await connectOverCDP(endpoint.url, {
-      isLocal: true,
-      noDefaults: true,
-      timeout: connectionTimeoutMs,
-    });
-
     if (!browser.isConnected()) {
       throw new Error('Playwright completed the CDP connection but reports the browser disconnected.');
     }
     const browserVersion = await browser.version();
-    if (
-      !browserVersion.trim() ||
-      !browser.isConnected() ||
-      isProcessFailure(processState.failure, processState.exited)
-    ) {
+    if (!browserVersion.trim() || !browser.isConnected() || childState.exited) {
       throw new Error('Playwright CDP connection verification failed.');
     }
 
-    let disconnected = false;
-    processState.sessionReturned = true;
+    let disconnectPromise: Promise<void> | undefined;
     return {
-      browser,
-      process: child,
-      endpoint: endpoint.url,
+      endpoint,
       browserVersion,
-      async disconnect() {
-        if (disconnected) {
-          return;
-        }
-        disconnected = true;
-        if (browser?.isConnected()) {
-          await browser.close();
-        }
+      disconnect() {
+        disconnectPromise ??= browser.close();
+        return disconnectPromise;
       },
     };
   } catch (error) {
-    const startupError = error instanceof Error ? error : new Error(String(error));
-    if (!child) {
-      releaseProfile();
-      throw startupError;
+    if (browser.isConnected()) {
+      await browser.close().catch(() => undefined);
     }
-    processState.cleanupInProgress = true;
-    const cleanupErrors = await cleanupFailedLaunch(
-      child,
-      browser,
-      processState,
-      terminateProcessTree ?? (ownedProcess => defaultTerminateProcessTree(
-        ownedProcess,
-        runTaskkill,
-        () => processState.exited,
-      )),
-    );
-    processState.cleanupInProgress = false;
-    if (cleanupErrors.length > 0 && !processState.spawnFailed) {
-      processState.cleanupIncomplete = true;
-    }
-    if (cleanupErrors.length === 0 || processState.spawnFailed) {
-      releaseProfile();
-    }
-    if (cleanupErrors.length > 0) {
-      throw new AggregateError(
-        [startupError, ...cleanupErrors],
-        `Browser startup failed: ${startupError.message}; cleanup incomplete (${cleanupErrors.length} error(s)).`,
-      );
-    }
-    throw startupError;
+    throw error;
   }
 }

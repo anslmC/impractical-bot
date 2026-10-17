@@ -71,6 +71,8 @@ const existingConfiguration: Configuration = {
   browser: 'brave',
   executablePath: bravePath,
   profilePath: 'C:\\Users\\test\\AppData\\Local\\Impractical Bot\\browser-profile',
+  cdpPort: 9222,
+  startupUrl: 'https://www.facebook.com',
 };
 
 test('a valid saved browser selection is preserved without prompting or rediscovery', async context => {
@@ -253,4 +255,22 @@ test('malformed and unsupported configurations are not overwritten', async conte
   const unsupportedContent = readFileSync(filePath, 'utf8');
   assert.equal(await initializeConfiguration(createOptions(filePath, { installedPaths: [chromePath] })), 'failed');
   assert.equal(readFileSync(filePath, 'utf8'), unsupportedContent);
+});
+
+test('a legacy valid configuration is upgraded with a CDP port and startup URL', async context => {
+  const filePath = createConfigurationPath(context);
+  const legacyConfiguration = { ...existingConfiguration };
+  delete (legacyConfiguration as Partial<Configuration>).cdpPort;
+  delete (legacyConfiguration as Partial<Configuration>).startupUrl;
+  saveConfiguration(legacyConfiguration, filePath);
+
+  assert.equal(await initializeConfiguration(createOptions(filePath, { installedPaths: [bravePath] })), 'saved');
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.ok(loaded.configuration.cdpPort && loaded.configuration.cdpPort >= 20_000);
+    assert.ok(loaded.configuration.cdpPort < 60_000);
+    assert.equal(loaded.configuration.startupUrl, 'https://www.facebook.com');
+    assert.equal(loaded.configuration.profilePath, legacyConfiguration.profilePath);
+  }
 });

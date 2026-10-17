@@ -9,9 +9,20 @@ import {
   type InitializationStatus,
   type TerminalPrompt,
 } from './browser/initialization.js';
-import { loadConfiguration } from './config/configuration.js';
+import {
+  launchConfiguredBrowser,
+  type BrowserLaunchSession,
+} from './browser/launch.js';
+import {
+  loadConfiguration,
+  type Configuration,
+} from './config/configuration.js';
 
 type Output = (message: string) => void;
+
+export interface CliRuntimeOptions {
+  launchBrowser?: (configuration: Configuration) => Promise<BrowserLaunchSession>;
+}
 
 const usage = `Usage: impbot <command>
 
@@ -92,18 +103,61 @@ function handleConfig(writeOutput: Output, writeError: Output, filePath?: string
     `  Executable: ${configuration.executablePath}`,
     `  Profile: ${configuration.profilePath}`,
     `  CDP port: ${configuration.cdpPort ?? 'not configured'}`,
+    `  Startup URL: ${configuration.startupUrl ?? 'not configured'}`,
   ].join('\n'));
   return 0;
 }
 
-function handleStart(writeOutput: Output): number {
-  writeOutput('The start command is not implemented yet.');
+async function handleStart(
+  writeOutput: Output,
+  writeError: Output,
+  configurationFilePath: string | undefined,
+  runtime: CliRuntimeOptions,
+): Promise<number> {
+  let configurationResult;
+  try {
+    configurationResult = loadConfiguration(configurationFilePath);
+  } catch (error) {
+    writeError(`Unable to load configuration: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+
+  if (configurationResult.status === 'missing') {
+    writeError('Configuration has not been initialized. Run `impbot init` first.');
+    return 1;
+  }
+  if (configurationResult.status === 'malformed') {
+    writeError(`Configuration is malformed: ${configurationResult.message}`);
+    return 1;
+  }
+  if (configurationResult.status === 'unsupported-version') {
+    writeError(`Configuration schema version ${configurationResult.version} is not supported.`);
+    return 1;
+  }
+
+  let session: BrowserLaunchSession;
+  try {
+    session = await (runtime.launchBrowser ?? launchConfiguredBrowser)(configurationResult.configuration);
+  } catch (error) {
+    writeError(`Unable to start browser: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+
+  writeOutput(`Browser launched and connected (${session.browserVersion}).`);
+  try {
+    await session.disconnect();
+  } catch (error) {
+    writeError(`Unable to disconnect Playwright: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+  writeOutput('Playwright disconnected; the browser remains open.');
   return 0;
 }
 
-function handleStop(writeOutput: Output): number {
-  writeOutput('The stop command is not implemented yet.');
-  return 0;
+async function handleStop(writeOutput: Output, writeError: Output): Promise<number> {
+  writeError('No browser session is managed by this process; `start` leaves the browser running.');
+  void writeOutput;
+  return 1;
 }
 
 function getVersion(): string {
@@ -121,6 +175,7 @@ export async function runCli(
   configurationFilePath?: string,
   prompt: TerminalPrompt = promptTerminal,
   initialize: (options: InitializationOptions) => Promise<InitializationStatus> = initializeConfiguration,
+  runtime: CliRuntimeOptions = {},
 ): Promise<number> {
   const [command, ...remainingArgs] = args;
 
@@ -142,8 +197,8 @@ export async function runCli(
   const handlers: Record<string, () => number | Promise<number>> = {
     init: () => handleInit(writeOutput, writeError, configurationFilePath, prompt, initialize),
     config: () => handleConfig(writeOutput, writeError, configurationFilePath),
-    start: () => handleStart(writeOutput),
-    stop: () => handleStop(writeOutput),
+    start: () => handleStart(writeOutput, writeError, configurationFilePath, runtime),
+    stop: () => handleStop(writeOutput, writeError),
   };
   const handler = command ? handlers[command] : undefined;
 

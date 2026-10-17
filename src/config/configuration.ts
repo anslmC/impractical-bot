@@ -23,6 +23,7 @@ export interface Configuration {
   executablePath: string;
   profilePath: string;
   cdpPort?: number;
+  startupUrl?: string;
 }
 
 export interface ConfigurationPaths {
@@ -44,6 +45,7 @@ const CONFIGURATION_KEYS = new Set([
   'executablePath',
   'profilePath',
   'cdpPort',
+  'startupUrl',
 ]);
 const BROWSER_EXECUTABLE_NAMES: Record<BrowserId, string> = {
   brave: 'brave.exe',
@@ -129,6 +131,18 @@ export function validateConfiguration(value: unknown): Configuration {
   ) {
     throw new Error('cdpPort must be an integer between 1 and 65535.');
   }
+  if (value.startupUrl !== undefined) {
+    if (typeof value.startupUrl !== 'string') {
+      throw new Error('startupUrl must be a valid HTTP or HTTPS URL.');
+    }
+    try {
+      if (!['http:', 'https:'].includes(new URL(value.startupUrl).protocol)) {
+        throw new Error('startupUrl must be a valid HTTP or HTTPS URL.');
+      }
+    } catch {
+      throw new Error('startupUrl must be a valid HTTP or HTTPS URL.');
+    }
+  }
 
   return {
     version: CONFIGURATION_VERSION,
@@ -136,6 +150,7 @@ export function validateConfiguration(value: unknown): Configuration {
     executablePath,
     profilePath,
     ...(value.cdpPort === undefined ? {} : { cdpPort: value.cdpPort as number }),
+    ...(value.startupUrl === undefined ? {} : { startupUrl: value.startupUrl as string }),
   };
 }
 

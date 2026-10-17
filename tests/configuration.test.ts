@@ -23,6 +23,7 @@ const validConfiguration: Configuration = {
   executablePath: 'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
   profilePath: 'C:\\Users\\test\\AppData\\Local\\Impractical Bot\\profile',
   cdpPort: 9222,
+  startupUrl: 'https://www.facebook.com',
 };
 
 function createTemporaryConfigPath(context: TestContext): string {
@@ -137,6 +138,12 @@ test('validation rejects invalid browsers, paths, and CDP ports', () => {
     assert.throws(
       () => validateConfiguration({ ...validConfiguration, cdpPort }),
       /cdpPort must be an integer between 1 and 65535/,
+    );
+  }
+  for (const startupUrl of ['not a URL', 'ftp://example.test']) {
+    assert.throws(
+      () => validateConfiguration({ ...validConfiguration, startupUrl }),
+      /startupUrl must be a valid HTTP or HTTPS URL/,
     );
   }
 });
