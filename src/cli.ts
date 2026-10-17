@@ -1,6 +1,14 @@
 #!/usr/bin/env node
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { createInterface } from 'node:readline';
+import { stdin, stdout } from 'node:process';
+import {
+  initializeConfiguration,
+  type InitializationOptions,
+  type InitializationStatus,
+  type TerminalPrompt,
+} from './browser/initialization.js';
 import { loadConfiguration } from './config/configuration.js';
 
 type Output = (message: string) => void;
@@ -17,11 +25,39 @@ Options:
   -h, --help     Show this help
   -v, --version  Show the version`;
 
-function handleInit(writeError: Output): number {
-  writeError(
-    'Initialization is unavailable: browser discovery is not implemented. No configuration was written.',
-  );
-  return 1;
+function promptTerminal(question: string): Promise<string | null> {
+  const terminal = createInterface({ input: stdin, output: stdout });
+  return new Promise(resolveAnswer => {
+    let settled = false;
+    const finish = (answer: string | null): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      terminal.close();
+      resolveAnswer(answer);
+    };
+
+    terminal.once('close', () => finish(null));
+    terminal.once('SIGINT', () => finish(null));
+    terminal.question(question, answer => finish(answer));
+  });
+}
+
+async function handleInit(
+  writeOutput: Output,
+  writeError: Output,
+  configurationFilePath: string | undefined,
+  prompt: TerminalPrompt,
+  initialize: (options: InitializationOptions) => Promise<InitializationStatus>,
+): Promise<number> {
+  const status = await initialize({
+    configurationFilePath,
+    prompt,
+    writeOutput,
+    writeError,
+  });
+  return status === 'failed' ? 1 : 0;
 }
 
 function handleConfig(writeOutput: Output, writeError: Output, filePath?: string): number {
@@ -78,12 +114,14 @@ function getVersion(): string {
   return packageMetadata.version;
 }
 
-export function runCli(
+export async function runCli(
   args: string[],
   writeOutput: Output = message => console.log(message),
   writeError: Output = message => console.error(message),
   configurationFilePath?: string,
-): number {
+  prompt: TerminalPrompt = promptTerminal,
+  initialize: (options: InitializationOptions) => Promise<InitializationStatus> = initializeConfiguration,
+): Promise<number> {
   const [command, ...remainingArgs] = args;
 
   if (args.length === 0 || args.length === 1 && (command === '--help' || command === '-h')) {
@@ -101,8 +139,8 @@ export function runCli(
     return 1;
   }
 
-  const handlers: Record<string, () => number> = {
-    init: () => handleInit(writeError),
+  const handlers: Record<string, () => number | Promise<number>> = {
+    init: () => handleInit(writeOutput, writeError, configurationFilePath, prompt, initialize),
     config: () => handleConfig(writeOutput, writeError, configurationFilePath),
     start: () => handleStart(writeOutput),
     stop: () => handleStop(writeOutput),
@@ -114,9 +152,17 @@ export function runCli(
     return 1;
   }
 
-  return handler();
+  return await handler();
 }
 
 if (require.main === module) {
-  process.exitCode = runCli(process.argv.slice(2));
+  void runCli(process.argv.slice(2)).then(
+    exitCode => {
+      process.exitCode = exitCode;
+    },
+    error => {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    },
+  );
 }

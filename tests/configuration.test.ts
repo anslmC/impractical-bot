@@ -125,6 +125,10 @@ test('validation rejects invalid browsers, paths, and CDP ports', () => {
     /Windows \.exe file/,
   );
   assert.throws(
+    () => validateConfiguration({ ...validConfiguration, browser: 'chrome' }),
+    /match the selected browser/,
+  );
+  assert.throws(
     () => validateConfiguration({ ...validConfiguration, profilePath: 'profile' }),
     /absolute Windows path/,
   );

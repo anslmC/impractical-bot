@@ -45,6 +45,11 @@ const CONFIGURATION_KEYS = new Set([
   'profilePath',
   'cdpPort',
 ]);
+const BROWSER_EXECUTABLE_NAMES: Record<BrowserId, string> = {
+  brave: 'brave.exe',
+  chrome: 'chrome.exe',
+  edge: 'msedge.exe',
+};
 
 function isFullyQualifiedWindowsPath(value: string): boolean {
   return win32.isAbsolute(value) && win32.parse(value).root !== '\\';
@@ -107,6 +112,9 @@ export function validateConfiguration(value: unknown): Configuration {
   const executablePath = requireWindowsAbsolutePath(value.executablePath, 'executablePath');
   if (win32.extname(executablePath).toLowerCase() !== '.exe') {
     throw new Error('executablePath must point to a Windows .exe file.');
+  }
+  if (win32.basename(executablePath).toLowerCase() !== BROWSER_EXECUTABLE_NAMES[value.browser as BrowserId]) {
+    throw new Error('executablePath must match the selected browser.');
   }
   const profilePath = requireWindowsAbsolutePath(value.profilePath, 'profilePath');
 
