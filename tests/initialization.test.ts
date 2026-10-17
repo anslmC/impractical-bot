@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join, win32 } from 'node:path';
 import { test, type TestContext } from 'node:test';
-import { initializeConfiguration } from '../src/browser/initialization.js';
+import { getBrowserProfilePath, initializeConfiguration } from '../src/browser/initialization.js';
 import { loadConfiguration, saveConfiguration, type Configuration } from '../src/config/configuration.js';
 
 const environment: NodeJS.ProcessEnv = {
@@ -74,6 +74,17 @@ const existingConfiguration: Configuration = {
   cdpPort: 9222,
   startupUrl: 'https://www.facebook.com',
 };
+
+test('browser profile paths use stable browser-specific names', () => {
+  const configurationFilePath = 'C:\\Users\\test\\AppData\\Local\\Impractical Bot\\config.json';
+
+  assert.equal(getBrowserProfilePath('brave', configurationFilePath),
+    'C:\\Users\\test\\AppData\\Local\\Impractical Bot\\brave-profile');
+  assert.equal(getBrowserProfilePath('edge', configurationFilePath),
+    'C:\\Users\\test\\AppData\\Local\\Impractical Bot\\msedge-profile');
+  assert.equal(getBrowserProfilePath('chrome', configurationFilePath),
+    'C:\\Users\\test\\AppData\\Local\\Impractical Bot\\chrome-profile');
+});
 
 test('a valid saved browser selection is preserved without prompting or rediscovery', async context => {
   const filePath = createConfigurationPath(context);
@@ -147,7 +158,7 @@ test('a single discovered browser requires confirmation before saving', async co
   if (loaded.status === 'valid') {
     assert.equal(loaded.configuration.browser, 'brave');
     assert.equal(loaded.configuration.executablePath, bravePath);
-    assert.equal(loaded.configuration.profilePath, win32.join(win32.dirname(filePath), 'browser-profile'));
+    assert.equal(loaded.configuration.profilePath, win32.join(win32.dirname(filePath), 'brave-profile'));
     assert.equal(existsSync(loaded.configuration.profilePath), false);
   }
 });

@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { test } from 'node:test';
 import {
+  closeConfiguredBrowser,
   launchConfiguredBrowser,
+  type BrowserCloseOptions,
   type BrowserLaunchFileSystem,
   type BrowserProcessHandle,
 } from '../src/browser/launch.js';
@@ -12,7 +14,7 @@ const baseConfiguration: Configuration = {
   version: 1,
   browser: 'brave',
   executablePath: 'C:\\Browsers\\Brave\\brave.exe',
-  profilePath: 'C:\\Users\\test\\AppData\\Local\\Impractical Bot\\browser-profile',
+  profilePath: 'C:\\Users\\test\\AppData\\Local\\Impractical Bot\\brave-profile',
   cdpPort: 49271,
   startupUrl: 'https://www.facebook.com',
 };
@@ -156,6 +158,66 @@ test('refuses to launch when the configured profile is already in use', async ()
     },
   }), /already use the configured profile/);
   assert.equal(spawned, false);
+});
+
+test('graceful close targets only the configured executable and profile, then verifies process exit', async () => {
+  let processScans = 0;
+  let closeTargets: number[] = [];
+  let now = 0;
+  const options: BrowserCloseOptions = {
+    platform: 'win32',
+    findProfileProcesses: async (executablePath, profilePath) => {
+      assert.equal(executablePath, baseConfiguration.executablePath);
+      assert.equal(profilePath, baseConfiguration.profilePath);
+      processScans += 1;
+      return processScans === 1 ? [12345] : [];
+    },
+    requestProcessClose: async processIds => {
+      closeTargets = processIds;
+    },
+    now: () => now,
+    delay: async milliseconds => {
+      now += milliseconds;
+    },
+  };
+
+  await closeConfiguredBrowser(baseConfiguration, options);
+
+  assert.deepEqual(closeTargets, [12345]);
+  assert.equal(processScans, 2);
+});
+
+test('graceful close does not request closure when no dedicated-profile process exists', async () => {
+  let closeRequested = false;
+  await closeConfiguredBrowser(baseConfiguration, {
+    platform: 'win32',
+    findProfileProcesses: async () => [],
+    requestProcessClose: async () => {
+      closeRequested = true;
+    },
+  });
+
+  assert.equal(closeRequested, false);
+});
+
+test('graceful close reports a timeout instead of forcing process termination', async () => {
+  let now = 0;
+  let closeRequests = 0;
+  await assert.rejects(closeConfiguredBrowser(baseConfiguration, {
+    platform: 'win32',
+    shutdownTimeoutMs: 10,
+    pollIntervalMs: 5,
+    findProfileProcesses: async () => [12345],
+    requestProcessClose: async () => {
+      closeRequests += 1;
+    },
+    now: () => now,
+    delay: async milliseconds => {
+      now += milliseconds;
+    },
+  }), /Timed out waiting/);
+
+  assert.equal(closeRequests, 1);
 });
 
 test('refuses an occupied CDP port rather than connecting to its listener', async t => {

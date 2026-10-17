@@ -5,16 +5,28 @@ import { createInterface } from 'node:readline';
 import { stdin, stdout } from 'node:process';
 import {
   initializeConfiguration,
+  getBrowserProfilePath,
+  isBrowserExecutableAvailable,
+  selectBrowserCandidate,
   type InitializationOptions,
   type InitializationStatus,
   type TerminalPrompt,
 } from './browser/initialization.js';
 import {
+  closeConfiguredBrowser,
   launchConfiguredBrowser,
   type BrowserLaunchSession,
 } from './browser/launch.js';
 import {
+  discoverBrowsers,
+  validateBrowserExecutablePath,
+  type BrowserCandidate,
+  type BrowserDiscoveryOptions,
+} from './browser/discovery.js';
+import {
   loadConfiguration,
+  resolveConfigurationPaths,
+  saveConfiguration,
   type Configuration,
 } from './config/configuration.js';
 
@@ -22,6 +34,9 @@ type Output = (message: string) => void;
 
 export interface CliRuntimeOptions {
   launchBrowser?: (configuration: Configuration) => Promise<BrowserLaunchSession>;
+  closeBrowser?: (configuration: Configuration) => Promise<void>;
+  discoverBrowsers?: (options?: BrowserDiscoveryOptions) => Promise<BrowserCandidate[]>;
+  browserExecutableExists?: (path: string) => boolean;
 }
 
 const usage = `Usage: impbot <command>
@@ -29,6 +44,7 @@ const usage = `Usage: impbot <command>
 Commands:
   init     Initialize impractical-bot
   config   Configure impractical-bot
+  changebrowser  Change the configured browser
   start    Start impractical-bot
   stop     Stop impractical-bot
 
@@ -105,6 +121,107 @@ function handleConfig(writeOutput: Output, writeError: Output, filePath?: string
     `  CDP port: ${configuration.cdpPort ?? 'not configured'}`,
     `  Startup URL: ${configuration.startupUrl ?? 'not configured'}`,
   ].join('\n'));
+  return 0;
+}
+
+async function handleChangeBrowser(
+  writeOutput: Output,
+  writeError: Output,
+  configurationFilePath: string | undefined,
+  prompt: TerminalPrompt,
+  runtime: CliRuntimeOptions,
+): Promise<number> {
+  let configurationResult;
+  try {
+    configurationResult = loadConfiguration(configurationFilePath);
+  } catch (error) {
+    writeError(`Unable to load configuration: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+
+  if (configurationResult.status === 'missing') {
+    writeError('Configuration has not been initialized. Run `impbot init` first.');
+    return 1;
+  }
+  if (configurationResult.status === 'malformed') {
+    writeError(`Configuration is malformed: ${configurationResult.message}`);
+    return 1;
+  }
+  if (configurationResult.status === 'unsupported-version') {
+    writeError(`Configuration schema version ${configurationResult.version} is not supported.`);
+    return 1;
+  }
+
+  let candidates: BrowserCandidate[];
+  try {
+    candidates = await (runtime.discoverBrowsers ?? discoverBrowsers)();
+  } catch (error) {
+    writeError(`Unable to discover browsers: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+
+  const fileExists = runtime.browserExecutableExists ?? (path => isBrowserExecutableAvailable(path));
+  const selection = await selectBrowserCandidate(
+    candidates,
+    prompt,
+    writeOutput,
+    writeError,
+    fileExists,
+  );
+  if (selection.status === 'cancelled') {
+    writeOutput('Browser change cancelled. The current configuration was not changed.');
+    return 0;
+  }
+
+  let candidate: BrowserCandidate;
+  try {
+    candidate = validateBrowserExecutablePath(selection.candidate.executablePath);
+    if (candidate.browser !== selection.candidate.browser) {
+      throw new Error('Selected browser does not match its executable.');
+    }
+  } catch (error) {
+    writeError(`Selected browser executable is invalid: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+  if (!isBrowserExecutableAvailable(candidate.executablePath, fileExists)) {
+    writeError(`Selected browser executable is unavailable: ${candidate.executablePath}`);
+    return 1;
+  }
+
+  const currentConfiguration = configurationResult.configuration;
+  let profilePath = currentConfiguration.profilePath;
+  if (candidate.browser !== currentConfiguration.browser) {
+    try {
+      const selectedConfigurationPath = configurationFilePath ?? resolveConfigurationPaths().filePath;
+      profilePath = getBrowserProfilePath(candidate.browser, selectedConfigurationPath);
+    } catch (error) {
+      writeError(`Unable to determine the selected browser profile: ${error instanceof Error ? error.message : String(error)}`);
+      return 1;
+    }
+  }
+  const nextConfiguration: Configuration = {
+    ...currentConfiguration,
+    browser: candidate.browser,
+    executablePath: candidate.executablePath,
+    profilePath,
+  };
+
+  try {
+    await (runtime.closeBrowser ?? closeConfiguredBrowser)(currentConfiguration);
+  } catch (error) {
+    writeError(`Unable to close the current browser: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+
+  try {
+    saveConfiguration(nextConfiguration, configurationFilePath);
+  } catch (error) {
+    writeError(`Unable to save browser selection: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+
+  writeOutput(`Browser selection saved: ${candidate.displayName} (${candidate.executablePath}).`);
+  writeOutput('The selected browser was not launched.');
   return 0;
 }
 
@@ -197,6 +314,13 @@ export async function runCli(
   const handlers: Record<string, () => number | Promise<number>> = {
     init: () => handleInit(writeOutput, writeError, configurationFilePath, prompt, initialize),
     config: () => handleConfig(writeOutput, writeError, configurationFilePath),
+    changebrowser: () => handleChangeBrowser(
+      writeOutput,
+      writeError,
+      configurationFilePath,
+      prompt,
+      runtime,
+    ),
     start: () => handleStart(writeOutput, writeError, configurationFilePath, runtime),
     stop: () => handleStop(writeOutput, writeError),
   };

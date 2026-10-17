@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { test, type TestContext } from 'node:test';
 import type { InitializationOptions, InitializationStatus, TerminalPrompt } from '../src/browser/initialization.js';
 import { runCli, type CliRuntimeOptions } from '../src/cli.js';
 import type { BrowserLaunchSession } from '../src/browser/launch.js';
-import { saveConfiguration, type Configuration } from '../src/config/configuration.js';
+import { loadConfiguration, saveConfiguration, type Configuration } from '../src/config/configuration.js';
 
 async function captureCli(
   args: string[],
@@ -39,7 +39,7 @@ const validConfiguration: Configuration = {
   version: 1,
   browser: 'brave',
   executablePath: 'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
-  profilePath: 'C:\\Users\\test\\AppData\\Local\\Impractical Bot\\browser-profile',
+  profilePath: 'C:\\Users\\test\\AppData\\Local\\Impractical Bot\\brave-profile',
   cdpPort: 9222,
   startupUrl: 'https://www.facebook.com',
 };
@@ -88,6 +88,206 @@ test('start reports missing configuration without launching a browser', async co
   assert.equal(result.exitCode, 1);
   assert.equal(launchAttempted, false);
   assert.match(result.errors[0], /Run `impbot init` first/);
+});
+
+test('changebrowser updates configuration after closing the current browser without launching the new one', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  const previousProfilePath = join(dirname(configurationFilePath), 'brave-profile');
+  mkdirSync(previousProfilePath);
+  const currentConfiguration = { ...validConfiguration, profilePath: previousProfilePath };
+  saveConfiguration(currentConfiguration, configurationFilePath);
+  const newExecutablePath = 'C:\\Portable\\chrome.exe';
+  let closedConfiguration: Configuration | undefined;
+  let launchAttempted = false;
+  const result = await captureCli(
+    ['changebrowser'],
+    configurationFilePath,
+    async () => 'y',
+    undefined,
+    {
+      discoverBrowsers: async () => [{
+        browser: 'chrome',
+        displayName: 'Google Chrome',
+        executablePath: newExecutablePath,
+      }],
+      browserExecutableExists: () => true,
+      closeBrowser: async configuration => {
+        closedConfiguration = configuration;
+      },
+      launchBrowser: async () => {
+        launchAttempted = true;
+        throw new Error('must not launch');
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(closedConfiguration, currentConfiguration);
+  assert.equal(launchAttempted, false);
+  assert.deepEqual(result.errors, []);
+  assert.equal(existsSync(previousProfilePath), true);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.browser, 'chrome');
+    assert.equal(saved.configuration.executablePath, newExecutablePath);
+    assert.equal(saved.configuration.profilePath, join(dirname(configurationFilePath), 'chrome-profile'));
+  }
+});
+
+test('changebrowser retains the same browser profile when its executable path changes', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  const previousProfilePath = join(dirname(configurationFilePath), 'brave-profile');
+  mkdirSync(previousProfilePath);
+  const configuration = {
+    ...validConfiguration,
+    profilePath: previousProfilePath,
+  };
+  saveConfiguration(configuration, configurationFilePath);
+
+  const result = await captureCli(
+    ['changebrowser'],
+    configurationFilePath,
+    async () => 'y',
+    undefined,
+    {
+      discoverBrowsers: async () => [{
+        browser: 'brave',
+        displayName: 'Brave Browser',
+        executablePath: 'C:\\Portable\\brave.exe',
+      }],
+      browserExecutableExists: () => true,
+      closeBrowser: async () => undefined,
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.executablePath, 'C:\\Portable\\brave.exe');
+    assert.equal(saved.configuration.profilePath, configuration.profilePath);
+  }
+  assert.equal(existsSync(previousProfilePath), true);
+});
+
+test('changebrowser leaves configuration untouched when the executable is unavailable', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  let closeAttempted = false;
+  const result = await captureCli(
+    ['changebrowser'],
+    configurationFilePath,
+    async () => 'y',
+    undefined,
+    {
+      discoverBrowsers: async () => [{
+        browser: 'edge',
+        displayName: 'Microsoft Edge',
+        executablePath: 'C:\\Portable\\msedge.exe',
+      }],
+      browserExecutableExists: () => false,
+      closeBrowser: async () => {
+        closeAttempted = true;
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(closeAttempted, false);
+  assert.match(result.errors[0], /unavailable/);
+  assert.deepEqual(loadConfiguration(configurationFilePath), {
+    status: 'valid',
+    configuration: validConfiguration,
+  });
+});
+
+test('changebrowser leaves configuration untouched when discovery fails', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  let closeAttempted = false;
+  const result = await captureCli(
+    ['changebrowser'],
+    configurationFilePath,
+    undefined,
+    undefined,
+    {
+      discoverBrowsers: async () => {
+        throw new Error('registry and PATH unavailable');
+      },
+      closeBrowser: async () => {
+        closeAttempted = true;
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(closeAttempted, false);
+  assert.match(result.errors[0], /Unable to discover browsers/);
+  assert.deepEqual(loadConfiguration(configurationFilePath), {
+    status: 'valid',
+    configuration: validConfiguration,
+  });
+});
+
+test('changebrowser rejects an unsupported executable before closing the current browser', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  let closeAttempted = false;
+  const result = await captureCli(
+    ['changebrowser'],
+    configurationFilePath,
+    async () => 'y',
+    undefined,
+    {
+      discoverBrowsers: async () => [{
+        browser: 'chrome',
+        displayName: 'Google Chrome',
+        executablePath: 'C:\\Portable\\firefox.exe',
+      }],
+      browserExecutableExists: () => true,
+      closeBrowser: async () => {
+        closeAttempted = true;
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(closeAttempted, false);
+  assert.match(result.errors[0], /invalid/);
+  assert.deepEqual(loadConfiguration(configurationFilePath), {
+    status: 'valid',
+    configuration: validConfiguration,
+  });
+});
+
+test('changebrowser leaves configuration untouched when graceful browser closure fails', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  const result = await captureCli(
+    ['changebrowser'],
+    configurationFilePath,
+    async () => 'y',
+    undefined,
+    {
+      discoverBrowsers: async () => [{
+        browser: 'edge',
+        displayName: 'Microsoft Edge',
+        executablePath: 'C:\\Portable\\msedge.exe',
+      }],
+      browserExecutableExists: () => true,
+      closeBrowser: async () => {
+        throw new Error('shutdown timed out');
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.errors[0], /shutdown timed out/);
+  assert.deepEqual(loadConfiguration(configurationFilePath), {
+    status: 'valid',
+    configuration: validConfiguration,
+  });
 });
 
 test('stop remains separate and does not attach to or close a browser', async () => {
@@ -151,6 +351,7 @@ test('help options and no command display usage', async () => {
     assert.match(result.output[0], /Usage: impbot <command>/);
     assert.match(result.output[0], /init\s+Initialize impractical-bot/);
     assert.match(result.output[0], /config\s+Configure impractical-bot/);
+    assert.match(result.output[0], /changebrowser\s+Change the configured browser/);
     assert.match(result.output[0], /start\s+Start impractical-bot/);
     assert.match(result.output[0], /stop\s+Stop impractical-bot/);
     assert.deepEqual(result.errors, []);

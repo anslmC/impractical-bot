@@ -28,7 +28,7 @@ export interface InitializationOptions extends BrowserDiscoveryOptions {
   writeError?: (message: string) => void;
 }
 
-type SelectionResult =
+export type SelectionResult =
   | { status: 'selected'; candidate: BrowserCandidate }
   | { status: 'cancelled' };
 
@@ -48,9 +48,9 @@ function candidateForConfiguration(configuration: Configuration): BrowserCandida
   };
 }
 
-function isExecutableAvailable(
+export function isBrowserExecutableAvailable(
   path: string,
-  fileExists: (path: string) => boolean,
+  fileExists: (path: string) => boolean = isFile,
 ): boolean {
   try {
     return fileExists(path);
@@ -73,7 +73,7 @@ async function selectManualExecutable(
 
     try {
       const candidate = validateBrowserExecutablePath(answer);
-      if (!isExecutableAvailable(candidate.executablePath, fileExists)) {
+      if (!isBrowserExecutableAvailable(candidate.executablePath, fileExists)) {
         throw new Error('The executable does not exist or cannot be accessed.');
       }
       return { status: 'selected', candidate };
@@ -84,7 +84,7 @@ async function selectManualExecutable(
   }
 }
 
-async function selectCandidate(
+export async function selectBrowserCandidate(
   candidates: BrowserCandidate[],
   prompt: TerminalPrompt,
   writeOutput: (message: string) => void,
@@ -141,7 +141,7 @@ function configurationForSelection(
   candidate: BrowserCandidate,
   configurationFilePath: string,
 ): Configuration {
-  const profilePath = win32.join(win32.dirname(configurationFilePath), 'browser-profile');
+  const profilePath = getBrowserProfilePath(candidate.browser, configurationFilePath);
   const browser: BrowserId = candidate.browser;
   return {
     version: CONFIGURATION_VERSION,
@@ -151,6 +151,11 @@ function configurationForSelection(
     cdpPort: randomInt(20_000, 60_000),
     startupUrl: 'https://www.facebook.com',
   };
+}
+
+export function getBrowserProfilePath(browser: BrowserId, configurationFilePath: string): string {
+  const profileName = browser === 'edge' ? 'msedge-profile' : `${browser}-profile`;
+  return win32.join(win32.dirname(configurationFilePath), profileName);
 }
 
 export async function initializeConfiguration(
@@ -186,10 +191,9 @@ export async function initializeConfiguration(
     writeError(`Configuration schema version ${saved.version} is not supported.`);
     return 'failed';
   }
-
   if (saved.status === 'valid') {
     const candidate = candidateForConfiguration(saved.configuration);
-    if (isExecutableAvailable(candidate.executablePath, fileExists)) {
+    if (isBrowserExecutableAvailable(candidate.executablePath, fileExists)) {
       if (saved.configuration.cdpPort === undefined || saved.configuration.startupUrl === undefined) {
         saveConfiguration({
           ...saved.configuration,
@@ -229,7 +233,7 @@ export async function initializeConfiguration(
     return 'failed';
   }
 
-  const selection = await selectCandidate(
+  const selection = await selectBrowserCandidate(
     candidates,
     options.prompt,
     writeOutput,
@@ -240,7 +244,7 @@ export async function initializeConfiguration(
     writeOutput('Initialization cancelled. No configuration was written.');
     return 'cancelled';
   }
-  if (!isExecutableAvailable(selection.candidate.executablePath, fileExists)) {
+  if (!isBrowserExecutableAvailable(selection.candidate.executablePath, fileExists)) {
     writeError(`Selected browser executable is no longer available: ${selection.candidate.executablePath}`);
     return 'failed';
   }

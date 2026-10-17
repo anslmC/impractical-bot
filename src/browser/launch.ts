@@ -39,6 +39,16 @@ export interface BrowserLaunchOptions {
   delay?: (milliseconds: number) => Promise<void>;
 }
 
+export interface BrowserCloseOptions {
+  platform?: NodeJS.Platform;
+  shutdownTimeoutMs?: number;
+  pollIntervalMs?: number;
+  findProfileProcesses?: (executablePath: string, profilePath: string) => Promise<number[]>;
+  requestProcessClose?: (processIds: number[]) => Promise<void>;
+  now?: () => number;
+  delay?: (milliseconds: number) => Promise<void>;
+}
+
 export interface BrowserLaunchSession {
   endpoint: string;
   browserVersion: string;
@@ -53,6 +63,7 @@ interface ChildState {
 const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
 const DEFAULT_POLL_INTERVAL_MS = 100;
 const DEFAULT_CONNECTION_TIMEOUT_MS = 10_000;
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
 const defaultFileSystem: BrowserLaunchFileSystem = { mkdir };
 
 function findProfileProcesses(executablePath: string, profilePath: string): Promise<number[]> {
@@ -141,6 +152,87 @@ function assertPortAvailable(port: number): Promise<void> {
 
 function defaultDelay(milliseconds: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function requestWindowsProcessClose(processIds: number[]): Promise<void> {
+  const script = `
+$ErrorActionPreference = 'Stop'
+$processIds = $env:IMPBOT_PROCESS_IDS.Split(',') | ForEach-Object { [int]$_ }
+$requested = $false
+foreach ($processId in $processIds) {
+  $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+  if ($process -and $process.MainWindowHandle -ne 0) {
+    if (-not $process.CloseMainWindow()) {
+      throw "Process $processId did not accept a graceful close request."
+    }
+    $requested = $true
+  }
+}
+if (-not $requested) { throw 'No dedicated browser window accepted a graceful close request.' }
+`;
+
+  return new Promise((resolve, reject) => {
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', script],
+      {
+        encoding: 'utf8',
+        windowsHide: true,
+        env: { ...process.env, IMPBOT_PROCESS_IDS: processIds.join(',') },
+      },
+      error => error
+        ? reject(new Error('Unable to request graceful browser shutdown.', { cause: error }))
+        : resolve(),
+    );
+  });
+}
+
+export async function closeConfiguredBrowser(
+  configuration: Configuration,
+  options: BrowserCloseOptions = {},
+): Promise<void> {
+  const platform = options.platform ?? process.platform;
+  if (platform !== 'win32') {
+    throw new Error(`Browser closing is not supported on '${platform}'.`);
+  }
+
+  const validatedConfiguration = validateConfiguration(configuration);
+  const getProfileProcesses = options.findProfileProcesses ?? findProfileProcesses;
+  const processIds = await getProfileProcesses(
+    validatedConfiguration.executablePath,
+    validatedConfiguration.profilePath,
+  );
+  if (processIds.length === 0) {
+    return;
+  }
+
+  const shutdownTimeoutMs = options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
+  const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+  if (shutdownTimeoutMs <= 0 || pollIntervalMs <= 0) {
+    throw new Error('Browser shutdown and polling timeouts must be positive.');
+  }
+
+  await (options.requestProcessClose ?? requestWindowsProcessClose)(processIds);
+
+  const now = options.now ?? Date.now;
+  const delay = options.delay ?? defaultDelay;
+  const deadline = now() + shutdownTimeoutMs;
+  while (now() <= deadline) {
+    const remainingProcesses = await getProfileProcesses(
+      validatedConfiguration.executablePath,
+      validatedConfiguration.profilePath,
+    );
+    if (remainingProcesses.length === 0) {
+      return;
+    }
+    const remainingTime = deadline - now();
+    if (remainingTime <= 0) {
+      break;
+    }
+    await delay(Math.min(pollIntervalMs, remainingTime));
+  }
+
+  throw new Error('Timed out waiting for the dedicated browser to shut down gracefully.');
 }
 
 async function waitForEndpoint(
