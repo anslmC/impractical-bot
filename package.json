@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "An experimental local Node.js bot project",
   "license": "ISC",
+  "bin": {
+    "impbot": "./dist/src/cli.js"
+  },
   "engines": {
     "node": ">=22.13.0"
   },
