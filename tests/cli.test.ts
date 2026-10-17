@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { test, type TestContext } from 'node:test';
@@ -40,6 +40,8 @@ const validConfiguration: Configuration = {
   browser: 'brave',
   executablePath: 'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
   profilePath: 'C:\\Users\\test\\AppData\\Local\\Impractical Bot\\brave-profile',
+  skipPinRestoration: false,
+  pin: '001234',
   cdpPort: 9222,
   startupUrl: 'https://www.facebook.com',
 };
@@ -94,15 +96,21 @@ test('changebrowser updates configuration after closing the current browser with
   const configurationFilePath = createTemporaryConfigPath(context);
   const previousProfilePath = join(dirname(configurationFilePath), 'brave-profile');
   mkdirSync(previousProfilePath);
-  const currentConfiguration = { ...validConfiguration, profilePath: previousProfilePath };
+  const currentConfiguration = {
+    ...validConfiguration,
+    profilePath: previousProfilePath,
+    skipPinRestoration: true,
+    pin: null,
+  };
   saveConfiguration(currentConfiguration, configurationFilePath);
   const newExecutablePath = 'C:\\Portable\\chrome.exe';
   let closedConfiguration: Configuration | undefined;
   let launchAttempted = false;
+  const promptAnswers = ['y', 'n', '000042'];
   const result = await captureCli(
     ['changebrowser'],
     configurationFilePath,
-    async () => 'y',
+    async () => promptAnswers.shift() ?? null,
     undefined,
     {
       discoverBrowsers: async () => [{
@@ -129,10 +137,60 @@ test('changebrowser updates configuration after closing the current browser with
   const saved = loadConfiguration(configurationFilePath);
   assert.equal(saved.status, 'valid');
   if (saved.status === 'valid') {
-    assert.equal(saved.configuration.browser, 'chrome');
-    assert.equal(saved.configuration.executablePath, newExecutablePath);
-    assert.equal(saved.configuration.profilePath, join(dirname(configurationFilePath), 'chrome-profile'));
+    assert.deepEqual(saved.configuration, {
+      ...currentConfiguration,
+      browser: 'chrome',
+      executablePath: newExecutablePath,
+      profilePath: join(dirname(configurationFilePath), 'chrome-profile'),
+      skipPinRestoration: false,
+      pin: '000042',
+    });
   }
+});
+
+test('changebrowser cancellation does not ask for or change the PIN preference', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  const configuration = { ...validConfiguration, skipPinRestoration: true, pin: null };
+  saveConfiguration(configuration, configurationFilePath);
+  const promptCalls: string[] = [];
+  let closeAttempted = false;
+
+  const result = await captureCli(
+    ['changebrowser'],
+    configurationFilePath,
+    async question => {
+      promptCalls.push(question);
+      return '0';
+    },
+    undefined,
+    {
+      discoverBrowsers: async () => [
+        {
+          browser: 'brave',
+          displayName: 'Brave Browser',
+          executablePath: validConfiguration.executablePath,
+        },
+        {
+          browser: 'chrome',
+          displayName: 'Google Chrome',
+          executablePath: 'C:\\Portable\\chrome.exe',
+        },
+      ],
+      browserExecutableExists: () => true,
+      closeBrowser: async () => {
+        closeAttempted = true;
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(promptCalls.length, 1);
+  assert.match(promptCalls[0], /Select a browser/);
+  assert.equal(closeAttempted, false);
+  assert.deepEqual(loadConfiguration(configurationFilePath), {
+    status: 'valid',
+    configuration,
+  });
 });
 
 test('changebrowser retains the same browser profile when its executable path changes', async context => {
@@ -144,11 +202,12 @@ test('changebrowser retains the same browser profile when its executable path ch
     profilePath: previousProfilePath,
   };
   saveConfiguration(configuration, configurationFilePath);
+  const promptAnswers = ['y', 'yes'];
 
   const result = await captureCli(
     ['changebrowser'],
     configurationFilePath,
-    async () => 'y',
+    async () => promptAnswers.shift() ?? null,
     undefined,
     {
       discoverBrowsers: async () => [{
@@ -165,8 +224,12 @@ test('changebrowser retains the same browser profile when its executable path ch
   const saved = loadConfiguration(configurationFilePath);
   assert.equal(saved.status, 'valid');
   if (saved.status === 'valid') {
-    assert.equal(saved.configuration.executablePath, 'C:\\Portable\\brave.exe');
-    assert.equal(saved.configuration.profilePath, configuration.profilePath);
+    assert.deepEqual(saved.configuration, {
+      ...configuration,
+      executablePath: 'C:\\Portable\\brave.exe',
+      skipPinRestoration: true,
+      pin: null,
+    });
   }
   assert.equal(existsSync(previousProfilePath), true);
 });
@@ -338,8 +401,10 @@ test('config reports persisted browser, profile, port, and startup URL', async c
   assert.match(result.output[0], /Browser: brave/);
   assert.match(result.output[0], /Executable: C:\\Program Files\\BraveSoftware/);
   assert.match(result.output[0], /Profile: C:\\Users\\test/);
+  assert.match(result.output[0], /Skip PIN restoration: false/);
   assert.match(result.output[0], /CDP port: 9222/);
   assert.match(result.output[0], /Startup URL: https:\/\/www\.facebook\.com/);
+  assert.doesNotMatch(result.output[0], /001234/);
   assert.deepEqual(result.errors, []);
 });
 

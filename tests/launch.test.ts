@@ -15,6 +15,8 @@ const baseConfiguration: Configuration = {
   browser: 'brave',
   executablePath: 'C:\\Browsers\\Brave\\brave.exe',
   profilePath: 'C:\\Users\\test\\AppData\\Local\\Impractical Bot\\brave-profile',
+  skipPinRestoration: false,
+  pin: '001234',
   cdpPort: 49271,
   startupUrl: 'https://www.facebook.com',
 };

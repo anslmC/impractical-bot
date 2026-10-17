@@ -22,9 +22,13 @@ export interface Configuration {
   browser: BrowserId;
   executablePath: string;
   profilePath: string;
+  skipPinRestoration: boolean;
+  pin: string | null;
   cdpPort?: number;
   startupUrl?: string;
 }
+
+export type ConfigurationWithoutPin = Omit<Configuration, 'pin'>;
 
 export interface ConfigurationPaths {
   directory: string;
@@ -33,7 +37,13 @@ export interface ConfigurationPaths {
 
 export type ConfigurationLoadResult =
   | { status: 'missing' }
-  | { status: 'valid'; configuration: Configuration }
+  | {
+    status: 'valid';
+    configuration: Configuration;
+    needsSkipPinRestorationBackfill?: true;
+    needsPinBackfill?: true;
+  }
+  | { status: 'pin-required'; configuration: ConfigurationWithoutPin }
   | { status: 'malformed'; message: string }
   | { status: 'unsupported-version'; version: number };
 
@@ -44,6 +54,8 @@ const CONFIGURATION_KEYS = new Set([
   'browser',
   'executablePath',
   'profilePath',
+  'skipPinRestoration',
+  'pin',
   'cdpPort',
   'startupUrl',
 ]);
@@ -94,7 +106,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-export function validateConfiguration(value: unknown): Configuration {
+function validateConfigurationFields(value: unknown): ConfigurationWithoutPin {
   if (!isRecord(value)) {
     throw new Error('Configuration must be a JSON object.');
   }
@@ -120,6 +132,10 @@ export function validateConfiguration(value: unknown): Configuration {
   }
   const profilePath = requireWindowsAbsolutePath(value.profilePath, 'profilePath');
 
+  const hasSkipPinRestoration = Object.prototype.hasOwnProperty.call(value, 'skipPinRestoration');
+  if (hasSkipPinRestoration && typeof value.skipPinRestoration !== 'boolean') {
+    throw new Error('skipPinRestoration must be a boolean.');
+  }
   if (
     value.cdpPort !== undefined &&
     (
@@ -149,9 +165,32 @@ export function validateConfiguration(value: unknown): Configuration {
     browser: value.browser as BrowserId,
     executablePath,
     profilePath,
+    skipPinRestoration: hasSkipPinRestoration ? value.skipPinRestoration as boolean : false,
     ...(value.cdpPort === undefined ? {} : { cdpPort: value.cdpPort as number }),
     ...(value.startupUrl === undefined ? {} : { startupUrl: value.startupUrl as string }),
   };
+}
+
+export function validateConfiguration(value: unknown): Configuration {
+  const configuration = validateConfigurationFields(value);
+  if (!isRecord(value)) {
+    throw new Error('Configuration must be a JSON object.');
+  }
+  const hasPin = Object.prototype.hasOwnProperty.call(value, 'pin');
+  if (!hasPin && !configuration.skipPinRestoration) {
+    throw new Error('pin is required when Messenger PIN restoration is enabled.');
+  }
+
+  const pin = hasPin ? value.pin : null;
+  if (configuration.skipPinRestoration) {
+    if (pin !== null) {
+      throw new Error('pin must be null when Messenger PIN restoration is skipped.');
+    }
+  } else if (typeof pin !== 'string' || !/^[0-9]{6}$/.test(pin)) {
+    throw new Error('pin must contain exactly six digits when Messenger PIN restoration is enabled.');
+  }
+
+  return { ...configuration, pin: pin as string | null };
 }
 
 function getFilePath(filePath?: string): string {
@@ -192,8 +231,30 @@ export function loadConfiguration(filePath?: string): ConfigurationLoadResult {
     return { status: 'unsupported-version', version: parsed.version as number };
   }
 
+  const hasPin = Object.prototype.hasOwnProperty.call(parsed, 'pin');
+  if (!hasPin && parsed.skipPinRestoration !== true) {
+    try {
+      return { status: 'pin-required', configuration: validateConfigurationFields(parsed) };
+    } catch (error) {
+      return {
+        status: 'malformed',
+        message: error instanceof Error ? error.message : 'Configuration values are invalid.',
+      };
+    }
+  }
+
   try {
-    return { status: 'valid', configuration: validateConfiguration(parsed) };
+    const configuration = validateConfiguration(
+      !hasPin ? { ...parsed, pin: null } : parsed,
+    );
+    return {
+      status: 'valid',
+      configuration,
+      ...(!Object.prototype.hasOwnProperty.call(parsed, 'skipPinRestoration')
+        ? { needsSkipPinRestorationBackfill: true as const }
+        : {}),
+      ...(!hasPin ? { needsPinBackfill: true as const } : {}),
+    };
   } catch (error) {
     return {
       status: 'malformed',

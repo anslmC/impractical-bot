@@ -3,7 +3,11 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join, win32 } from 'node:path';
 import { test, type TestContext } from 'node:test';
-import { getBrowserProfilePath, initializeConfiguration } from '../src/browser/initialization.js';
+import {
+  getBrowserProfilePath,
+  initializeConfiguration,
+  promptPinRestorationSettings,
+} from '../src/browser/initialization.js';
 import { loadConfiguration, saveConfiguration, type Configuration } from '../src/config/configuration.js';
 
 const environment: NodeJS.ProcessEnv = {
@@ -71,6 +75,8 @@ const existingConfiguration: Configuration = {
   browser: 'brave',
   executablePath: bravePath,
   profilePath: 'C:\\Users\\test\\AppData\\Local\\Impractical Bot\\browser-profile',
+  skipPinRestoration: false,
+  pin: '001234',
   cdpPort: 9222,
   startupUrl: 'https://www.facebook.com',
 };
@@ -147,9 +153,11 @@ test('confirmed rediscovery can replace a stale selection only after selection c
 
 test('a single discovered browser requires confirmation before saving', async context => {
   const filePath = createConfigurationPath(context);
+  const promptCalls: string[] = [];
   const options = createOptions(filePath, {
     installedPaths: [bravePath],
-    answers: ['y'],
+    answers: ['y', '', '123456'],
+    promptCalls,
   });
 
   assert.equal(await initializeConfiguration(options), 'saved');
@@ -159,7 +167,88 @@ test('a single discovered browser requires confirmation before saving', async co
     assert.equal(loaded.configuration.browser, 'brave');
     assert.equal(loaded.configuration.executablePath, bravePath);
     assert.equal(loaded.configuration.profilePath, win32.join(win32.dirname(filePath), 'brave-profile'));
+    assert.equal(loaded.configuration.skipPinRestoration, false);
+    assert.equal(loaded.configuration.pin, '123456');
     assert.equal(existsSync(loaded.configuration.profilePath), false);
+  }
+  assert.match(promptCalls[1], /Skip Messenger PIN restoration/);
+});
+
+test('initial setup saves an affirmative PIN-restoration skip preference', async context => {
+  const filePath = createConfigurationPath(context);
+  const options = createOptions(filePath, {
+    installedPaths: [bravePath],
+    answers: ['y', 'yes'],
+  });
+
+  assert.equal(await initializeConfiguration(options), 'saved');
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.equal(loaded.configuration.skipPinRestoration, true);
+    assert.equal(loaded.configuration.pin, null);
+  }
+});
+
+test('PIN preference prompt accepts Y, y, N, n, whitespace, and the default', async () => {
+  for (const answer of ['Y', 'y', ' y ', 'N', 'n', ' N ', '']) {
+    const skipPinRestoration = ['Y', 'y', ' y '].includes(answer);
+    const answers = [answer, ...(skipPinRestoration ? [] : ['000007'])];
+    const settings = await promptPinRestorationSettings(
+      async () => answers.shift() ?? null,
+      () => undefined,
+    );
+
+    assert.deepEqual(settings, {
+      skipPinRestoration,
+      pin: skipPinRestoration ? null : '000007',
+    });
+  }
+});
+
+test('PIN preference prompt retries invalid answers and PINs without exposing the PIN', async () => {
+  const answers = ['maybe', 'N', '', '12345', '12a456', '001234'];
+  const errors: string[] = [];
+  let promptCount = 0;
+  const settings = await promptPinRestorationSettings(async () => {
+    promptCount += 1;
+    return answers.shift() ?? null;
+  }, message => errors.push(message));
+
+  assert.deepEqual(settings, { skipPinRestoration: false, pin: '001234' });
+  assert.equal(promptCount, 6);
+  assert.equal(errors.length, 4);
+  assert.ok(errors.every(message => !message.includes('001234')));
+});
+
+test('init preserves an existing PIN-restoration preference without prompting', async context => {
+  const filePath = createConfigurationPath(context);
+  const configuration = { ...existingConfiguration, skipPinRestoration: true, pin: null };
+  saveConfiguration(configuration, filePath);
+  const promptCalls: string[] = [];
+
+  assert.equal(await initializeConfiguration(createOptions(filePath, {
+    installedPaths: [bravePath],
+    promptCalls,
+  })), 'preserved');
+  assert.deepEqual(promptCalls, []);
+  assert.deepEqual(loadConfiguration(filePath), { status: 'valid', configuration });
+});
+
+test('init backfills skipPinRestoration without changing an existing browser selection', async context => {
+  const filePath = createConfigurationPath(context);
+  const legacyConfiguration: Record<string, unknown> = { ...existingConfiguration };
+  delete legacyConfiguration.skipPinRestoration;
+  writeFileSync(filePath, JSON.stringify(legacyConfiguration));
+
+  assert.equal(await initializeConfiguration(createOptions(filePath, { installedPaths: [bravePath] })), 'saved');
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.deepEqual(loaded.configuration, {
+      ...existingConfiguration,
+      skipPinRestoration: false,
+    });
   }
 });
 
@@ -184,7 +273,7 @@ test('multiple browsers show a menu and persist only the selected browser', asyn
   const output: string[] = [];
   const options = createOptions(filePath, {
     installedPaths: [bravePath, chromePath],
-    answers: ['2'],
+    answers: ['2', 'n', '012345'],
     output,
   });
 
@@ -197,6 +286,7 @@ test('multiple browsers show a menu and persist only the selected browser', asyn
   assert.equal(loaded.status, 'valid');
   if (loaded.status === 'valid') {
     assert.equal(loaded.configuration.browser, 'chrome');
+    assert.equal(loaded.configuration.pin, '012345');
   }
 });
 
@@ -216,7 +306,7 @@ test('manual path input retries invalid values and saves only an existing suppor
   const errors: string[] = [];
   const options = createOptions(filePath, {
     installedPaths: [edgePath],
-    answers: ['4', ` ${edgePath} `, edgePath],
+    answers: ['4', ` ${edgePath} `, edgePath, 'n', '012345'],
     errors,
   });
 
@@ -227,6 +317,7 @@ test('manual path input retries invalid values and saves only an existing suppor
   if (loaded.status === 'valid') {
     assert.equal(loaded.configuration.browser, 'edge');
     assert.equal(loaded.configuration.executablePath, edgePath);
+    assert.equal(loaded.configuration.pin, '012345');
   }
 });
 
@@ -270,10 +361,11 @@ test('malformed and unsupported configurations are not overwritten', async conte
 
 test('a legacy valid configuration is upgraded with a CDP port and startup URL', async context => {
   const filePath = createConfigurationPath(context);
-  const legacyConfiguration = { ...existingConfiguration };
-  delete (legacyConfiguration as Partial<Configuration>).cdpPort;
-  delete (legacyConfiguration as Partial<Configuration>).startupUrl;
-  saveConfiguration(legacyConfiguration, filePath);
+  const legacyConfiguration: Record<string, unknown> = { ...existingConfiguration };
+  delete legacyConfiguration.skipPinRestoration;
+  delete legacyConfiguration.cdpPort;
+  delete legacyConfiguration.startupUrl;
+  writeFileSync(filePath, JSON.stringify(legacyConfiguration));
 
   assert.equal(await initializeConfiguration(createOptions(filePath, { installedPaths: [bravePath] })), 'saved');
   const loaded = loadConfiguration(filePath);
@@ -283,5 +375,50 @@ test('a legacy valid configuration is upgraded with a CDP port and startup URL',
     assert.ok(loaded.configuration.cdpPort < 60_000);
     assert.equal(loaded.configuration.startupUrl, 'https://www.facebook.com');
     assert.equal(loaded.configuration.profilePath, legacyConfiguration.profilePath);
+    assert.equal(loaded.configuration.skipPinRestoration, false);
+    assert.equal(loaded.configuration.pin, existingConfiguration.pin);
+  }
+});
+
+test('init reconfigures a legacy config missing its required PIN without changing unrelated fields', async context => {
+  const filePath = createConfigurationPath(context);
+  const legacyConfiguration: Record<string, unknown> = { ...existingConfiguration };
+  delete legacyConfiguration.pin;
+  writeFileSync(filePath, JSON.stringify(legacyConfiguration));
+
+  assert.equal(await initializeConfiguration(createOptions(filePath, {
+    installedPaths: [bravePath],
+    answers: ['n', '000042'],
+  })), 'saved');
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.deepEqual(loaded.configuration, {
+      ...existingConfiguration,
+      pin: '000042',
+    });
+  }
+});
+
+test('init backfills a missing PIN as null when legacy restoration is skipped', async context => {
+  const filePath = createConfigurationPath(context);
+  const legacyConfiguration: Record<string, unknown> = {
+    ...existingConfiguration,
+    skipPinRestoration: true,
+  };
+  delete legacyConfiguration.pin;
+  writeFileSync(filePath, JSON.stringify(legacyConfiguration));
+  const promptCalls: string[] = [];
+
+  assert.equal(await initializeConfiguration(createOptions(filePath, {
+    installedPaths: [bravePath],
+    promptCalls,
+  })), 'saved');
+  assert.deepEqual(promptCalls, []);
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.equal(loaded.configuration.skipPinRestoration, true);
+    assert.equal(loaded.configuration.pin, null);
   }
 });

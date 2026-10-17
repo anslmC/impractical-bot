@@ -8,6 +8,7 @@ import {
   saveConfiguration,
   type BrowserId,
   type Configuration,
+  type ConfigurationWithoutPin,
   type ConfigurationLoadResult,
 } from '../config/configuration.js';
 import {
@@ -32,6 +33,56 @@ export type SelectionResult =
   | { status: 'selected'; candidate: BrowserCandidate }
   | { status: 'cancelled' };
 
+export interface PinRestorationSettings {
+  skipPinRestoration: boolean;
+  pin: string | null;
+}
+
+export async function promptSkipPinRestoration(
+  prompt: TerminalPrompt,
+  writeError: (message: string) => void,
+): Promise<boolean | null> {
+  while (true) {
+    const answer = await prompt('Skip Messenger PIN restoration on startup? [y/N]: ');
+    if (answer === null) {
+      return null;
+    }
+
+    const normalizedAnswer = answer.trim().toLowerCase();
+    if (normalizedAnswer === 'y' || normalizedAnswer === 'yes') {
+      return true;
+    }
+    if (normalizedAnswer === '' || normalizedAnswer === 'n' || normalizedAnswer === 'no') {
+      return false;
+    }
+    writeError('Enter y to skip PIN restoration, or n to restore chats with the PIN.');
+  }
+}
+
+export async function promptPinRestorationSettings(
+  prompt: TerminalPrompt,
+  writeError: (message: string) => void,
+): Promise<PinRestorationSettings | null> {
+  const skipPinRestoration = await promptSkipPinRestoration(prompt, writeError);
+  if (skipPinRestoration === null) {
+    return null;
+  }
+  if (skipPinRestoration) {
+    return { skipPinRestoration: true, pin: null };
+  }
+
+  while (true) {
+    const pin = await prompt('Enter the six-digit Messenger restoration PIN: ');
+    if (pin === null) {
+      return null;
+    }
+    if (/^[0-9]{6}$/.test(pin)) {
+      return { skipPinRestoration: false, pin };
+    }
+    writeError('PIN must contain exactly six digits. The PIN was not saved.');
+  }
+}
+
 function isFile(path: string): boolean {
   try {
     return statSync(path).isFile();
@@ -40,7 +91,7 @@ function isFile(path: string): boolean {
   }
 }
 
-function candidateForConfiguration(configuration: Configuration): BrowserCandidate {
+function candidateForConfiguration(configuration: ConfigurationWithoutPin): BrowserCandidate {
   return {
     browser: configuration.browser,
     displayName: getBrowserDisplayName(configuration.browser),
@@ -140,16 +191,20 @@ export async function selectBrowserCandidate(
 function configurationForSelection(
   candidate: BrowserCandidate,
   configurationFilePath: string,
+  pinSettings: PinRestorationSettings,
+  existingConfiguration?: ConfigurationWithoutPin,
 ): Configuration {
   const profilePath = getBrowserProfilePath(candidate.browser, configurationFilePath);
   const browser: BrowserId = candidate.browser;
   return {
+    ...existingConfiguration,
     version: CONFIGURATION_VERSION,
     browser,
     executablePath: candidate.executablePath,
     profilePath,
-    cdpPort: randomInt(20_000, 60_000),
-    startupUrl: 'https://www.facebook.com',
+    ...pinSettings,
+    cdpPort: existingConfiguration?.cdpPort ?? randomInt(20_000, 60_000),
+    startupUrl: existingConfiguration?.startupUrl ?? 'https://www.facebook.com',
   };
 }
 
@@ -191,22 +246,64 @@ export async function initializeConfiguration(
     writeError(`Configuration schema version ${saved.version} is not supported.`);
     return 'failed';
   }
+  const existingConfiguration = saved.status === 'valid' || saved.status === 'pin-required'
+    ? saved.configuration
+    : undefined;
   if (saved.status === 'valid') {
     const candidate = candidateForConfiguration(saved.configuration);
     if (isBrowserExecutableAvailable(candidate.executablePath, fileExists)) {
-      if (saved.configuration.cdpPort === undefined || saved.configuration.startupUrl === undefined) {
+      if (
+        saved.needsSkipPinRestorationBackfill === true ||
+        saved.needsPinBackfill === true ||
+        saved.configuration.cdpPort === undefined ||
+        saved.configuration.startupUrl === undefined
+      ) {
         saveConfiguration({
           ...saved.configuration,
+          skipPinRestoration: saved.configuration.skipPinRestoration ?? false,
+          pin: saved.configuration.pin ?? null,
           cdpPort: saved.configuration.cdpPort ?? randomInt(20_000, 60_000),
           startupUrl: saved.configuration.startupUrl ?? 'https://www.facebook.com',
         }, configurationFilePath);
-        writeOutput('Existing configuration updated with the CDP port and startup URL.');
+        writeOutput('Existing configuration updated with missing default values.');
         return 'saved';
       }
       writeOutput(
         `Existing browser selection preserved: ${candidate.displayName} (${candidate.executablePath}).`,
       );
       return 'preserved';
+    }
+
+    writeError(
+      `Saved ${candidate.displayName} executable is missing: ${candidate.executablePath}`,
+    );
+    const answer = await options.prompt('Rediscover available browsers? [y/N]: ');
+    if (answer === null || !['y', 'yes'].includes(answer.trim().toLowerCase())) {
+      writeOutput('Initialization cancelled. Existing configuration was not changed.');
+      return 'cancelled';
+    }
+  }
+  if (saved.status === 'pin-required') {
+    const candidate = candidateForConfiguration(saved.configuration);
+    if (isBrowserExecutableAvailable(candidate.executablePath, fileExists)) {
+      const pinSettings = await promptPinRestorationSettings(options.prompt, writeError);
+      if (pinSettings === null) {
+        writeOutput('Initialization cancelled. No configuration was written.');
+        return 'cancelled';
+      }
+      try {
+        saveConfiguration({
+          ...saved.configuration,
+          ...pinSettings,
+          cdpPort: saved.configuration.cdpPort ?? randomInt(20_000, 60_000),
+          startupUrl: saved.configuration.startupUrl ?? 'https://www.facebook.com',
+        }, configurationFilePath);
+      } catch (error) {
+        writeError(`Unable to save configuration: ${error instanceof Error ? error.message : String(error)}`);
+        return 'failed';
+      }
+      writeOutput('Existing browser configuration updated with PIN-restoration settings.');
+      return 'saved';
     }
 
     writeError(
@@ -249,7 +346,23 @@ export async function initializeConfiguration(
     return 'failed';
   }
 
-  const configuration = configurationForSelection(selection.candidate, configurationFilePath);
+  const pinSettings = saved.status === 'valid'
+    ? {
+      skipPinRestoration: saved.configuration.skipPinRestoration,
+      pin: saved.configuration.pin,
+    }
+    : await promptPinRestorationSettings(options.prompt, writeError);
+  if (pinSettings === null) {
+    writeOutput('Initialization cancelled. No configuration was written.');
+    return 'cancelled';
+  }
+
+  const configuration = configurationForSelection(
+    selection.candidate,
+    configurationFilePath,
+    pinSettings,
+    existingConfiguration,
+  );
   try {
     saveConfiguration(configuration, configurationFilePath);
   } catch (error) {

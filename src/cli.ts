@@ -7,6 +7,7 @@ import {
   initializeConfiguration,
   getBrowserProfilePath,
   isBrowserExecutableAvailable,
+  promptPinRestorationSettings,
   selectBrowserCandidate,
   type InitializationOptions,
   type InitializationStatus,
@@ -110,6 +111,10 @@ function handleConfig(writeOutput: Output, writeError: Output, filePath?: string
     writeError(`Configuration schema version ${result.version} is not supported.`);
     return 1;
   }
+  if (result.status === 'pin-required') {
+    writeError('Messenger PIN configuration is required. Run `impbot init` to reconfigure it.');
+    return 1;
+  }
 
   const configuration = result.configuration;
   writeOutput([
@@ -118,6 +123,7 @@ function handleConfig(writeOutput: Output, writeError: Output, filePath?: string
     `  Browser: ${configuration.browser}`,
     `  Executable: ${configuration.executablePath}`,
     `  Profile: ${configuration.profilePath}`,
+    `  Skip PIN restoration: ${configuration.skipPinRestoration}`,
     `  CDP port: ${configuration.cdpPort ?? 'not configured'}`,
     `  Startup URL: ${configuration.startupUrl ?? 'not configured'}`,
   ].join('\n'));
@@ -149,6 +155,10 @@ async function handleChangeBrowser(
   }
   if (configurationResult.status === 'unsupported-version') {
     writeError(`Configuration schema version ${configurationResult.version} is not supported.`);
+    return 1;
+  }
+  if (configurationResult.status === 'pin-required') {
+    writeError('Messenger PIN configuration is required. Run `impbot init` to reconfigure it.');
     return 1;
   }
 
@@ -199,11 +209,18 @@ async function handleChangeBrowser(
       return 1;
     }
   }
+  const pinSettings = await promptPinRestorationSettings(prompt, writeError);
+  if (pinSettings === null) {
+    writeOutput('Browser change cancelled. The current configuration was not changed.');
+    return 0;
+  }
+
   const nextConfiguration: Configuration = {
     ...currentConfiguration,
     browser: candidate.browser,
     executablePath: candidate.executablePath,
     profilePath,
+    ...pinSettings,
   };
 
   try {
@@ -249,6 +266,10 @@ async function handleStart(
   }
   if (configurationResult.status === 'unsupported-version') {
     writeError(`Configuration schema version ${configurationResult.version} is not supported.`);
+    return 1;
+  }
+  if (configurationResult.status === 'pin-required') {
+    writeError('Messenger PIN configuration is required. Run `impbot init` to reconfigure it.');
     return 1;
   }
 

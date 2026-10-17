@@ -22,6 +22,8 @@ const validConfiguration: Configuration = {
   browser: 'brave',
   executablePath: 'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
   profilePath: 'C:\\Users\\test\\AppData\\Local\\Impractical Bot\\profile',
+  skipPinRestoration: false,
+  pin: '001234',
   cdpPort: 9222,
   startupUrl: 'https://www.facebook.com',
 };
@@ -162,4 +164,106 @@ test('saving refuses to overwrite malformed configuration or leave partial files
   assert.throws(() => saveConfiguration(validConfiguration, join(blockingPath, 'config.json')));
   assert.equal(readFileSync(blockingPath, 'utf8'), 'preserve me');
   assert.deepEqual(readdirSync(dirname(filePath)).sort(), ['config.json', 'not-a-directory']);
+});
+
+test('validation defaults the PIN restoration setting and rejects invalid values and unknown keys', () => {
+  const legacyConfiguration: Record<string, unknown> = { ...validConfiguration };
+  delete legacyConfiguration.skipPinRestoration;
+  assert.equal(validateConfiguration(legacyConfiguration).skipPinRestoration, false);
+
+  for (const skipPinRestoration of [undefined, null, 'false', 0]) {
+    assert.throws(
+      () => validateConfiguration({ ...validConfiguration, skipPinRestoration }),
+      /skipPinRestoration must be a boolean/,
+    );
+  }
+  assert.throws(
+    () => validateConfiguration({ ...validConfiguration, unexpected: true }),
+    /unsupported field 'unexpected'/,
+  );
+});
+
+test('PIN validation requires six digits when enabled and null when skipped', () => {
+  for (const pin of ['000000', '012345', '999999']) {
+    assert.equal(validateConfiguration({
+      ...validConfiguration,
+      skipPinRestoration: false,
+      pin,
+    }).pin, pin);
+  }
+  assert.equal(validateConfiguration({
+    ...validConfiguration,
+    skipPinRestoration: true,
+    pin: null,
+  }).pin, null);
+
+  for (const pin of [null, '', '12345', '1234567', '12a456', 123456]) {
+    assert.throws(
+      () => validateConfiguration({ ...validConfiguration, skipPinRestoration: false, pin }),
+      /pin must contain exactly six digits/,
+    );
+  }
+  assert.throws(
+    () => validateConfiguration({ ...validConfiguration, skipPinRestoration: true, pin: '123456' }),
+    /pin must be null/,
+  );
+  const missingPin: Record<string, unknown> = { ...validConfiguration };
+  delete missingPin.pin;
+  assert.throws(
+    () => validateConfiguration(missingPin),
+    /pin is required/,
+  );
+  const skippedWithoutPin: Record<string, unknown> = {
+    ...validConfiguration,
+    skipPinRestoration: true,
+  };
+  delete skippedWithoutPin.pin;
+  assert.equal(validateConfiguration(skippedWithoutPin).pin, null);
+});
+
+test('loading a legacy configuration defaults the PIN restoration setting and marks it for backfill', context => {
+  const filePath = createTemporaryConfigPath(context);
+  const legacyConfiguration: Record<string, unknown> = { ...validConfiguration };
+  delete legacyConfiguration.skipPinRestoration;
+  writeFileSync(filePath, JSON.stringify(legacyConfiguration));
+
+  const result = loadConfiguration(filePath);
+  assert.equal(result.status, 'valid');
+  if (result.status === 'valid') {
+    assert.equal(result.configuration.skipPinRestoration, false);
+    assert.equal(result.needsSkipPinRestorationBackfill, true);
+  }
+});
+
+test('loading a legacy enabled-restoration configuration requires PIN reconfiguration', context => {
+  const filePath = createTemporaryConfigPath(context);
+  const legacyConfiguration: Record<string, unknown> = { ...validConfiguration };
+  delete legacyConfiguration.pin;
+  writeFileSync(filePath, JSON.stringify(legacyConfiguration));
+
+  const result = loadConfiguration(filePath);
+  assert.equal(result.status, 'pin-required');
+  if (result.status === 'pin-required') {
+    assert.equal(result.configuration.skipPinRestoration, false);
+    assert.equal(result.configuration.browser, validConfiguration.browser);
+    assert.equal('pin' in result.configuration, false);
+  }
+});
+
+test('loading a legacy skipped-restoration config safely backfills a null PIN', context => {
+  const filePath = createTemporaryConfigPath(context);
+  const legacyConfiguration: Record<string, unknown> = {
+    ...validConfiguration,
+    skipPinRestoration: true,
+  };
+  delete legacyConfiguration.pin;
+  writeFileSync(filePath, JSON.stringify(legacyConfiguration));
+
+  const result = loadConfiguration(filePath);
+  assert.equal(result.status, 'valid');
+  if (result.status === 'valid') {
+    assert.equal(result.configuration.skipPinRestoration, true);
+    assert.equal(result.configuration.pin, null);
+    assert.equal(result.needsPinBackfill, true);
+  }
 });
