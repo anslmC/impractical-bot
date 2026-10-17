@@ -21,7 +21,7 @@ const validConfiguration: Configuration = {
   version: 1,
   browser: 'brave',
   executablePath: 'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
-  profilePath: 'C:\\Users\\test\\AppData\\Local\\impractical-bot\\profile',
+  profilePath: 'C:\\Users\\test\\AppData\\Local\\Impractical Bot\\profile',
   cdpPort: 9222,
 };
 
@@ -34,7 +34,7 @@ function createTemporaryConfigPath(context: TestContext): string {
 test('configuration paths use LOCALAPPDATA and reject unsupported or invalid locations', () => {
   const localAppData = join(tmpdir(), 'test-local-app-data');
   const paths = resolveConfigurationPaths({ LOCALAPPDATA: localAppData }, 'win32');
-  const expectedDirectory = win32.join(localAppData, 'impractical-bot');
+  const expectedDirectory = win32.join(localAppData, 'Impractical Bot');
 
   assert.deepEqual(paths, {
     directory: expectedDirectory,

@@ -36,7 +36,7 @@ const validConfiguration: Configuration = {
   version: 1,
   browser: 'brave',
   executablePath: 'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
-  profilePath: 'C:\\Users\\test\\AppData\\Local\\impractical-bot\\profile',
+  profilePath: 'C:\\Users\\test\\AppData\\Local\\Impractical Bot\\profile',
   cdpPort: 9222,
 };
 

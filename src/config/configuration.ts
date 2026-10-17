@@ -36,7 +36,7 @@ export type ConfigurationLoadResult =
   | { status: 'malformed'; message: string }
   | { status: 'unsupported-version'; version: number };
 
-const CONFIGURATION_DIRECTORY_NAME = 'impractical-bot';
+const CONFIGURATION_DIRECTORY_NAME = 'Impractical Bot';
 const CONFIGURATION_FILE_NAME = 'config.json';
 const CONFIGURATION_KEYS = new Set([
   'version',

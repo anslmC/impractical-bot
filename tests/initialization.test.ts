@@ -70,7 +70,7 @@ const existingConfiguration: Configuration = {
   version: 1,
   browser: 'brave',
   executablePath: bravePath,
-  profilePath: 'C:\\Users\\test\\AppData\\Local\\impractical-bot\\browser-profile',
+  profilePath: 'C:\\Users\\test\\AppData\\Local\\Impractical Bot\\browser-profile',
 };
 
 test('a valid saved browser selection is preserved without prompting or rediscovery', async context => {
