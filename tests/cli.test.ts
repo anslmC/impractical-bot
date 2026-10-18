@@ -47,14 +47,30 @@ const validConfiguration: Configuration = {
   messageDestination: 'https://www.facebook.com/messages/t/1618007223454558',
 };
 
-test('start launches, reports connection, disconnects Playwright, and returns', async context => {
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>(resolvePromise => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+test('start prepares the destination, remains alive after readiness, and disconnects on shutdown', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
   let receivedConfiguration: Configuration | undefined;
   let disconnects = 0;
+  const prepareStarted = deferred<void>();
+  const preparation = deferred<void>();
+  const shutdown = deferred<void>();
   const session: BrowserLaunchSession = {
     endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
     browserVersion: 'Brave Chromium test',
+    disconnected: new Promise<void>(() => undefined),
+    async prepare() {
+      prepareStarted.resolve();
+      await preparation.promise;
+    },
     async disconnect() {
       disconnects += 1;
     },
@@ -64,18 +80,126 @@ test('start launches, reports connection, disconnects Playwright, and returns', 
       receivedConfiguration = configuration;
       return session;
     },
+    waitForShutdown: () => shutdown.promise,
   };
 
-  const result = await captureCli(['start'], configurationFilePath, undefined, undefined, runtime);
+  const start = captureCli(['start'], configurationFilePath, undefined, undefined, runtime);
+  let settled = false;
+  void start.then(() => {
+    settled = true;
+  });
+  await prepareStarted.promise;
+  preparation.resolve();
+  await new Promise<void>(resolve => setImmediate(resolve));
 
-  assert.equal(result.exitCode, 0);
+  assert.equal(settled, false);
+  assert.equal(disconnects, 0);
+  shutdown.resolve();
+  const result = await start;
+
+  assert.equal(result.exitCode, 130);
   assert.deepEqual(receivedConfiguration, validConfiguration);
   assert.equal(disconnects, 1);
   assert.deepEqual(result.output, [
     'Browser launched and connected (Brave Chromium test).',
-    'Playwright disconnected; the browser remains open.',
+    `Engine ready at ${validConfiguration.messageDestination}.`,
+    'Shutdown requested; disconnecting Playwright.',
   ]);
   assert.deepEqual(result.errors, []);
+});
+
+test('start disconnects the session when shutdown is requested during launch', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  const launchStarted = deferred<void>();
+  const launchCompletion = deferred<BrowserLaunchSession>();
+  const shutdown = deferred<void>();
+  let prepareCalls = 0;
+  let disconnects = 0;
+  const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    launchBrowser: async () => {
+      launchStarted.resolve();
+      return launchCompletion.promise;
+    },
+    waitForShutdown: () => shutdown.promise,
+  });
+
+  await launchStarted.promise;
+  shutdown.resolve();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  launchCompletion.resolve({
+    endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+    browserVersion: 'Brave Chromium test',
+    disconnected: new Promise<void>(() => undefined),
+    async prepare() {
+      prepareCalls += 1;
+    },
+    async disconnect() {
+      disconnects += 1;
+    },
+  });
+  const result = await start;
+
+  assert.equal(result.exitCode, 130);
+  assert.equal(prepareCalls, 0);
+  assert.equal(disconnects, 1);
+  assert.ok(!result.output.some(message => message.startsWith('Engine ready')));
+});
+
+test('start disconnects Playwright and does not report readiness when preparation fails', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  let disconnects = 0;
+  const result = await captureCli(['start'], configurationFilePath, undefined, undefined, {
+    launchBrowser: async () => ({
+      endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+      browserVersion: 'Brave Chromium test',
+      disconnected: new Promise<void>(() => undefined),
+      async prepare() {
+        throw new Error('login detection timed out');
+      },
+      async disconnect() {
+        disconnects += 1;
+      },
+    }),
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(disconnects, 1);
+  assert.ok(!result.output.some(message => message.startsWith('Engine ready')));
+  assert.match(result.errors[0], /login detection timed out/);
+});
+
+test('start exits with an error and disconnects when CDP disconnects unexpectedly', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  const disconnected = deferred<void>();
+  const preparationStarted = deferred<void>();
+  const preparation = deferred<void>();
+  let disconnects = 0;
+  const resultPromise = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    launchBrowser: async () => ({
+      endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+      browserVersion: 'Brave Chromium test',
+      disconnected: disconnected.promise,
+      async prepare() {
+        preparationStarted.resolve();
+        await preparation.promise;
+      },
+      async disconnect() {
+        disconnects += 1;
+      },
+    }),
+  });
+
+  await preparationStarted.promise;
+  disconnected.resolve();
+  const result = await resultPromise;
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(disconnects, 1);
+  assert.ok(!result.output.some(message => message.startsWith('Engine ready')));
+  assert.match(result.errors[0], /disconnected/);
 });
 
 test('start reports missing configuration without launching a browser', async context => {

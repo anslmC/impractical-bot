@@ -37,6 +37,7 @@ type Output = (message: string) => void;
 
 export interface CliRuntimeOptions {
   launchBrowser?: (configuration: Configuration) => Promise<BrowserLaunchSession>;
+  waitForShutdown?: () => Promise<void>;
   closeBrowser?: (configuration: Configuration) => Promise<void>;
   navigateMessageDestination?: (
     configuration: Configuration,
@@ -353,23 +354,79 @@ async function handleStart(
     return 1;
   }
 
-  let session: BrowserLaunchSession;
-  try {
-    session = await (runtime.launchBrowser ?? launchConfiguredBrowser)(configurationResult.configuration);
-  } catch (error) {
-    writeError(`Unable to start browser: ${error instanceof Error ? error.message : String(error)}`);
-    return 1;
-  }
+  let resolveSigint!: () => void;
+  const sigintPromise = new Promise<void>(resolve => {
+    resolveSigint = resolve;
+  });
+  const onSigint = (): void => resolveSigint();
+  process.once('SIGINT', onSigint);
+  const shutdownPromise = runtime.waitForShutdown
+    ? Promise.race([sigintPromise, Promise.resolve().then(() => runtime.waitForShutdown!())])
+    : sigintPromise;
+  let session: BrowserLaunchSession | undefined;
+  let exitCode = 0;
+  let startupStage: 'launch' | 'prepare' = 'launch';
 
-  writeOutput(`Browser launched and connected (${session.browserVersion}).`);
   try {
-    await session.disconnect();
+    const launchPromise = (runtime.launchBrowser ?? launchConfiguredBrowser)(configurationResult.configuration);
+    const launchResult = await Promise.race([
+      launchPromise.then(
+        launchedSession => ({ type: 'launched' as const, session: launchedSession }),
+        error => ({ type: 'failed' as const, error }),
+      ),
+      shutdownPromise.then(() => ({ type: 'shutdown' as const })),
+    ]);
+    if (launchResult.type === 'failed') {
+      writeError(`Unable to start browser: ${launchResult.error instanceof Error ? launchResult.error.message : String(launchResult.error)}`);
+      exitCode = 1;
+    } else if (launchResult.type === 'shutdown') {
+      session = await launchPromise.catch(() => undefined);
+      writeOutput('Shutdown requested; disconnecting Playwright.');
+      exitCode = 130;
+    } else {
+      session = launchResult.session;
+      startupStage = 'prepare';
+      writeOutput(`Browser launched and connected (${session.browserVersion}).`);
+      const preparationResult = await Promise.race([
+        session.prepare().then(() => 'ready' as const),
+        shutdownPromise.then(() => 'shutdown' as const),
+        session.disconnected.then(() => 'disconnected' as const),
+      ]);
+      if (preparationResult === 'shutdown') {
+        writeOutput('Shutdown requested; disconnecting Playwright.');
+        exitCode = 130;
+      } else if (preparationResult === 'disconnected') {
+        throw new Error('The browser disconnected during startup preparation.');
+      } else {
+        writeOutput(`Engine ready at ${configurationResult.configuration.messageDestination}.`);
+        const runtimeResult = await Promise.race([
+          shutdownPromise.then(() => 'shutdown' as const),
+          session.disconnected.then(() => 'disconnected' as const),
+        ]);
+        if (runtimeResult === 'shutdown') {
+          writeOutput('Shutdown requested; disconnecting Playwright.');
+          exitCode = 130;
+        } else {
+          throw new Error('The browser disconnected unexpectedly while the engine was running.');
+        }
+      }
+    }
   } catch (error) {
-    writeError(`Unable to disconnect Playwright: ${error instanceof Error ? error.message : String(error)}`);
-    return 1;
+    const action = startupStage === 'launch' ? 'start browser' : 'prepare browser';
+    writeError(`Unable to ${action}: ${error instanceof Error ? error.message : String(error)}`);
+    exitCode = 1;
+  } finally {
+    process.removeListener('SIGINT', onSigint);
+    if (session) {
+      try {
+        await session.disconnect();
+      } catch (error) {
+        writeError(`Unable to disconnect Playwright: ${error instanceof Error ? error.message : String(error)}`);
+        exitCode = 1;
+      }
+    }
   }
-  writeOutput('Playwright disconnected; the browser remains open.');
-  return 0;
+  return exitCode;
 }
 
 async function handleStop(writeOutput: Output, writeError: Output): Promise<number> {
