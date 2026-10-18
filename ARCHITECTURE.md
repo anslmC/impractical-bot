@@ -43,12 +43,8 @@ These are responsibility boundaries, not a commitment to speculative modules or 
 
 - **M0 - Project foundation:** establish TypeScript, linting, Node's built-in test runner, repository structure, and accurate project documentation.
 - **M1 - Browser and CLI lifecycle:** implement supported-browser discovery and managed launch, local configuration foundations, and the `init`, `config`, `start`, and `stop` command flows with process ownership safeguards.
-- **M2 - Conversation identity:** identify the intended tab and conversation and detect unexpected changes.
-- **M3 - Message handling:** gather rendered messages and classify sender and direction; do not act on unknown identity.
-- **M4 - Bot orchestration:** decide when to prepare a response and ensure proposals are tied to current context.
-- **M5 - AI integration:** add NVIDIA integration and AI response generation. Dynamic message gathering and AI response generation remain future work.
-- **M6 - Safety and sending:** validate proposals, apply the approval gate, and send only through the verified conversation; do not automatically retry uncertain sends.
-- **M7 - End-to-end hardening:** verify the integrated workflow and failure handling before expanding use.
+- **M2 - Core Bot:** implement Playwright browser actions for navigation, retrieving and backreading messages, and sending messages; integrate NVIDIA AI response generation; and define system instructions governing the bot's behavior.
+- **M3 - End-to-end hardening:** integrate and polish the workflow, improve reliability, and verify failure handling before expanding use.
 
 ## Existing Experiments and Open Questions
 
