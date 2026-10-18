@@ -128,7 +128,10 @@ class StartupLocator {
 
 class StartupPage {
   currentUrl: string;
+  readonly gotoUrls: string[] = [];
   loginDetected = false;
+  loginIndicatorsAvailable = true;
+  loginIndicatorError: Error | undefined;
   navigationCount = 0;
   pinVisible = false;
   notificationVisible = false;
@@ -147,6 +150,9 @@ class StartupPage {
     this.currentUrl = 'https://www.facebook.com/';
     this.scenario = scenario;
     this.destination = destination;
+    void this.loginGate.promise.then(() => {
+      this.loginDetected = true;
+    });
   }
 
   private readonly destination: string;
@@ -178,7 +184,17 @@ class StartupPage {
   }
 
   async goto(url: string): Promise<void> {
-    assert.equal(this.loginDetected, true, 'navigation must follow successful login detection');
+    this.gotoUrls.push(url);
+    if (url === baseConfiguration.startupUrl) {
+      this.currentUrl = url;
+      return;
+    }
+    const alreadyAtDestination = this.currentUrl === url;
+    assert.equal(
+      this.loginDetected || alreadyAtDestination,
+      true,
+      'destination navigation must follow login detection unless already at the destination',
+    );
     this.navigationCount += 1;
     this.currentUrl = this.scenario === 'wrong-conversation'
       ? 'https://www.facebook.com/messages/t/999999999'
@@ -225,11 +241,20 @@ class StartupPage {
     if (key === 'pin-rejection') return this.pinRejected ? 1 : 0;
     if (key === 'role:heading:Create a post' ||
       key === '[role="region"][aria-label="Create a post"]' ||
-      key === 'role:button:Messenger') return 1;
+      key === 'role:button:Messenger') {
+      return this.loginDetected && this.loginIndicatorsAvailable ? 1 : 0;
+    }
     return 0;
   }
 
   isVisible(key: string): boolean {
+    if (this.loginIndicatorError && (
+      key === 'role:heading:Create a post' ||
+      key === '[role="region"][aria-label="Create a post"]' ||
+      key === 'role:button:Messenger'
+    )) {
+      throw this.loginIndicatorError;
+    }
     if (key === 'notification-dialog') {
       if (this.scenario === 'late-blockers' && this.events.includes('notification-checked')) {
         this.notificationVisible = true;
@@ -259,8 +284,17 @@ class StartupPage {
       if (timeout !== undefined) {
         this.loginTimeouts.push(timeout);
       }
+      if (this.loginIndicatorError) {
+        throw this.loginIndicatorError;
+      }
+      if (!this.loginIndicatorsAvailable) {
+        const timeoutError = new Error('Timed out waiting for the Facebook login indicator.');
+        timeoutError.name = 'TimeoutError';
+        await new Promise<void>((_resolve, reject) => {
+          setTimeout(() => reject(timeoutError), timeout ?? 0);
+        });
+      }
       await this.loginGate.promise;
-      this.loginDetected = true;
       return;
     }
     if (key === 'pin-heading' || key === 'role:heading:Enter your PIN to restore your chats') {
@@ -297,10 +331,11 @@ class StartupPage {
   }
 }
 
-function browserForStartupPage(page: StartupPage): Browser {
+function browserForStartupPage(pages: StartupPage | StartupPage[]): Browser {
+  const startupPages = Array.isArray(pages) ? pages : [pages];
   return {
     isConnected: () => true,
-    contexts: () => [{ pages: () => [page] }],
+    contexts: () => [{ pages: () => startupPages }],
   } as unknown as Browser;
 }
 
@@ -409,7 +444,7 @@ test('startup handles notification before skipping PIN restoration when configur
   assert.equal(page.enteredPin, undefined);
   assert.equal(page.skipClicked, true);
   assert.equal(page.composerReady, true);
-  assert.deepEqual(page.loginTimeouts, [1_800_000, 1_800_000, 1_800_000]);
+  assert.deepEqual(page.loginTimeouts, []);
   assert.deepEqual(page.events, [
     'navigated',
     'conversation-verified',
@@ -421,6 +456,136 @@ test('startup handles notification before skipping PIN restoration when configur
     'confirmation-visible',
     'skip-clicked',
   ]);
+});
+
+test('startup detects login on the feed tab and navigates the configured Messenger tab', async () => {
+  const destination = baseConfiguration.messageDestination!;
+  const feedPage = new StartupPage(destination, 'no-pin');
+  feedPage.loginGate.resolve();
+  const messengerPage = new StartupPage(destination, 'no-pin');
+  messengerPage.currentUrl = destination;
+  messengerPage.loginDetected = true;
+  messengerPage.loginIndicatorsAvailable = false;
+
+  await prepareConfiguredBrowser(
+    browserForStartupPage([feedPage, messengerPage]),
+    baseConfiguration,
+    { readinessTimeoutMs: 1_000 },
+  );
+
+  assert.equal(feedPage.navigationCount, 0);
+  assert.equal(messengerPage.navigationCount, 1);
+  assert.deepEqual(feedPage.gotoUrls, []);
+  assert.deepEqual(messengerPage.gotoUrls, [destination]);
+  assert.equal(messengerPage.currentUrl, destination);
+});
+
+test('startup opens Facebook in the existing blank tab when no Facebook tab is restored', async () => {
+  const page = new StartupPage(baseConfiguration.messageDestination!, 'no-pin');
+  page.currentUrl = 'about:blank';
+  page.loginGate.resolve();
+
+  await prepareConfiguredBrowser(browserForStartupPage(page), baseConfiguration);
+
+  assert.deepEqual(page.gotoUrls, [
+    baseConfiguration.startupUrl,
+    baseConfiguration.messageDestination,
+  ]);
+});
+
+test('startup detects login on a single Facebook tab', async () => {
+  const page = new StartupPage(baseConfiguration.messageDestination!, 'no-pin');
+  page.loginGate.resolve();
+
+  await prepareConfiguredBrowser(browserForStartupPage(page), baseConfiguration);
+
+  assert.equal(page.navigationCount, 1);
+  assert.equal(page.loginDetected, true);
+  assert.deepEqual(page.gotoUrls, [baseConfiguration.messageDestination]);
+});
+
+test('startup skips feed login indicators when already at the configured conversation', async () => {
+  const page = new StartupPage(baseConfiguration.messageDestination!, 'no-pin');
+  page.currentUrl = baseConfiguration.messageDestination!;
+  page.loginIndicatorsAvailable = false;
+
+  await prepareConfiguredBrowser(browserForStartupPage(page), baseConfiguration, {
+    loginTimeoutMs: 10,
+    readinessTimeoutMs: 1_000,
+  });
+
+  assert.equal(page.loginDetected, false);
+  assert.equal(page.navigationCount, 1);
+  assert.deepEqual(page.gotoUrls, [baseConfiguration.messageDestination]);
+});
+
+test('startup still requires login detection on another conversation or checkpoint redirect', async () => {
+  const pageUrls = [
+    'https://www.facebook.com/messages/t/999999999',
+    'https://www.facebook.com/checkpoint/',
+  ];
+
+  for (const pageUrl of pageUrls) {
+    const page = new StartupPage(baseConfiguration.messageDestination!, 'no-pin');
+    page.currentUrl = pageUrl;
+    page.loginIndicatorsAvailable = false;
+
+    await assert.rejects(
+      prepareConfiguredBrowser(browserForStartupPage(page), baseConfiguration, {
+        loginTimeoutMs: 10,
+      }),
+      /Login detection timed out before all three visible Facebook indicators appeared/,
+    );
+    assert.deepEqual(page.gotoUrls, []);
+  }
+});
+
+test('startup keeps waiting for manual login before navigating', async () => {
+  const page = new StartupPage(baseConfiguration.messageDestination!, 'no-pin');
+  const preparation = prepareConfiguredBrowser(browserForStartupPage(page), baseConfiguration, {
+    loginTimeoutMs: 1_000,
+  });
+
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(page.navigationCount, 0);
+  page.loginGate.resolve();
+  await preparation;
+
+  assert.equal(page.navigationCount, 1);
+  assert.equal(page.loginDetected, true);
+});
+
+test('startup times out when multiple Facebook tabs have no sufficient login evidence', async () => {
+  const destination = baseConfiguration.messageDestination!;
+  const messengerPage = new StartupPage(destination, 'no-pin');
+  messengerPage.currentUrl = 'https://www.facebook.com/messages/t/999999999';
+  messengerPage.loginIndicatorsAvailable = false;
+  const feedPage = new StartupPage(destination, 'no-pin');
+  feedPage.loginIndicatorsAvailable = false;
+
+  await assert.rejects(
+    prepareConfiguredBrowser(browserForStartupPage([messengerPage, feedPage]), baseConfiguration, {
+      loginTimeoutMs: 10,
+    }),
+    /Login detection timed out before all three visible Facebook indicators appeared/,
+  );
+
+  assert.equal(messengerPage.navigationCount, 0);
+  assert.equal(feedPage.navigationCount, 0);
+});
+
+test('startup reports login indicator page errors instead of relabeling them as timeouts', async () => {
+  const page = new StartupPage(baseConfiguration.messageDestination!, 'no-pin');
+  page.loginIndicatorError = new Error('Facebook tab target closed');
+
+  await assert.rejects(
+    prepareConfiguredBrowser(browserForStartupPage(page), baseConfiguration, {
+      loginTimeoutMs: 10,
+    }),
+    /Login detection could not confirm authentication across Facebook tabs: Facebook tab target closed/,
+  );
+
+  assert.equal(page.navigationCount, 0);
 });
 
 test('startup reports each blocker that appears after the initial checks', async () => {
@@ -612,7 +777,6 @@ test('launches configured browser, connects to its configured port, then disconn
     '--remote-debugging-address=127.0.0.1',
     `--remote-debugging-port=${port}`,
     `--user-data-dir=${config.profilePath}`,
-    config.startupUrl,
   ]);
   assert.equal(connectEndpoint, `ws://127.0.0.1:${port}/devtools/browser/test-session`);
   assert.equal(child.unrefCalls, 1);

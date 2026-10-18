@@ -278,18 +278,49 @@ const DEFAULT_LOGIN_TIMEOUT_MS = 1_800_000;
 const DEFAULT_PIN_PROMPT_TIMEOUT_MS = 8_000;
 const DEFAULT_READINESS_TIMEOUT_MS = 20_000;
 
-async function waitForSuccessLogin(page: Page, timeoutMs: number): Promise<void> {
-  const indicators = LOGIN_INDICATORS.map(createIndicator =>
-    createIndicator(page).filter({ visible: true }).first());
-  try {
-    await Promise.all(indicators.map(indicator =>
-      indicator.waitFor({ state: 'visible', timeout: timeoutMs })));
-  } catch {
-    throw new Error('Login detection timed out before all three visible Facebook indicators appeared.');
-  }
+async function areLoginIndicatorsVisible(indicators: Locator[]): Promise<boolean> {
+  return (await Promise.all(indicators.map(indicator => indicator.isVisible()))).every(Boolean);
+}
 
-  if (!(await Promise.all(indicators.map(indicator => indicator.isVisible()))).every(Boolean)) {
-    throw new Error('Login detection failed because a required Facebook indicator is no longer visible.');
+async function waitForSuccessLogin(pages: Page[], timeoutMs: number): Promise<void> {
+  const indicatorsByPage = pages.map(page => LOGIN_INDICATORS.map(createIndicator =>
+    createIndicator(page).filter({ visible: true }).first()));
+  const deadline = Date.now() + timeoutMs;
+  const inspectionErrors = new Map<Page, unknown>();
+
+  while (true) {
+    let inspectedPageCount = 0;
+    for (let index = 0; index < indicatorsByPage.length; index += 1) {
+      try {
+        const indicators = indicatorsByPage[index];
+        if (await areLoginIndicatorsVisible(indicators) && await areLoginIndicatorsVisible(indicators)) {
+          return;
+        }
+        inspectionErrors.delete(pages[index]);
+        inspectedPageCount += 1;
+      } catch (error) {
+        inspectionErrors.set(pages[index], error);
+      }
+    }
+
+    if (inspectedPageCount === 0) {
+      const errors = [...inspectionErrors.values()];
+      const details = errors.map(item => item instanceof Error ? item.message : String(item)).join('; ');
+      throw new Error(`Login detection could not confirm authentication across Facebook tabs: ${details}`, {
+        cause: new AggregateError(errors, 'Facebook login detection failed on every candidate tab.'),
+      });
+    }
+
+    const remainingTime = deadline - Date.now();
+    if (remainingTime <= 0) {
+      const details = [...inspectionErrors.values()]
+        .map(item => item instanceof Error ? item.message : String(item)).join('; ');
+      const suffix = details ? ` Some Facebook tabs could not be inspected: ${details}` : '';
+      throw new Error(
+        `Login detection timed out before all three visible Facebook indicators appeared.${suffix}`,
+      );
+    }
+    await new Promise<void>(resolve => setTimeout(resolve, Math.min(100, remainingTime)));
   }
 }
 
@@ -492,8 +523,39 @@ export async function prepareConfiguredBrowser(
     throw new Error('Message destination must identify a Messenger conversation.');
   }
 
-  const page = selectFacebookPage(browser, destinationUrl);
-  await waitForSuccessLogin(page, options.loginTimeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS);
+  let facebookPages = getFacebookPages(browser);
+  if (facebookPages.length === 0) {
+    const contexts = browser.contexts();
+    const existingPages = contexts.flatMap(context => context.pages());
+    const blankPage = existingPages.find(page => {
+      if (page.isClosed()) {
+        return false;
+      }
+      const url = page.url();
+      return url === 'about:blank' || /^(?:chrome|brave|edge):\/\/newtab\/?$/i.test(url);
+    });
+    const context = contexts[0];
+    if (!blankPage && !context) {
+      throw new Error('No browser context is available for the Facebook startup page.');
+    }
+    const startupPage = blankPage ?? await context!.newPage();
+    if (!validatedConfiguration.startupUrl) {
+      throw new Error('Configuration is missing its startup URL. Run `impbot init` to update it.');
+    }
+    await startupPage.goto(validatedConfiguration.startupUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: options.navigationTimeoutMs ?? 30_000,
+    });
+    facebookPages = getFacebookPages(browser);
+  }
+  const page = selectFacebookPage(facebookPages, destinationUrl);
+  const currentPageUrl = new URL(page.url());
+  const alreadyAtConfiguredConversation = isFacebookUrl(currentPageUrl) &&
+    currentPageUrl.origin === destinationUrl.origin &&
+    conversationId(currentPageUrl) === expectedConversationId;
+  if (!alreadyAtConfiguredConversation) {
+    await waitForSuccessLogin(facebookPages, options.loginTimeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS);
+  }
   await page.goto(destinationUrl.href, {
     waitUntil: 'domcontentloaded',
     timeout: options.navigationTimeoutMs ?? 30_000,
@@ -569,8 +631,8 @@ export async function prepareConfiguredBrowser(
   console.log(`Final verification: configured conversation ${expectedConversationId} is still selected.`);
 }
 
-function selectFacebookPage(browser: Browser, destinationUrl: URL): Page {
-  const facebookPages = browser.contexts()
+function getFacebookPages(browser: Browser): Page[] {
+  return browser.contexts()
     .flatMap(context => context.pages())
     .filter(page => {
       if (page.isClosed()) {
@@ -582,7 +644,9 @@ function selectFacebookPage(browser: Browser, destinationUrl: URL): Page {
         return false;
       }
     });
+}
 
+function selectFacebookPage(facebookPages: Page[], destinationUrl: URL): Page {
   if (facebookPages.length === 0) {
     throw new Error('No existing Facebook tab was found in the configured browser.');
   }
@@ -673,7 +737,7 @@ export async function navigateConfiguredBrowserToMessageDestination(
       throw new Error('Playwright connected to CDP but reports the browser disconnected.');
     }
 
-    const page = selectFacebookPage(browser, destinationUrl);
+    const page = selectFacebookPage(getFacebookPages(browser), destinationUrl);
     const expectedConversationId = conversationId(destinationUrl);
     const currentUrl = new URL(page.url());
     if (expectedConversationId !== conversationId(currentUrl)) {
@@ -830,7 +894,6 @@ export async function launchConfiguredBrowser(
       '--remote-debugging-address=127.0.0.1',
       `--remote-debugging-port=${validatedConfiguration.cdpPort}`,
       `--user-data-dir=${validatedConfiguration.profilePath}`,
-      validatedConfiguration.startupUrl,
     ],
     { detached: true, shell: false, windowsHide: false, stdio: 'ignore' },
   );
