@@ -26,6 +26,7 @@ const validConfiguration: Configuration = {
   pin: '001234',
   cdpPort: 9222,
   startupUrl: 'https://www.facebook.com',
+  messageDestination: 'https://www.facebook.com/messages',
 };
 
 function createTemporaryConfigPath(context: TestContext): string {
@@ -147,6 +148,25 @@ test('validation rejects invalid browsers, paths, and CDP ports', () => {
       () => validateConfiguration({ ...validConfiguration, startupUrl }),
       /startupUrl must be a valid HTTP or HTTPS URL/,
     );
+  }
+  for (const messageDestination of ['not a URL', 'ftp://example.test', null]) {
+    assert.throws(
+      () => validateConfiguration({ ...validConfiguration, messageDestination }),
+      /messageDestination must be a valid HTTP or HTTPS URL/,
+    );
+  }
+});
+
+test('legacy configurations without messageDestination remain valid', context => {
+  const filePath = createTemporaryConfigPath(context);
+  const legacyConfiguration: Record<string, unknown> = { ...validConfiguration };
+  delete legacyConfiguration.messageDestination;
+
+  saveConfiguration(legacyConfiguration, filePath);
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.equal(loaded.configuration.messageDestination, undefined);
   }
 });
 

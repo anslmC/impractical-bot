@@ -16,6 +16,7 @@ import {
 import {
   closeConfiguredBrowser,
   launchConfiguredBrowser,
+  navigateConfiguredBrowserToMessageDestination,
   type BrowserLaunchSession,
 } from './browser/launch.js';
 import {
@@ -28,6 +29,7 @@ import {
   loadConfiguration,
   resolveConfigurationPaths,
   saveConfiguration,
+  validateConfiguration,
   type Configuration,
 } from './config/configuration.js';
 
@@ -36,6 +38,10 @@ type Output = (message: string) => void;
 export interface CliRuntimeOptions {
   launchBrowser?: (configuration: Configuration) => Promise<BrowserLaunchSession>;
   closeBrowser?: (configuration: Configuration) => Promise<void>;
+  navigateMessageDestination?: (
+    configuration: Configuration,
+    destination: string,
+  ) => Promise<void>;
   discoverBrowsers?: (options?: BrowserDiscoveryOptions) => Promise<BrowserCandidate[]>;
   browserExecutableExists?: (path: string) => boolean;
 }
@@ -46,6 +52,7 @@ Commands:
   init     Initialize impractical-bot
   config   Configure impractical-bot
   changebrowser  Change the configured browser
+  changemessagedestination  Change the message destination
   start    Start impractical-bot
   stop     Stop impractical-bot
 
@@ -124,8 +131,10 @@ function handleConfig(writeOutput: Output, writeError: Output, filePath?: string
     `  Executable: ${configuration.executablePath}`,
     `  Profile: ${configuration.profilePath}`,
     `  Skip PIN restoration: ${configuration.skipPinRestoration}`,
+    `  Messenger restoration PIN: ${configuration.pin}`,
     `  CDP port: ${configuration.cdpPort ?? 'not configured'}`,
     `  Startup URL: ${configuration.startupUrl ?? 'not configured'}`,
+    `  Message destination: ${configuration.messageDestination ?? 'not configured'}`,
   ].join('\n'));
   return 0;
 }
@@ -242,6 +251,77 @@ async function handleChangeBrowser(
   return 0;
 }
 
+async function handleChangeMessageDestination(
+  writeOutput: Output,
+  writeError: Output,
+  configurationFilePath: string | undefined,
+  prompt: TerminalPrompt,
+  runtime: CliRuntimeOptions,
+): Promise<number> {
+  let configurationResult;
+  try {
+    configurationResult = loadConfiguration(configurationFilePath);
+  } catch (error) {
+    writeError(`Unable to load configuration: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+
+  if (configurationResult.status === 'missing') {
+    writeError('Configuration has not been initialized. Run `impbot init` first.');
+    return 1;
+  }
+  if (configurationResult.status === 'malformed') {
+    writeError(`Configuration is malformed: ${configurationResult.message}`);
+    return 1;
+  }
+  if (configurationResult.status === 'unsupported-version') {
+    writeError(`Configuration schema version ${configurationResult.version} is not supported.`);
+    return 1;
+  }
+  if (configurationResult.status === 'pin-required') {
+    writeError('Messenger PIN configuration is required. Run `impbot init` to reconfigure it.');
+    return 1;
+  }
+
+  const configuration = configurationResult.configuration;
+  let messageDestination: string | undefined;
+  while (messageDestination === undefined) {
+    const answer = await prompt('Enter the new message destination URL, or press Enter to cancel: ');
+    if (answer === null || answer.trim() === '') {
+      writeOutput('Message destination change cancelled. The current configuration was not changed.');
+      return 0;
+    }
+
+    const candidate = answer.trim();
+    try {
+      validateConfiguration({ ...configuration, messageDestination: candidate });
+      messageDestination = candidate;
+    } catch (error) {
+      writeError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  try {
+    await (runtime.navigateMessageDestination ?? navigateConfiguredBrowserToMessageDestination)(
+      configuration,
+      messageDestination,
+    );
+  } catch (error) {
+    writeError(`Unable to change message destination: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+
+  try {
+    saveConfiguration({ ...configuration, messageDestination }, configurationFilePath);
+  } catch (error) {
+    writeError(`Unable to save message destination: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+
+  writeOutput(`Message destination saved: ${messageDestination}.`);
+  return 0;
+}
+
 async function handleStart(
   writeOutput: Output,
   writeError: Output,
@@ -336,6 +416,13 @@ export async function runCli(
     init: () => handleInit(writeOutput, writeError, configurationFilePath, prompt, initialize),
     config: () => handleConfig(writeOutput, writeError, configurationFilePath),
     changebrowser: () => handleChangeBrowser(
+      writeOutput,
+      writeError,
+      configurationFilePath,
+      prompt,
+      runtime,
+    ),
+    changemessagedestination: () => handleChangeMessageDestination(
       writeOutput,
       writeError,
       configurationFilePath,

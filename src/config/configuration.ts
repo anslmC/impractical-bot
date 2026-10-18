@@ -26,6 +26,7 @@ export interface Configuration {
   pin: string | null;
   cdpPort?: number;
   startupUrl?: string;
+  messageDestination?: string;
 }
 
 export type ConfigurationWithoutPin = Omit<Configuration, 'pin'>;
@@ -58,6 +59,7 @@ const CONFIGURATION_KEYS = new Set([
   'pin',
   'cdpPort',
   'startupUrl',
+  'messageDestination',
 ]);
 const BROWSER_EXECUTABLE_NAMES: Record<BrowserId, string> = {
   brave: 'brave.exe',
@@ -159,6 +161,18 @@ function validateConfigurationFields(value: unknown): ConfigurationWithoutPin {
       throw new Error('startupUrl must be a valid HTTP or HTTPS URL.');
     }
   }
+  if (value.messageDestination !== undefined) {
+    if (typeof value.messageDestination !== 'string') {
+      throw new Error('messageDestination must be a valid HTTP or HTTPS URL.');
+    }
+    try {
+      if (!['http:', 'https:'].includes(new URL(value.messageDestination).protocol)) {
+        throw new Error('messageDestination must be a valid HTTP or HTTPS URL.');
+      }
+    } catch {
+      throw new Error('messageDestination must be a valid HTTP or HTTPS URL.');
+    }
+  }
 
   return {
     version: CONFIGURATION_VERSION,
@@ -168,6 +182,9 @@ function validateConfigurationFields(value: unknown): ConfigurationWithoutPin {
     skipPinRestoration: hasSkipPinRestoration ? value.skipPinRestoration as boolean : false,
     ...(value.cdpPort === undefined ? {} : { cdpPort: value.cdpPort as number }),
     ...(value.startupUrl === undefined ? {} : { startupUrl: value.startupUrl as string }),
+    ...(value.messageDestination === undefined
+      ? {}
+      : { messageDestination: value.messageDestination as string }),
   };
 }
 

@@ -2,7 +2,7 @@ import { execFile, spawn, type SpawnOptions } from 'node:child_process';
 import { createConnection } from 'node:net';
 import { mkdir } from 'node:fs/promises';
 import { win32 } from 'node:path';
-import { chromium, type Browser, type ConnectOverCDPOptions } from 'playwright';
+import { chromium, type Browser, type ConnectOverCDPOptions, type Page } from 'playwright';
 import { validateConfiguration, type Configuration } from '../config/configuration.js';
 
 export interface BrowserProcessHandle {
@@ -47,6 +47,17 @@ export interface BrowserCloseOptions {
   requestProcessClose?: (processIds: number[]) => Promise<void>;
   now?: () => number;
   delay?: (milliseconds: number) => Promise<void>;
+}
+
+export interface BrowserNavigationOptions {
+  platform?: NodeJS.Platform;
+  connectionTimeoutMs?: number;
+  navigationTimeoutMs?: number;
+  findProfileProcesses?: (executablePath: string, profilePath: string) => Promise<number[]>;
+  connectOverCDP?: (
+    endpoint: string,
+    options: ConnectOverCDPOptions,
+  ) => Promise<Browser>;
 }
 
 export interface BrowserLaunchSession {
@@ -233,6 +244,169 @@ export async function closeConfiguredBrowser(
   }
 
   throw new Error('Timed out waiting for the dedicated browser to shut down gracefully.');
+}
+
+function isFacebookUrl(url: URL): boolean {
+  return url.hostname === 'facebook.com' || url.hostname.endsWith('.facebook.com');
+}
+
+function conversationId(url: URL): string | null {
+  return url.pathname.match(/^\/messages\/t\/(\d+)(?:\/|$)/)?.[1] ?? null;
+}
+
+function selectFacebookPage(browser: Browser, destinationUrl: URL): Page {
+  const facebookPages = browser.contexts()
+    .flatMap(context => context.pages())
+    .filter(page => {
+      if (page.isClosed()) {
+        return false;
+      }
+      try {
+        return isFacebookUrl(new URL(page.url()));
+      } catch {
+        return false;
+      }
+    });
+
+  if (facebookPages.length === 0) {
+    throw new Error('No existing Facebook tab was found in the configured browser.');
+  }
+
+  const destinationConversationId = conversationId(destinationUrl);
+  if (destinationConversationId) {
+    const matchingPages = facebookPages.filter(page => {
+      try {
+        return conversationId(new URL(page.url())) === destinationConversationId;
+      } catch {
+        return false;
+      }
+    });
+    if (matchingPages.length === 1) {
+      return matchingPages[0];
+    }
+    if (matchingPages.length > 1) {
+      throw new Error('Multiple Facebook tabs already show the destination conversation.');
+    }
+  }
+
+  const messengerPages = facebookPages.filter(page => {
+    try {
+      return /^\/messages(?:\/|$)/.test(new URL(page.url()).pathname);
+    } catch {
+      return false;
+    }
+  });
+  if (messengerPages.length === 1) {
+    return messengerPages[0];
+  }
+  if (messengerPages.length > 1) {
+    throw new Error('Multiple Messenger tabs were found; cannot choose one reliably.');
+  }
+  if (facebookPages.length === 1) {
+    return facebookPages[0];
+  }
+
+  throw new Error('Multiple Facebook tabs were found and none is a unique Messenger tab.');
+}
+
+export async function navigateConfiguredBrowserToMessageDestination(
+  configuration: Configuration,
+  destination: string,
+  options: BrowserNavigationOptions = {},
+): Promise<void> {
+  const platform = options.platform ?? process.platform;
+  if (platform !== 'win32') {
+    throw new Error(`Browser navigation is not supported on '${platform}'.`);
+  }
+
+  const validatedConfiguration = validateConfiguration({
+    ...configuration,
+    messageDestination: destination,
+  });
+  if (validatedConfiguration.cdpPort === undefined) {
+    throw new Error('Configuration is missing its CDP port. Run `impbot init` to update it.');
+  }
+  const destinationUrl = new URL(destination);
+  if (!isFacebookUrl(destinationUrl)) {
+    throw new Error('Message destination must be on Facebook.');
+  }
+
+  const getProfileProcesses = options.findProfileProcesses ?? findProfileProcesses;
+  const processIds = await getProfileProcesses(
+    validatedConfiguration.executablePath,
+    validatedConfiguration.profilePath,
+  );
+  if (processIds.length === 0) {
+    throw new Error('The configured browser profile is not running; no browser was launched.');
+  }
+
+  const connectionTimeoutMs = options.connectionTimeoutMs ?? DEFAULT_CONNECTION_TIMEOUT_MS;
+  const navigationTimeoutMs = options.navigationTimeoutMs ?? 30_000;
+  if (connectionTimeoutMs <= 0 || navigationTimeoutMs <= 0) {
+    throw new Error('Browser connection and navigation timeouts must be positive.');
+  }
+
+  const connectOverCDP = options.connectOverCDP ?? ((endpoint, connectOptions) =>
+    chromium.connectOverCDP(endpoint, connectOptions));
+  const browser = await connectOverCDP(
+    `http://127.0.0.1:${validatedConfiguration.cdpPort}`,
+    { isLocal: true, noDefaults: true, timeout: connectionTimeoutMs },
+  );
+
+  try {
+    if (!browser.isConnected()) {
+      throw new Error('Playwright connected to CDP but reports the browser disconnected.');
+    }
+
+    const page = selectFacebookPage(browser, destinationUrl);
+    const expectedConversationId = conversationId(destinationUrl);
+    const currentUrl = new URL(page.url());
+    if (expectedConversationId !== conversationId(currentUrl)) {
+      await page.goto(destinationUrl.href, {
+        waitUntil: 'domcontentloaded',
+        timeout: navigationTimeoutMs,
+      });
+    }
+
+    try {
+      await page.waitForLoadState('networkidle', { timeout: 5_000 });
+    } catch {
+      // Messenger may keep network activity open; verification below checks the settled page.
+    }
+
+    if (page.isClosed()) {
+      throw new Error('The selected Facebook tab closed before navigation could be verified.');
+    }
+
+    let resultingUrl: URL;
+    try {
+      resultingUrl = new URL(page.url());
+    } catch {
+      throw new Error('The selected tab has an invalid URL after navigation.');
+    }
+    const resultingConversationId = conversationId(resultingUrl);
+    const expectedPath = destinationUrl.pathname.replace(/\/$/, '') || '/';
+    const resultingPath = resultingUrl.pathname.replace(/\/$/, '') || '/';
+    const destinationReached = isFacebookUrl(resultingUrl) && (
+      expectedConversationId
+        ? resultingConversationId === expectedConversationId
+        : resultingUrl.origin === destinationUrl.origin &&
+          resultingPath === expectedPath &&
+          (!destinationUrl.search || resultingUrl.search === destinationUrl.search)
+    );
+    const authenticationRedirect = /^\/(?:login(?:\.php)?|checkpoint)(?:\/|$)/.test(
+      resultingUrl.pathname,
+    );
+    const pageContextVerified = expectedConversationId
+      ? await page.getByRole('heading').filter({ visible: true }).count() > 0
+      : await page.locator('body').isVisible();
+
+    if (!destinationReached || authenticationRedirect || !pageContextVerified) {
+      throw new Error('Navigation verification failed: the destination and rendered page context did not match.');
+    }
+  } finally {
+    await browser.close();
+  }
 }
 
 async function waitForEndpoint(

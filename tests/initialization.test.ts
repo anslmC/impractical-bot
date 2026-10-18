@@ -79,6 +79,7 @@ const existingConfiguration: Configuration = {
   pin: '001234',
   cdpPort: 9222,
   startupUrl: 'https://www.facebook.com',
+  messageDestination: 'https://www.facebook.com/messages',
 };
 
 test('browser profile paths use stable browser-specific names', () => {
@@ -141,6 +142,7 @@ test('confirmed rediscovery can replace a stale selection only after selection c
   });
 
   assert.equal(await initializeConfiguration(options), 'saved');
+  assert.equal(promptCalls.length, 2);
   assert.match(promptCalls[0], /Rediscover available browsers/);
   assert.match(promptCalls[1], /Select this browser/);
   const loaded = loadConfiguration(filePath);
@@ -151,12 +153,31 @@ test('confirmed rediscovery can replace a stale selection only after selection c
   }
 });
 
+test('initial setup retries invalid message destination URLs', async context => {
+  const filePath = createConfigurationPath(context);
+  const errors: string[] = [];
+  const options = createOptions(filePath, {
+    installedPaths: [bravePath],
+    answers: ['y', 'not-a-url', 'ftp://example.test/messages', ' https://example.test/messages ', 'yes'],
+    errors,
+  });
+
+  assert.equal(await initializeConfiguration(options), 'saved');
+  assert.equal(errors.length, 2);
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.equal(loaded.configuration.messageDestination, 'https://example.test/messages');
+    assert.equal(loaded.configuration.pin, null);
+  }
+});
+
 test('a single discovered browser requires confirmation before saving', async context => {
   const filePath = createConfigurationPath(context);
   const promptCalls: string[] = [];
   const options = createOptions(filePath, {
     installedPaths: [bravePath],
-    answers: ['y', '', '123456'],
+    answers: ['y', 'https://example.test/messages', '', '123456'],
     promptCalls,
   });
 
@@ -169,16 +190,17 @@ test('a single discovered browser requires confirmation before saving', async co
     assert.equal(loaded.configuration.profilePath, win32.join(win32.dirname(filePath), 'brave-profile'));
     assert.equal(loaded.configuration.skipPinRestoration, false);
     assert.equal(loaded.configuration.pin, '123456');
+    assert.equal(loaded.configuration.messageDestination, 'https://example.test/messages');
     assert.equal(existsSync(loaded.configuration.profilePath), false);
   }
-  assert.match(promptCalls[1], /Skip Messenger PIN restoration/);
+  assert.match(promptCalls[2], /Skip Messenger PIN restoration/);
 });
 
 test('initial setup saves an affirmative PIN-restoration skip preference', async context => {
   const filePath = createConfigurationPath(context);
   const options = createOptions(filePath, {
     installedPaths: [bravePath],
-    answers: ['y', 'yes'],
+    answers: ['y', 'https://example.test/messages', 'yes'],
   });
 
   assert.equal(await initializeConfiguration(options), 'saved');
@@ -187,6 +209,30 @@ test('initial setup saves an affirmative PIN-restoration skip preference', async
   if (loaded.status === 'valid') {
     assert.equal(loaded.configuration.skipPinRestoration, true);
     assert.equal(loaded.configuration.pin, null);
+    assert.equal(loaded.configuration.messageDestination, 'https://example.test/messages');
+  }
+});
+
+test('init backfills messageDestination and preserves existing settings', async context => {
+  const filePath = createConfigurationPath(context);
+  const legacyConfiguration: Record<string, unknown> = { ...existingConfiguration };
+  delete legacyConfiguration.messageDestination;
+  writeFileSync(filePath, JSON.stringify(legacyConfiguration));
+  const promptCalls: string[] = [];
+
+  assert.equal(await initializeConfiguration(createOptions(filePath, {
+    installedPaths: [bravePath],
+    answers: ['https://example.test/messages'],
+    promptCalls,
+  })), 'saved');
+  assert.match(promptCalls[0], /message destination URL/);
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.deepEqual(loaded.configuration, {
+      ...existingConfiguration,
+      messageDestination: 'https://example.test/messages',
+    });
   }
 });
 
@@ -273,7 +319,7 @@ test('multiple browsers show a menu and persist only the selected browser', asyn
   const output: string[] = [];
   const options = createOptions(filePath, {
     installedPaths: [bravePath, chromePath],
-    answers: ['2', 'n', '012345'],
+    answers: ['2', 'https://example.test/messages', 'n', '012345'],
     output,
   });
 
@@ -287,6 +333,7 @@ test('multiple browsers show a menu and persist only the selected browser', asyn
   if (loaded.status === 'valid') {
     assert.equal(loaded.configuration.browser, 'chrome');
     assert.equal(loaded.configuration.pin, '012345');
+    assert.equal(loaded.configuration.messageDestination, 'https://example.test/messages');
   }
 });
 
@@ -306,7 +353,7 @@ test('manual path input retries invalid values and saves only an existing suppor
   const errors: string[] = [];
   const options = createOptions(filePath, {
     installedPaths: [edgePath],
-    answers: ['4', ` ${edgePath} `, edgePath, 'n', '012345'],
+    answers: ['4', ` ${edgePath} `, edgePath, 'https://example.test/messages', 'n', '012345'],
     errors,
   });
 
@@ -318,6 +365,7 @@ test('manual path input retries invalid values and saves only an existing suppor
     assert.equal(loaded.configuration.browser, 'edge');
     assert.equal(loaded.configuration.executablePath, edgePath);
     assert.equal(loaded.configuration.pin, '012345');
+    assert.equal(loaded.configuration.messageDestination, 'https://example.test/messages');
   }
 });
 

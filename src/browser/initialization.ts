@@ -83,6 +83,29 @@ export async function promptPinRestorationSettings(
   }
 }
 
+async function promptMessageDestination(
+  prompt: TerminalPrompt,
+  writeError: (message: string) => void,
+): Promise<string | null> {
+  while (true) {
+    const answer = await prompt('Enter the message destination URL: ');
+    if (answer === null) {
+      return null;
+    }
+
+    const messageDestination = answer.trim();
+    try {
+      if (['http:', 'https:'].includes(new URL(messageDestination).protocol)) {
+        return messageDestination;
+      }
+    } catch {
+      writeError('Message destination must be a valid HTTP or HTTPS URL.');
+      continue;
+    }
+    writeError('Message destination must be a valid HTTP or HTTPS URL.');
+  }
+}
+
 function isFile(path: string): boolean {
   try {
     return statSync(path).isFile();
@@ -191,6 +214,7 @@ export async function selectBrowserCandidate(
 function configurationForSelection(
   candidate: BrowserCandidate,
   configurationFilePath: string,
+  messageDestination: string,
   pinSettings: PinRestorationSettings,
   existingConfiguration?: ConfigurationWithoutPin,
 ): Configuration {
@@ -205,6 +229,7 @@ function configurationForSelection(
     ...pinSettings,
     cdpPort: existingConfiguration?.cdpPort ?? randomInt(20_000, 60_000),
     startupUrl: existingConfiguration?.startupUrl ?? 'https://www.facebook.com',
+    messageDestination,
   };
 }
 
@@ -252,11 +277,20 @@ export async function initializeConfiguration(
   if (saved.status === 'valid') {
     const candidate = candidateForConfiguration(saved.configuration);
     if (isBrowserExecutableAvailable(candidate.executablePath, fileExists)) {
+      let messageDestination = saved.configuration.messageDestination;
+      if (messageDestination === undefined) {
+        messageDestination = await promptMessageDestination(options.prompt, writeError) ?? undefined;
+        if (messageDestination === undefined) {
+          writeOutput('Initialization cancelled. Existing configuration was not changed.');
+          return 'cancelled';
+        }
+      }
       if (
         saved.needsSkipPinRestorationBackfill === true ||
         saved.needsPinBackfill === true ||
         saved.configuration.cdpPort === undefined ||
-        saved.configuration.startupUrl === undefined
+        saved.configuration.startupUrl === undefined ||
+        saved.configuration.messageDestination === undefined
       ) {
         saveConfiguration({
           ...saved.configuration,
@@ -264,6 +298,7 @@ export async function initializeConfiguration(
           pin: saved.configuration.pin ?? null,
           cdpPort: saved.configuration.cdpPort ?? randomInt(20_000, 60_000),
           startupUrl: saved.configuration.startupUrl ?? 'https://www.facebook.com',
+          messageDestination,
         }, configurationFilePath);
         writeOutput('Existing configuration updated with missing default values.');
         return 'saved';
@@ -286,6 +321,12 @@ export async function initializeConfiguration(
   if (saved.status === 'pin-required') {
     const candidate = candidateForConfiguration(saved.configuration);
     if (isBrowserExecutableAvailable(candidate.executablePath, fileExists)) {
+      const messageDestination = saved.configuration.messageDestination ??
+        await promptMessageDestination(options.prompt, writeError);
+      if (messageDestination === null) {
+        writeOutput('Initialization cancelled. No configuration was written.');
+        return 'cancelled';
+      }
       const pinSettings = await promptPinRestorationSettings(options.prompt, writeError);
       if (pinSettings === null) {
         writeOutput('Initialization cancelled. No configuration was written.');
@@ -294,6 +335,7 @@ export async function initializeConfiguration(
       try {
         saveConfiguration({
           ...saved.configuration,
+          messageDestination,
           ...pinSettings,
           cdpPort: saved.configuration.cdpPort ?? randomInt(20_000, 60_000),
           startupUrl: saved.configuration.startupUrl ?? 'https://www.facebook.com',
@@ -346,6 +388,13 @@ export async function initializeConfiguration(
     return 'failed';
   }
 
+  const messageDestination = existingConfiguration?.messageDestination ??
+    await promptMessageDestination(options.prompt, writeError);
+  if (messageDestination === null) {
+    writeOutput('Initialization cancelled. No configuration was written.');
+    return 'cancelled';
+  }
+
   const pinSettings = saved.status === 'valid'
     ? {
       skipPinRestoration: saved.configuration.skipPinRestoration,
@@ -360,6 +409,7 @@ export async function initializeConfiguration(
   const configuration = configurationForSelection(
     selection.candidate,
     configurationFilePath,
+    messageDestination,
     pinSettings,
     existingConfiguration,
   );

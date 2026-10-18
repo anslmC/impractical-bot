@@ -4,10 +4,12 @@ import { test } from 'node:test';
 import {
   closeConfiguredBrowser,
   launchConfiguredBrowser,
+  navigateConfiguredBrowserToMessageDestination,
   type BrowserCloseOptions,
   type BrowserLaunchFileSystem,
   type BrowserProcessHandle,
 } from '../src/browser/launch.js';
+import type { Browser } from 'playwright';
 import type { Configuration } from '../src/config/configuration.js';
 
 const baseConfiguration: Configuration = {
@@ -146,6 +148,113 @@ test('launches configured browser, connects to its configured port, then disconn
   assert.equal(browser.calls.close, 1);
   assert.equal(server.listening, true);
   assert.equal(child.exited, false);
+});
+
+test('navigates a unique existing Facebook tab through CDP and disconnects Playwright only', async () => {
+  const destination = 'https://www.facebook.com/messages/t/1618007223454558';
+  let currentUrl = 'https://www.facebook.com/messages/';
+  let navigationCount = 0;
+  let disconnectCount = 0;
+  let connectedEndpoint = '';
+  const page = {
+    isClosed: () => false,
+    url: () => currentUrl,
+    async goto(url: string) {
+      navigationCount += 1;
+      currentUrl = url;
+    },
+    async waitForLoadState() {},
+    getByRole() {
+      return { filter: () => ({ count: async () => 1 }) };
+    },
+  };
+  const browser = {
+    isConnected: () => true,
+    contexts: () => [{ pages: () => [page] }],
+    async close() {
+      disconnectCount += 1;
+    },
+  };
+
+  await navigateConfiguredBrowserToMessageDestination(baseConfiguration, destination, {
+    platform: 'win32',
+    findProfileProcesses: async (executablePath, profilePath) => {
+      assert.equal(executablePath, baseConfiguration.executablePath);
+      assert.equal(profilePath, baseConfiguration.profilePath);
+      return [12345];
+    },
+    connectOverCDP: async endpoint => {
+      connectedEndpoint = endpoint;
+      return browser as unknown as Browser;
+    },
+  });
+
+  assert.equal(connectedEndpoint, `http://127.0.0.1:${baseConfiguration.cdpPort}`);
+  assert.equal(navigationCount, 1);
+  assert.equal(currentUrl, destination);
+  assert.equal(disconnectCount, 1);
+});
+
+test('navigation verification failure disconnects Playwright and rejects the destination change', async () => {
+  const destination = 'https://www.facebook.com/messages/t/1618007223454558';
+  let disconnectCount = 0;
+  const page = {
+    isClosed: () => false,
+    url: () => 'https://www.facebook.com/messages/t/999999999',
+    async goto() {},
+    async waitForLoadState() {},
+    getByRole() {
+      return { filter: () => ({ count: async () => 1 }) };
+    },
+  };
+  const browser = {
+    isConnected: () => true,
+    contexts: () => [{ pages: () => [page] }],
+    async close() {
+      disconnectCount += 1;
+    },
+  };
+
+  await assert.rejects(navigateConfiguredBrowserToMessageDestination(
+    baseConfiguration,
+    destination,
+    {
+      platform: 'win32',
+      findProfileProcesses: async () => [12345],
+      connectOverCDP: async () => browser as unknown as Browser,
+    },
+  ), /Navigation verification failed/);
+  assert.equal(disconnectCount, 1);
+});
+
+test('navigation failure disconnects Playwright without closing the browser', async () => {
+  let disconnectCount = 0;
+  const page = {
+    isClosed: () => false,
+    url: () => 'https://www.facebook.com/messages/',
+    async goto() {
+      throw new Error('navigation failed');
+    },
+    async waitForLoadState() {},
+  };
+  const browser = {
+    isConnected: () => true,
+    contexts: () => [{ pages: () => [page] }],
+    async close() {
+      disconnectCount += 1;
+    },
+  };
+
+  await assert.rejects(navigateConfiguredBrowserToMessageDestination(
+    baseConfiguration,
+    'https://www.facebook.com/messages/t/1618007223454558',
+    {
+      platform: 'win32',
+      findProfileProcesses: async () => [12345],
+      connectOverCDP: async () => browser as unknown as Browser,
+    },
+  ), /navigation failed/);
+  assert.equal(disconnectCount, 1);
 });
 
 test('refuses to launch when the configured profile is already in use', async () => {
