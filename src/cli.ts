@@ -4,6 +4,13 @@ import { resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { stdin, stdout } from 'node:process';
 import {
+  loadNvidiaApiKey,
+  NvidiaApiKeyError,
+  resolveNvidiaEnvironmentPath,
+  saveNvidiaApiKey,
+  validateNvidiaApiKey,
+} from './ai/nvidia.js';
+import {
   initializeConfiguration,
   getBrowserProfilePath,
   isBrowserExecutableAvailable,
@@ -37,6 +44,8 @@ type Output = (message: string) => void;
 
 export interface CliRuntimeOptions {
   launchBrowser?: (configuration: Configuration) => Promise<BrowserLaunchSession>;
+  promptSecret?: TerminalPrompt;
+  validateNvidiaApiKey?: (apiKey: string) => Promise<void>;
   waitForShutdown?: () => Promise<void>;
   closeBrowser?: (configuration: Configuration) => Promise<void>;
   navigateMessageDestination?: (
@@ -54,6 +63,7 @@ Commands:
   config   Configure impractical-bot
   changebrowser  Change the configured browser
   changemessagedestination  Change the message destination
+  updatekey  Replace the NVIDIA API key
   start    Start impractical-bot
   stop     Stop impractical-bot
 
@@ -80,12 +90,110 @@ function promptTerminal(question: string): Promise<string | null> {
   });
 }
 
+function promptSecretTerminal(question: string): Promise<string | null> {
+  if (!stdin.isTTY || typeof stdin.setRawMode !== 'function') {
+    return Promise.reject(new Error('Hidden input requires an interactive terminal.'));
+  }
+
+  const wasRaw = stdin.isRaw;
+  const wasPaused = stdin.isPaused();
+  stdout.write(question);
+
+  return new Promise(resolveAnswer => {
+    let answer = '';
+    const finish = (result: string | null): void => {
+      stdin.removeListener('data', onData);
+      try {
+        stdin.setRawMode(wasRaw ?? false);
+      } catch {
+        // The prompt result must not include or expose the submitted value.
+      }
+      if (wasPaused) {
+        stdin.pause();
+      }
+      stdout.write('\n');
+      resolveAnswer(result);
+    };
+    const onData = (chunk: Buffer | string): void => {
+      for (const character of chunk.toString()) {
+        const code = character.charCodeAt(0);
+        if (code === 3 || code === 4) {
+          finish(null);
+          return;
+        }
+        if (code === 10 || code === 13) {
+          finish(answer);
+          return;
+        }
+        if (code === 8 || code === 127) {
+          answer = answer.slice(0, -1);
+        } else if (code >= 32 && code <= 126) {
+          answer += character;
+        }
+      }
+    };
+
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.on('data', onData);
+  });
+}
+
+function getSafeNvidiaError(error: unknown, fallback: string): string {
+  return error instanceof NvidiaApiKeyError ? error.message : fallback;
+}
+
+async function ensureNvidiaApiKey(
+  configurationFilePath: string | undefined,
+  promptSecret: TerminalPrompt,
+  validateApiKey: (apiKey: string) => Promise<void>,
+  writeOutput: Output,
+  writeError: Output,
+): Promise<boolean> {
+  let environmentFilePath: string;
+  let existingKey: string | undefined;
+  try {
+    environmentFilePath = resolveNvidiaEnvironmentPath(configurationFilePath);
+    existingKey = loadNvidiaApiKey(environmentFilePath);
+  } catch {
+    writeError('Unable to load the application NVIDIA API key file.');
+    return false;
+  }
+  if (existingKey) {
+    return true;
+  }
+
+  let submittedKey: string | null;
+  try {
+    submittedKey = await promptSecret('Enter your NVIDIA API key: ');
+  } catch {
+    writeError('Unable to read the NVIDIA API key using hidden input.');
+    return false;
+  }
+  if (submittedKey === null) {
+    writeError('NVIDIA API key setup was cancelled; no key was saved.');
+    return false;
+  }
+
+  const apiKey = submittedKey.trim();
+  try {
+    await validateApiKey(apiKey);
+    saveNvidiaApiKey(environmentFilePath, apiKey);
+  } catch (error) {
+    writeError(getSafeNvidiaError(error, 'Unable to validate or save the NVIDIA API key.'));
+    return false;
+  }
+  writeOutput('NVIDIA API key saved.');
+  return true;
+}
+
 async function handleInit(
   writeOutput: Output,
   writeError: Output,
   configurationFilePath: string | undefined,
   prompt: TerminalPrompt,
   initialize: (options: InitializationOptions) => Promise<InitializationStatus>,
+  runtime: CliRuntimeOptions,
 ): Promise<number> {
   const status = await initialize({
     configurationFilePath,
@@ -93,7 +201,20 @@ async function handleInit(
     writeOutput,
     writeError,
   });
-  return status === 'failed' ? 1 : 0;
+  if (status === 'failed') {
+    return 1;
+  }
+  if (status === 'cancelled') {
+    return 0;
+  }
+  const configured = await ensureNvidiaApiKey(
+    configurationFilePath,
+    runtime.promptSecret ?? promptSecretTerminal,
+    runtime.validateNvidiaApiKey ?? validateNvidiaApiKey,
+    writeOutput,
+    writeError,
+  );
+  return configured ? 0 : 1;
 }
 
 function handleConfig(writeOutput: Output, writeError: Output, filePath?: string): number {
@@ -354,6 +475,26 @@ async function handleStart(
     return 1;
   }
 
+  let apiKey: string | undefined;
+  try {
+    const environmentFilePath = resolveNvidiaEnvironmentPath(configurationFilePath);
+    apiKey = loadNvidiaApiKey(environmentFilePath);
+  } catch {
+    writeError('Unable to load the application NVIDIA API key file.');
+    return 1;
+  }
+  if (!apiKey) {
+    writeError('NVIDIA API key is missing. Run `impbot init` or `impbot updatekey` first.');
+    return 1;
+  }
+  try {
+    await (runtime.validateNvidiaApiKey ?? validateNvidiaApiKey)(apiKey);
+  } catch (error) {
+    writeError(getSafeNvidiaError(error, 'Unable to validate the NVIDIA API key.'));
+    return 1;
+  }
+  writeOutput('NVIDIA API key validated successfully.');
+
   let resolveSigint!: () => void;
   const sigintPromise = new Promise<void>(resolve => {
     resolveSigint = resolve;
@@ -429,6 +570,42 @@ async function handleStart(
   return exitCode;
 }
 
+async function handleUpdateKey(
+  writeOutput: Output,
+  writeError: Output,
+  configurationFilePath: string | undefined,
+  runtime: CliRuntimeOptions,
+): Promise<number> {
+  let apiKey: string | null;
+  try {
+    apiKey = await (runtime.promptSecret ?? promptSecretTerminal)('Enter the replacement NVIDIA API key: ');
+  } catch {
+    writeError('Unable to read the NVIDIA API key using hidden input.');
+    return 1;
+  }
+  if (apiKey === null) {
+    writeOutput('NVIDIA API key update cancelled.');
+    return 0;
+  }
+
+  const normalizedKey = apiKey.trim();
+  try {
+    await (runtime.validateNvidiaApiKey ?? validateNvidiaApiKey)(normalizedKey);
+  } catch (error) {
+    writeError(getSafeNvidiaError(error, 'Unable to validate the replacement NVIDIA API key.'));
+    return 1;
+  }
+
+  try {
+    saveNvidiaApiKey(resolveNvidiaEnvironmentPath(configurationFilePath), normalizedKey);
+  } catch {
+    writeError('Unable to save the replacement NVIDIA API key. The previous key was preserved.');
+    return 1;
+  }
+  writeOutput('NVIDIA API key updated.');
+  return 0;
+}
+
 async function handleStop(writeOutput: Output, writeError: Output): Promise<number> {
   writeError('No browser session is managed by this process; `start` leaves the browser running.');
   void writeOutput;
@@ -470,7 +647,7 @@ export async function runCli(
   }
 
   const handlers: Record<string, () => number | Promise<number>> = {
-    init: () => handleInit(writeOutput, writeError, configurationFilePath, prompt, initialize),
+    init: () => handleInit(writeOutput, writeError, configurationFilePath, prompt, initialize, runtime),
     config: () => handleConfig(writeOutput, writeError, configurationFilePath),
     changebrowser: () => handleChangeBrowser(
       writeOutput,
@@ -486,6 +663,7 @@ export async function runCli(
       prompt,
       runtime,
     ),
+    updatekey: () => handleUpdateKey(writeOutput, writeError, configurationFilePath, runtime),
     start: () => handleStart(writeOutput, writeError, configurationFilePath, runtime),
     stop: () => handleStop(writeOutput, writeError),
   };

@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { test, type TestContext } from 'node:test';
 import type { InitializationOptions, InitializationStatus, TerminalPrompt } from '../src/browser/initialization.js';
 import { runCli, type CliRuntimeOptions } from '../src/cli.js';
+import { NvidiaApiKeyError } from '../src/ai/nvidia.js';
 import type { BrowserLaunchSession } from '../src/browser/launch.js';
 import { loadConfiguration, saveConfiguration, type Configuration } from '../src/config/configuration.js';
 
@@ -35,6 +36,12 @@ function createTemporaryConfigPath(context: TestContext): string {
   return join(directory, 'config.json');
 }
 
+function saveApplicationApiKey(configurationFilePath: string, apiKey = 'nvapi-test-key'): string {
+  const environmentFilePath = join(dirname(configurationFilePath), '.env');
+  writeFileSync(environmentFilePath, `NVIDIA_API_KEY=${apiKey}\n`);
+  return environmentFilePath;
+}
+
 const validConfiguration: Configuration = {
   version: 1,
   browser: 'brave',
@@ -58,8 +65,10 @@ function deferred<T>() {
 test('start prepares the destination, remains alive after readiness, and disconnects on shutdown', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
   let receivedConfiguration: Configuration | undefined;
   let disconnects = 0;
+  const events: string[] = [];
   const prepareStarted = deferred<void>();
   const preparation = deferred<void>();
   const shutdown = deferred<void>();
@@ -78,7 +87,12 @@ test('start prepares the destination, remains alive after readiness, and disconn
   const runtime: CliRuntimeOptions = {
     launchBrowser: async configuration => {
       receivedConfiguration = configuration;
+      events.push('launched');
       return session;
+    },
+    validateNvidiaApiKey: async apiKey => {
+      assert.equal(apiKey, 'nvapi-test-key');
+      events.push('validated');
     },
     waitForShutdown: () => shutdown.promise,
   };
@@ -100,7 +114,9 @@ test('start prepares the destination, remains alive after readiness, and disconn
   assert.equal(result.exitCode, 130);
   assert.deepEqual(receivedConfiguration, validConfiguration);
   assert.equal(disconnects, 1);
+  assert.deepEqual(events, ['validated', 'launched']);
   assert.deepEqual(result.output, [
+    'NVIDIA API key validated successfully.',
     'Browser launched and connected (Brave Chromium test).',
     `Engine ready at ${validConfiguration.messageDestination}.`,
     'Shutdown requested; disconnecting Playwright.',
@@ -111,12 +127,14 @@ test('start prepares the destination, remains alive after readiness, and disconn
 test('start disconnects the session when shutdown is requested during launch', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
   const launchStarted = deferred<void>();
   const launchCompletion = deferred<BrowserLaunchSession>();
   const shutdown = deferred<void>();
   let prepareCalls = 0;
   let disconnects = 0;
   const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
     launchBrowser: async () => {
       launchStarted.resolve();
       return launchCompletion.promise;
@@ -149,8 +167,10 @@ test('start disconnects the session when shutdown is requested during launch', a
 test('start disconnects Playwright and does not report readiness when preparation fails', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
   let disconnects = 0;
   const result = await captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
     launchBrowser: async () => ({
       endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
       browserVersion: 'Brave Chromium test',
@@ -173,11 +193,13 @@ test('start disconnects Playwright and does not report readiness when preparatio
 test('start exits with an error and disconnects when CDP disconnects unexpectedly', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
   const disconnected = deferred<void>();
   const preparationStarted = deferred<void>();
   const preparation = deferred<void>();
   let disconnects = 0;
   const resultPromise = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
     launchBrowser: async () => ({
       endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
       browserVersion: 'Brave Chromium test',
@@ -215,6 +237,186 @@ test('start reports missing configuration without launching a browser', async co
   assert.equal(result.exitCode, 1);
   assert.equal(launchAttempted, false);
   assert.match(result.errors[0], /Run `impbot init` first/);
+});
+
+test('start ignores a shell-only key and does not launch without an application key', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  const originalKey = process.env.NVIDIA_API_KEY;
+  process.env.NVIDIA_API_KEY = 'shell-key-must-not-be-used';
+  let launchAttempted = false;
+
+  try {
+    const result = await captureCli(['start'], configurationFilePath, undefined, undefined, {
+      launchBrowser: async () => {
+        launchAttempted = true;
+        throw new Error('must not launch');
+      },
+    });
+    assert.equal(result.exitCode, 1);
+    assert.equal(launchAttempted, false);
+    assert.match(result.errors[0], /NVIDIA API key is missing/);
+  } finally {
+    if (originalKey === undefined) {
+      delete process.env.NVIDIA_API_KEY;
+    } else {
+      process.env.NVIDIA_API_KEY = originalKey;
+    }
+  }
+});
+
+test('start does not launch a browser after NVIDIA authentication, network, or service failures', async context => {
+  for (const kind of ['authentication', 'network', 'service'] as const) {
+    const configurationFilePath = createTemporaryConfigPath(context);
+    saveConfiguration(validConfiguration, configurationFilePath);
+    saveApplicationApiKey(configurationFilePath);
+    let launchAttempted = false;
+
+    const result = await captureCli(['start'], configurationFilePath, undefined, undefined, {
+      validateNvidiaApiKey: async () => {
+        throw new NvidiaApiKeyError(kind, `safe ${kind} failure`);
+      },
+      launchBrowser: async () => {
+        launchAttempted = true;
+        throw new Error('must not launch');
+      },
+    });
+
+    assert.equal(result.exitCode, 1);
+    assert.equal(launchAttempted, false);
+    assert.match(result.errors[0], new RegExp(`safe ${kind} failure`));
+  }
+});
+
+test('init prompts for and saves a missing key after existing setup succeeds', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  const submittedKey = 'nvapi-init-test-key';
+  const secretPrompts: string[] = [];
+  let validatedKey = '';
+
+  const result = await captureCli(
+    ['init'],
+    configurationFilePath,
+    async () => { throw new Error('the API key prompt must be hidden'); },
+    async () => 'preserved',
+    {
+      promptSecret: async question => {
+        secretPrompts.push(question);
+        return submittedKey;
+      },
+      validateNvidiaApiKey: async key => {
+        validatedKey = key;
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(secretPrompts.length, 1);
+  assert.match(secretPrompts[0], /NVIDIA API key/);
+  assert.equal(validatedKey, submittedKey);
+  assert.ok(readFileSync(join(dirname(configurationFilePath), '.env'), 'utf8').includes(submittedKey));
+  assert.ok(!result.output.join('\n').includes(submittedKey));
+  assert.ok(!result.errors.join('\n').includes(submittedKey));
+});
+
+test('repeated init preserves an existing key without prompting or revalidating', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  const environmentFilePath = saveApplicationApiKey(configurationFilePath, 'nvapi-existing-key');
+  const originalContent = readFileSync(environmentFilePath, 'utf8');
+  let promptCalls = 0;
+  let validationCalls = 0;
+
+  const result = await captureCli(
+    ['init'],
+    configurationFilePath,
+    undefined,
+    async () => 'preserved',
+    {
+      promptSecret: async () => {
+        promptCalls += 1;
+        return 'nvapi-unexpected-key';
+      },
+      validateNvidiaApiKey: async () => {
+        validationCalls += 1;
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(promptCalls, 0);
+  assert.equal(validationCalls, 0);
+  assert.equal(readFileSync(environmentFilePath, 'utf8'), originalContent);
+});
+
+test('init does not save a key when validation fails', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  const submittedKey = 'nvapi-rejected-init-key';
+
+  const result = await captureCli(
+    ['init'],
+    configurationFilePath,
+    undefined,
+    async () => 'saved',
+    {
+      promptSecret: async () => submittedKey,
+      validateNvidiaApiKey: async () => {
+        throw new NvidiaApiKeyError('authentication', 'NVIDIA rejected the API key.');
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(existsSync(join(dirname(configurationFilePath), '.env')), false);
+  assert.ok(!result.output.join('\n').includes(submittedKey));
+  assert.ok(!result.errors.join('\n').includes(submittedKey));
+});
+
+test('updatekey validates a hidden replacement before saving it', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  const environmentFilePath = saveApplicationApiKey(configurationFilePath, 'nvapi-old-key');
+  const submittedKey = 'nvapi-new-key';
+  let prompted = false;
+
+  const result = await captureCli(['updatekey'], configurationFilePath, undefined, undefined, {
+    promptSecret: async question => {
+      prompted = true;
+      assert.match(question, /replacement NVIDIA API key/);
+      return submittedKey;
+    },
+    validateNvidiaApiKey: async key => {
+      assert.equal(key, submittedKey);
+    },
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(prompted, true);
+  assert.ok(readFileSync(environmentFilePath, 'utf8').includes(submittedKey));
+  assert.ok(!result.output.join('\n').includes(submittedKey));
+  assert.ok(!result.errors.join('\n').includes(submittedKey));
+});
+
+test('updatekey preserves the existing key when replacement validation fails', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  const environmentFilePath = saveApplicationApiKey(configurationFilePath, 'nvapi-working-key');
+  const originalContent = readFileSync(environmentFilePath, 'utf8');
+  const submittedKey = 'nvapi-rejected-key';
+
+  const result = await captureCli(['updatekey'], configurationFilePath, undefined, undefined, {
+    promptSecret: async () => submittedKey,
+    validateNvidiaApiKey: async () => {
+      throw new NvidiaApiKeyError('authentication', 'NVIDIA rejected the API key.');
+    },
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(readFileSync(environmentFilePath, 'utf8'), originalContent);
+  assert.ok(!result.output.join('\n').includes(submittedKey));
+  assert.ok(!result.errors.join('\n').includes(submittedKey));
 });
 
 test('changebrowser updates configuration after closing the current browser without launching the new one', async context => {
@@ -639,6 +841,7 @@ test('help options and no command display usage', async () => {
     assert.match(result.output[0], /init\s+Initialize impractical-bot/);
     assert.match(result.output[0], /config\s+Configure impractical-bot/);
     assert.match(result.output[0], /changebrowser\s+Change the configured browser/);
+    assert.match(result.output[0], /updatekey\s+Replace the NVIDIA API key/);
     assert.match(result.output[0], /start\s+Start impractical-bot/);
     assert.match(result.output[0], /stop\s+Stop impractical-bot/);
     assert.deepEqual(result.errors, []);

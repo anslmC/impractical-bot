@@ -888,6 +888,8 @@ export async function launchConfiguredBrowser(
   await fileSystem.mkdir(validatedConfiguration.profilePath, { recursive: true });
   const spawnProcess = options.spawnProcess ?? ((executablePath, args, spawnOptions) =>
     spawn(executablePath, args, spawnOptions));
+  const browserEnvironment = { ...process.env };
+  delete browserEnvironment.NVIDIA_API_KEY;
   const child = spawnProcess(
     validatedConfiguration.executablePath,
     [
@@ -895,7 +897,13 @@ export async function launchConfiguredBrowser(
       `--remote-debugging-port=${validatedConfiguration.cdpPort}`,
       `--user-data-dir=${validatedConfiguration.profilePath}`,
     ],
-    { detached: true, shell: false, windowsHide: false, stdio: 'ignore' },
+    {
+      detached: true,
+      shell: false,
+      windowsHide: false,
+      stdio: 'ignore',
+      env: browserEnvironment,
+    },
   );
   const childState: ChildState = { exited: false };
   child.once('error', error => {

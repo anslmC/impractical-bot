@@ -29,7 +29,7 @@ Production code will be written in TypeScript under `src/`, compiled for Node.js
 
 ## Local Data and Secrets
 
-The intended configuration and runtime state location is the user's local application-data directory, such as `%LOCALAPPDATA%\impractical-bot` on Windows. Credentials, recovery PINs, API keys, browser session data, and runtime state must remain outside the repository. No runtime configuration loader or secret handling is implemented yet.
+The configuration is stored under `%LOCALAPPDATA%\Impractical Bot` on Windows by default. The NVIDIA API key is stored as `NVIDIA_API_KEY` in an ignored `.env` file beside `config.json`; a custom configuration path uses its containing directory. `init` and `updatekey` validate keys before saving, and `start` validates the application key before launching the browser. Shell-provided `NVIDIA_API_KEY` values are not used. Credentials, recovery PINs, API keys, browser session data, and runtime state must remain outside the repository.
 
 ## Milestones
 

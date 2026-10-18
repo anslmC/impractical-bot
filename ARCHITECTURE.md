@@ -52,5 +52,5 @@ The JavaScript scripts in `Tools/` are independent experiments, not production c
 
 - Messenger selectors and accessible labels may change. Conversation identity, message completeness and ordering, sender/direction classification, approval criteria, and recovery after uncertain sends require implementation and verification.
 - Browser installation discovery, dedicated-profile behavior, browser-process ownership, and recovery when a supported browser is unavailable remain to be implemented and verified.
-- NVIDIA API details, credential handling, request limits, and failure behavior are not defined or implemented. Dynamic message gathering and AI response generation remain future work.
+- NVIDIA API key storage and startup validation use the documented chat-completions endpoint. Request limits, dynamic message gathering, AI response generation, and the reasoning loop remain future work.
 - A successful send-control click is not proof of message delivery. Setup, operation, and production-level failure testing remain to be defined.

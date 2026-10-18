@@ -751,7 +751,17 @@ test('launches configured browser, connects to its configured port, then disconn
   const browser = browserMock();
   let args: string[] = [];
   let connectEndpoint = '';
+  let launchedEnvironment: NodeJS.ProcessEnv | undefined;
   let processScans = 0;
+  const originalNvidiaApiKey = process.env.NVIDIA_API_KEY;
+  process.env.NVIDIA_API_KEY = 'shell-key-must-not-reach-browser';
+  t.after(() => {
+    if (originalNvidiaApiKey === undefined) {
+      delete process.env.NVIDIA_API_KEY;
+    } else {
+      process.env.NVIDIA_API_KEY = originalNvidiaApiKey;
+    }
+  });
   const session = await launchConfiguredBrowser(config, {
     platform: 'win32',
     fileSystem,
@@ -762,6 +772,7 @@ test('launches configured browser, connects to its configured port, then disconn
     spawnProcess: (executablePath, launchArgs, options) => {
       assert.equal(executablePath, config.executablePath);
       assert.equal(options.detached, true);
+      launchedEnvironment = options.env;
       args = launchArgs;
       void start(port);
       return child;
@@ -781,6 +792,8 @@ test('launches configured browser, connects to its configured port, then disconn
   assert.equal(connectEndpoint, `ws://127.0.0.1:${port}/devtools/browser/test-session`);
   assert.equal(child.unrefCalls, 1);
   assert.equal(browser.calls.version, 1);
+  assert.equal(launchedEnvironment?.NVIDIA_API_KEY, undefined);
+  assert.equal(process.env.NVIDIA_API_KEY, 'shell-key-must-not-reach-browser');
 
   await session.disconnect();
   await session.disconnect();
