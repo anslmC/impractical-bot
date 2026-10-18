@@ -13,10 +13,11 @@ import { randomUUID } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import { config as loadDotenv, parse } from 'dotenv';
 import { resolveConfigurationPaths } from '../config/configuration.js';
+import type { BackreadMessage } from '../messages/backread.js';
 
 const NVIDIA_CHAT_COMPLETIONS_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
-const NVIDIA_VALIDATION_MODEL = 'openai/gpt-oss-20b';
-const DEFAULT_VALIDATION_TIMEOUT_MS = 10_000;
+const NVIDIA_CHAT_COMPLETIONS_MODEL = 'openai/gpt-oss-20b';
+const DEFAULT_REQUEST_TIMEOUT_MS = 50_000;
 
 export type NvidiaApiKeyErrorKind = 'authentication' | 'network' | 'service';
 
@@ -30,10 +31,12 @@ export class NvidiaApiKeyError extends Error {
   }
 }
 
-export interface NvidiaValidationOptions {
+export interface NvidiaRequestOptions {
   fetch?: typeof fetch;
   timeoutMs?: number;
 }
+
+export type NvidiaValidationOptions = NvidiaRequestOptions;
 
 export function resolveNvidiaEnvironmentPath(configurationFilePath?: string): string {
   const selectedConfigurationPath = configurationFilePath ?? resolveConfigurationPaths().filePath;
@@ -142,13 +145,13 @@ export async function validateNvidiaApiKey(
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: NVIDIA_VALIDATION_MODEL,
+        model: NVIDIA_CHAT_COMPLETIONS_MODEL,
         messages: [{ role: 'user', content: 'Reply with OK.' }],
         reasoning_effort: 'low',
         max_tokens: 4096,
         stream: false,
       }),
-      signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_VALIDATION_TIMEOUT_MS),
+      signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS),
     });
   } catch {
     throw new NvidiaApiKeyError(
@@ -185,4 +188,99 @@ export async function validateNvidiaApiKey(
   if (!isCompletionResponse(body)) {
     throw new NvidiaApiKeyError('service', 'NVIDIA returned an unexpected validation response.');
   }
+}
+
+export async function generateNvidiaReply(
+  apiKey: string,
+  messages: readonly BackreadMessage[],
+  options: NvidiaRequestOptions = {},
+): Promise<string> {
+  if (!apiKey.trim() || /[\r\n]/.test(apiKey)) {
+    throw new NvidiaApiKeyError('authentication', 'The NVIDIA API key is empty or malformed.');
+  }
+
+  const conversationMessages = messages.flatMap(message => {
+    if (message.direction === 'UNKNOWN') {
+      return [];
+    }
+    const content = message.message.trim();
+    if (!content) {
+      return [];
+    }
+    const isIncoming = message.direction === 'INCOMING';
+    const sender = message.sender !== 'UNKNOWN' ? `${message.sender}: ` : '';
+    return [{
+      role: isIncoming ? 'user' : 'assistant',
+      content: isIncoming ? `${sender}${content}` : content,
+    }];
+  });
+  if (conversationMessages.length === 0) {
+    throw new Error('No usable Messenger messages are available to generate a reply.');
+  }
+
+  let response: Response;
+  try {
+    response = await (options.fetch ?? fetch)(NVIDIA_CHAT_COMPLETIONS_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: NVIDIA_CHAT_COMPLETIONS_MODEL,
+        messages: [
+          {
+            role: 'system',
+            content: 'Write a short, natural Messenger reply that matches the conversation\'s tone and directly addresses the latest incoming message. Aim for roughly 3–12 words when appropriate, but do not force an exact word count; use more words when needed for a natural answer. Avoid unsolicited email copy, calls to action, headings, labels, and unrelated prefixes such as "Verse 3.1". Return only the reply text. This reply is a proposal until the application sends it.',
+          },
+          ...conversationMessages,
+        ],
+        reasoning_effort: 'low',
+        max_tokens: 160,
+        stream: false,
+      }),
+      signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS),
+    });
+  } catch {
+    throw new NvidiaApiKeyError(
+      'network',
+      'Unable to reach NVIDIA to generate a reply. Check the network connection and try again.',
+    );
+  }
+
+  if (response.status === 401) {
+    throw new NvidiaApiKeyError('authentication', 'NVIDIA rejected the API key. Check the saved key.');
+  }
+  if (response.status === 202) {
+    throw new NvidiaApiKeyError(
+      'service',
+      'NVIDIA accepted the reply request but left it pending. Try again later.',
+    );
+  }
+  if (response.status !== 200) {
+    throw new NvidiaApiKeyError(
+      'service',
+      `NVIDIA could not generate a reply (HTTP ${response.status}). This does not establish that the key is invalid.`,
+    );
+  }
+
+  let body: unknown;
+  try {
+    body = await response.json() as unknown;
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new NvidiaApiKeyError('service', 'NVIDIA returned an unexpected reply response.');
+    }
+    throw new NvidiaApiKeyError('network', 'The NVIDIA reply response could not be read. Try again.');
+  }
+  if (!isCompletionResponse(body)) {
+    throw new NvidiaApiKeyError('service', 'NVIDIA returned an unexpected reply response.');
+  }
+
+  const reply = (body as { choices: { message: { content: string } }[] })
+    .choices[0].message.content.trim();
+  if (!reply) {
+    throw new NvidiaApiKeyError('service', 'NVIDIA returned an empty reply.');
+  }
+  return reply;
 }

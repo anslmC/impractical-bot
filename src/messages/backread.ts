@@ -1,0 +1,309 @@
+import type { ElementHandle, Page } from 'playwright';
+
+const MESSAGE_SELECTOR =
+  '[data-scope="messages_table"][aria-roledescription="message"][data-message-id]';
+const TARGET_MESSAGE_COUNT = 60;
+const MAX_SCROLL_ATTEMPTS = 8;
+const MAX_NO_NEW_MESSAGE_ATTEMPTS = 3;
+
+interface RenderedMessage {
+  messageId: string | null;
+  ariaLabel: string | null;
+  message: string;
+}
+
+export interface BackreadMessage {
+  id: string;
+  timestamp: MessageTimestamp;
+  sender: string;
+  direction: 'INCOMING' | 'OUTGOING' | 'UNKNOWN';
+  message: string;
+  ariaLabel: string | null;
+}
+
+export interface MessageTimestamp {
+  original: string | null;
+  normalized: string | null;
+  resolved: boolean;
+}
+
+export interface BackreadResult {
+  messages: BackreadMessage[];
+  diagnostics: string[];
+}
+
+function unresolvedTimestamp(original: string | null): MessageTimestamp {
+  return { original, normalized: null, resolved: false };
+}
+
+function normalizeFullTimestamp(original: string): MessageTimestamp {
+  const match = original.match(
+    /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),\s+(\d{4}),\s+(\d{1,2}):(\d{2})\s+(AM|PM)$/i,
+  );
+  if (!match) {
+    return unresolvedTimestamp(original);
+  }
+
+  const monthNames = [
+    'january', 'february', 'march', 'april', 'may', 'june',
+    'july', 'august', 'september', 'october', 'november', 'december',
+  ];
+  const month = monthNames.indexOf(match[1].toLowerCase()) + 1;
+  const day = Number(match[2]);
+  const year = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const meridiem = match[6].toUpperCase();
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+  if (day < 1 || day > daysInMonth[month - 1] || hour < 1 || hour > 12 || minute > 59) {
+    return unresolvedTimestamp(original);
+  }
+
+  const hour24 = (hour % 12) + (meridiem === 'PM' ? 12 : 0);
+  const pad = (value: number): string => String(value).padStart(2, '0');
+  return {
+    original,
+    normalized: `${String(year).padStart(4, '0')}-${pad(month)}-${pad(day)}T${pad(hour24)}:${pad(minute)}:00`,
+    resolved: true,
+  };
+}
+
+function parseTimestampLabel(ariaLabel: string): {
+  timestamp: MessageTimestamp;
+  remainder: string;
+} {
+  const fullDateMatch = ariaLabel.match(
+    /^At\s+((?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4},\s+\d{1,2}:\d{2}\s+(?:AM|PM)),\s*(.*)$/i,
+  );
+  if (fullDateMatch) {
+    return {
+      timestamp: normalizeFullTimestamp(fullDateMatch[1]),
+      remainder: fullDateMatch[2].trim(),
+    };
+  }
+
+  const weekdayTimeMatch = ariaLabel.match(
+    /^At\s+((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+\d{1,2}:\d{2}),\s*(.*)$/i,
+  );
+  if (weekdayTimeMatch) {
+    return {
+      timestamp: unresolvedTimestamp(weekdayTimeMatch[1]),
+      remainder: weekdayTimeMatch[2].trim(),
+    };
+  }
+
+  const twelveHourTimeMatch = ariaLabel.match(/^At\s+(\d{1,2}:\d{2}\s+(?:AM|PM)),\s*(.*)$/i);
+  if (twelveHourTimeMatch) {
+    return {
+      timestamp: unresolvedTimestamp(twelveHourTimeMatch[1]),
+      remainder: twelveHourTimeMatch[2].trim(),
+    };
+  }
+
+  const twentyFourHourTimeMatch = ariaLabel.match(/^At\s+(\d{1,2}:\d{2}),\s*(.*)$/);
+  if (twentyFourHourTimeMatch) {
+    return {
+      timestamp: unresolvedTimestamp(twentyFourHourTimeMatch[1]),
+      remainder: twentyFourHourTimeMatch[2].trim(),
+    };
+  }
+
+  const unknownTimestampMatch = ariaLabel.match(/^At\s+([^,]+),\s*(.*)$/);
+  if (unknownTimestampMatch) {
+    return {
+      timestamp: unresolvedTimestamp(unknownTimestampMatch[1].trim()),
+      remainder: unknownTimestampMatch[2].trim(),
+    };
+  }
+
+  const timestampOnlyMatch = ariaLabel.match(/^At\s+(.+)$/);
+  return {
+    timestamp: unresolvedTimestamp(timestampOnlyMatch?.[1].trim() ?? null),
+    remainder: '',
+  };
+}
+
+export function classifyMessageLabel(
+  ariaLabel: string | null,
+): Pick<BackreadMessage, 'timestamp' | 'sender' | 'direction'> {
+  if (typeof ariaLabel !== 'string') {
+    return {
+      timestamp: unresolvedTimestamp(null),
+      sender: 'UNKNOWN',
+      direction: 'UNKNOWN',
+    };
+  }
+
+  const { timestamp, remainder } = parseTimestampLabel(ariaLabel);
+  const messageMatch = remainder.match(/^([^:\r\n]+):\s+\S[\s\S]*$/);
+  const senderOnlyMatch = remainder.match(/^([^:\r\n]+)$/);
+  const sender = messageMatch
+    ? messageMatch[1].trim()
+    : senderOnlyMatch
+      ? senderOnlyMatch[1].trim()
+      : '';
+
+  if (!sender) {
+    return { timestamp, sender: 'UNKNOWN', direction: 'UNKNOWN' };
+  }
+
+  return {
+    timestamp,
+    sender,
+    direction: sender === 'You' ? 'OUTGOING' : 'INCOMING',
+  };
+}
+
+function extractMessageContent(ariaLabel: string | null, textWithoutSenderHeading: string): string {
+  if (ariaLabel === null) {
+    return textWithoutSenderHeading;
+  }
+
+  const { remainder } = parseTimestampLabel(ariaLabel);
+  const match = remainder.match(/^([^:\r\n]+):\s+([\s\S]*)$/);
+  if (!match) {
+    return textWithoutSenderHeading;
+  }
+
+  const sender = classifyMessageLabel(ariaLabel).sender;
+  if (sender === 'UNKNOWN' || match[1].trim() !== sender) {
+    return textWithoutSenderHeading;
+  }
+
+  return match[2].trim();
+}
+
+export async function readMessengerMessages(page: Page): Promise<BackreadResult> {
+  const diagnostics: string[] = [];
+  const messageLocator = page.locator(MESSAGE_SELECTOR);
+  const initialCount = await messageLocator.count();
+  let scrollContainer: ElementHandle<HTMLElement> | null;
+
+  if (initialCount > 0) {
+    const containerHandle = await messageLocator.first().evaluateHandle(message => {
+      let ancestor = message.parentElement;
+      while (ancestor && ancestor !== document.body &&
+             ancestor !== document.documentElement) {
+        const overflowY = window.getComputedStyle(ancestor).overflowY;
+        const hasScrollableOverflow = ['auto', 'scroll', 'overlay'].includes(overflowY);
+        if (hasScrollableOverflow && ancestor.scrollHeight > ancestor.clientHeight + 1) {
+          return ancestor;
+        }
+        ancestor = ancestor.parentElement;
+      }
+      return null;
+    });
+    scrollContainer = containerHandle.asElement() as ElementHandle<HTMLElement> | null;
+  } else {
+    scrollContainer = null;
+  }
+
+  if (scrollContainer) {
+    diagnostics.push('Found a scrollable conversation container; moving to the latest messages.');
+    await scrollContainer.evaluate(element => {
+      element.scrollTop = element.scrollHeight;
+    });
+    await page.waitForTimeout(300);
+  } else {
+    diagnostics.push(
+      'No scrollable conversation container found; reading currently rendered messages only.',
+    );
+  }
+
+  const collectRenderedMessages = async (): Promise<RenderedMessage[]> => {
+    const elements = await messageLocator.evaluateAll(elements =>
+      elements.map(element => ({
+      messageId: element.getAttribute('data-message-id'),
+      ariaLabel: element.getAttribute('aria-label'),
+        innerText: ((element as HTMLElement).innerText || '').trim(),
+        textWithoutSenderHeading: (() => {
+          const clone = (element as HTMLElement).cloneNode(true) as HTMLElement;
+          clone.querySelectorAll('h4').forEach(heading => heading.remove());
+          return (clone.innerText || '').trim();
+        })(),
+      }))
+    );
+    return elements.map(element => ({
+      messageId: element.messageId,
+      ariaLabel: element.ariaLabel,
+      message: extractMessageContent(
+        element.ariaLabel,
+        element.textWithoutSenderHeading,
+      ),
+    }));
+  };
+
+  const seenMessageIds = new Set<string>();
+  let collectedMessages: RenderedMessage[] = [];
+  const initialMessages = await collectRenderedMessages();
+
+  for (const message of initialMessages) {
+    if (message.messageId && !seenMessageIds.has(message.messageId)) {
+      seenMessageIds.add(message.messageId);
+      collectedMessages.push(message);
+    }
+  }
+  collectedMessages = collectedMessages.slice(-TARGET_MESSAGE_COUNT);
+
+  if (initialMessages.length === 0) {
+    diagnostics.push('No rendered messages matched the requested message selector.');
+  }
+
+  let noNewMessageAttempts = 0;
+  for (let attempt = 0;
+       scrollContainer && collectedMessages.length < TARGET_MESSAGE_COUNT &&
+       attempt < MAX_SCROLL_ATTEMPTS &&
+       noNewMessageAttempts < MAX_NO_NEW_MESSAGE_ATTEMPTS;
+       attempt += 1) {
+    try {
+      await scrollContainer.evaluate(element => {
+        const increment = Math.max(200, Math.floor(element.clientHeight * 0.75));
+        element.scrollTop = Math.max(0, element.scrollTop - increment);
+      });
+    } catch {
+      diagnostics.push('Stopped: the conversation scroll container is no longer available.');
+      break;
+    }
+
+    await page.waitForTimeout(400);
+    const renderedMessages = await collectRenderedMessages();
+    const newlyFoundMessages: RenderedMessage[] = [];
+
+    for (const message of renderedMessages) {
+      if (message.messageId && !seenMessageIds.has(message.messageId)) {
+        seenMessageIds.add(message.messageId);
+        newlyFoundMessages.push(message);
+      }
+    }
+
+    if (newlyFoundMessages.length === 0) {
+      noNewMessageAttempts += 1;
+    } else {
+      noNewMessageAttempts = 0;
+      collectedMessages = [
+        ...newlyFoundMessages,
+        ...collectedMessages,
+      ].slice(-TARGET_MESSAGE_COUNT);
+    }
+  }
+
+  if (collectedMessages.length === 0) {
+    diagnostics.push('No messages with usable data-message-id values were collected.');
+  }
+
+  const messages = collectedMessages.map(message => {
+    const classification = classifyMessageLabel(message.ariaLabel);
+    return {
+      id: message.messageId!,
+      timestamp: classification.timestamp,
+      sender: classification.sender,
+      direction: classification.direction,
+      message: message.message,
+      ariaLabel: message.ariaLabel,
+    };
+  });
+
+  return { messages, diagnostics };
+}

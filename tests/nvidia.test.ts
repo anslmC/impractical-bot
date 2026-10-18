@@ -6,6 +6,7 @@ import { test, type TestContext } from 'node:test';
 import {
   loadNvidiaApiKey,
   NvidiaApiKeyError,
+  generateNvidiaReply,
   resolveNvidiaEnvironmentPath,
   saveNvidiaApiKey,
   validateNvidiaApiKey,
@@ -17,9 +18,9 @@ function createEnvironmentPath(context: TestContext): string {
   return join(directory, '.env');
 }
 
-function successfulCompletion(): Response {
+function successfulCompletion(content = 'O'): Response {
   return new Response(JSON.stringify({
-    choices: [{ message: { role: 'assistant', content: 'O' } }],
+    choices: [{ message: { role: 'assistant', content } }],
   }), { status: 200 });
 }
 
@@ -100,6 +101,142 @@ test('NVIDIA validation sends a minimal non-streaming Bearer-authenticated reque
     max_tokens: 4096,
     stream: false,
   });
+});
+
+test('reply generation sends known-direction messages in order and extracts trimmed reply text', async () => {
+  let requestedUrl = '';
+  let requestedOptions: RequestInit | undefined;
+
+  const reply = await generateNvidiaReply('nvapi-test-key', [{
+    id: 'incoming-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Alex',
+    direction: 'INCOMING',
+    message: '  Are you free tomorrow?  ',
+    ariaLabel: null,
+  }, {
+    id: 'outgoing-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'You',
+    direction: 'OUTGOING',
+    message: 'I think so.',
+    ariaLabel: null,
+  }, {
+    id: 'unknown-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'UNKNOWN',
+    direction: 'UNKNOWN',
+    message: 'Do not include this.',
+    ariaLabel: null,
+  }, {
+    id: 'incoming-2',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Blair',
+    direction: 'INCOMING',
+    message: 'Great, what time works?',
+    ariaLabel: null,
+  }], {
+    fetch: async (input, init) => {
+      requestedUrl = String(input);
+      requestedOptions = init;
+      return successfulCompletion('  How about 6 PM?  ');
+    },
+  });
+
+  assert.equal(reply, 'How about 6 PM?');
+  assert.equal(requestedUrl, 'https://integrate.api.nvidia.com/v1/chat/completions');
+  assert.equal(requestedOptions?.method, 'POST');
+  assert.deepEqual(requestedOptions?.headers, {
+    Authorization: 'Bearer nvapi-test-key',
+    'Content-Type': 'application/json',
+  });
+  assert.deepEqual(JSON.parse(String(requestedOptions?.body)), {
+    model: 'openai/gpt-oss-20b',
+    messages: [
+      {
+        role: 'system',
+        content: 'Write a short, natural Messenger reply that matches the conversation\'s tone and directly addresses the latest incoming message. Aim for roughly 3–12 words when appropriate, but do not force an exact word count; use more words when needed for a natural answer. Avoid unsolicited email copy, calls to action, headings, labels, and unrelated prefixes such as "Verse 3.1". Return only the reply text. This reply is a proposal until the application sends it.',
+      },
+      { role: 'user', content: 'Alex: Are you free tomorrow?' },
+      { role: 'assistant', content: 'I think so.' },
+      { role: 'user', content: 'Blair: Great, what time works?' },
+    ],
+    reasoning_effort: 'low',
+    max_tokens: 160,
+    stream: false,
+  });
+});
+
+test('reply generation rejects when no known-direction non-empty context is available', async () => {
+  let fetchCalls = 0;
+  const fetch = async () => {
+    fetchCalls += 1;
+    return successfulCompletion();
+  };
+
+  await assert.rejects(
+    generateNvidiaReply('nvapi-test-key', [{
+      id: 'unknown-1',
+      timestamp: { original: null, normalized: null, resolved: false },
+      sender: 'UNKNOWN',
+      direction: 'UNKNOWN',
+      message: 'Unknown direction.',
+      ariaLabel: null,
+    }], { fetch }),
+    /No usable Messenger messages/,
+  );
+  assert.equal(fetchCalls, 0);
+});
+
+test('reply generation rejects empty output and malformed responses', async () => {
+  const context = [{
+    id: 'incoming-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Alex',
+    direction: 'INCOMING' as const,
+    message: 'Hello.',
+    ariaLabel: null,
+  }];
+
+  for (const response of [
+    successfulCompletion('  '),
+    new Response('{', { status: 200 }),
+    new Response(JSON.stringify({ choices: [{ message: { content: 7 } }] }), { status: 200 }),
+  ]) {
+    await assert.rejects(
+      generateNvidiaReply('nvapi-test-key', context, { fetch: async () => response }),
+      error => {
+        assert.ok(error instanceof NvidiaApiKeyError);
+        assert.equal(error.kind, 'service');
+        return true;
+      },
+    );
+  }
+});
+
+test('reply generation preserves authentication and service API error handling', async () => {
+  const context = [{
+    id: 'incoming-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Alex',
+    direction: 'INCOMING' as const,
+    message: 'Hello.',
+    ariaLabel: null,
+  }];
+
+  for (const [status, kind] of [[401, 'authentication'], [202, 'service'], [429, 'service']] as const) {
+    await assert.rejects(
+      generateNvidiaReply('nvapi-test-key', context, {
+        fetch: async () => new Response('', { status }),
+      }),
+      error => {
+        assert.ok(error instanceof NvidiaApiKeyError);
+        assert.equal(error.kind, kind);
+        assert.ok(!error.message.includes('nvapi-test-key'));
+        return true;
+      },
+    );
+  }
 });
 
 test('NVIDIA 401 responses are authentication failures without exposing the key', async () => {

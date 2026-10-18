@@ -3,11 +3,13 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { test, type TestContext } from 'node:test';
+import type { Page } from 'playwright';
 import type { InitializationOptions, InitializationStatus, TerminalPrompt } from '../src/browser/initialization.js';
 import { runCli, type CliRuntimeOptions } from '../src/cli.js';
 import { NvidiaApiKeyError } from '../src/ai/nvidia.js';
 import type { BrowserLaunchSession } from '../src/browser/launch.js';
 import { loadConfiguration, saveConfiguration, type Configuration } from '../src/config/configuration.js';
+import type { BackreadResult } from '../src/messages/backread.js';
 
 async function captureCli(
   args: string[],
@@ -15,12 +17,16 @@ async function captureCli(
   prompt?: TerminalPrompt,
   initialize?: (options: InitializationOptions) => Promise<InitializationStatus>,
   runtime?: CliRuntimeOptions,
+  observeOutput?: (message: string) => void,
 ) {
   const output: string[] = [];
   const errors: string[] = [];
   const exitCode = await runCli(
     args,
-    message => output.push(message),
+    message => {
+      output.push(message);
+      observeOutput?.(message);
+    },
     message => errors.push(message),
     configurationFilePath,
     prompt,
@@ -53,6 +59,7 @@ const validConfiguration: Configuration = {
   startupUrl: 'https://www.facebook.com',
   messageDestination: 'https://www.facebook.com/messages/t/1618007223454558',
 };
+const stubPage = {} as unknown as Page;
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -69,6 +76,29 @@ test('start prepares the destination, remains alive after readiness, and disconn
   let receivedConfiguration: Configuration | undefined;
   let disconnects = 0;
   const events: string[] = [];
+  let validationCalls = 0;
+  const backreadResult: BackreadResult = {
+    diagnostics: ['Found a scrollable conversation container; moving to the latest messages.'],
+    messages: [{
+      id: 'message-1',
+      timestamp: {
+        original: 'October 18, 2026, 1:15 PM',
+        normalized: '2026-10-18T13:15:00',
+        resolved: true,
+      },
+      ariaLabel: 'At October 18, 2026, 1:15 PM, You: hello',
+      message: 'hello',
+      sender: 'You',
+      direction: 'OUTGOING',
+    }, {
+      id: 'message-2',
+      timestamp: { original: 'Friday 19:35', normalized: null, resolved: false },
+      ariaLabel: null,
+      message: '',
+      sender: 'UNKNOWN',
+      direction: 'UNKNOWN',
+    }],
+  };
   const prepareStarted = deferred<void>();
   const preparation = deferred<void>();
   const shutdown = deferred<void>();
@@ -79,6 +109,8 @@ test('start prepares the destination, remains alive after readiness, and disconn
     async prepare() {
       prepareStarted.resolve();
       await preparation.promise;
+      events.push('prepared');
+      return stubPage;
     },
     async disconnect() {
       disconnects += 1;
@@ -92,12 +124,39 @@ test('start prepares the destination, remains alive after readiness, and disconn
     },
     validateNvidiaApiKey: async apiKey => {
       assert.equal(apiKey, 'nvapi-test-key');
-      events.push('validated');
+      validationCalls += 1;
+      events.push(`validated-${validationCalls}`);
+    },
+    readMessengerMessages: async page => {
+      assert.equal(page, stubPage);
+      events.push('read-messages');
+      return backreadResult;
+    },
+    generateNvidiaReply: async (apiKey, messages) => {
+      assert.equal(apiKey, 'nvapi-test-key');
+      assert.deepEqual(messages, backreadResult.messages);
+      events.push('generate-reply');
+      return 'Generated reply';
+    },
+    composeMessengerReply: async (page, reply) => {
+      assert.equal(page, stubPage);
+      assert.equal(reply, 'Generated reply');
+      events.push('compose-reply');
+      return { status: 'sent' };
     },
     waitForShutdown: () => shutdown.promise,
   };
 
-  const start = captureCli(['start'], configurationFilePath, undefined, undefined, runtime);
+  const start = captureCli(
+    ['start'],
+    configurationFilePath,
+    async () => null,
+    undefined,
+    runtime,
+    message => {
+      if (message.startsWith('Engine ready')) events.push('engine-ready-logged');
+    },
+  );
   let settled = false;
   void start.then(() => {
     settled = true;
@@ -114,14 +173,70 @@ test('start prepares the destination, remains alive after readiness, and disconn
   assert.equal(result.exitCode, 130);
   assert.deepEqual(receivedConfiguration, validConfiguration);
   assert.equal(disconnects, 1);
-  assert.deepEqual(events, ['validated', 'launched']);
+  assert.equal(validationCalls, 1);
+  assert.deepEqual(events, [
+    'validated-1',
+    'launched',
+    'prepared',
+    'engine-ready-logged',
+    'read-messages',
+    'generate-reply',
+    'compose-reply',
+  ]);
   assert.deepEqual(result.output, [
     'NVIDIA API key validated successfully.',
     'Browser launched and connected (Brave Chromium test).',
     `Engine ready at ${validConfiguration.messageDestination}.`,
+    'Found a scrollable conversation container; moving to the latest messages.',
+    'Retrieved 2 messages from the configured conversation.',
+    'Generated reply; checking the composer before automatic send.',
+    'Send control clicked; delivery is not confirmed.',
     'Shutdown requested; disconnecting Playwright.',
   ]);
   assert.deepEqual(result.errors, []);
+});
+
+test('start keeps the ready session alive when backreading fails', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const shutdown = deferred<void>();
+  const backreadStarted = deferred<void>();
+  let settled = false;
+  let disconnects = 0;
+  const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
+    launchBrowser: async () => ({
+      endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+      browserVersion: 'Brave Chromium test',
+      disconnected: new Promise<void>(() => undefined),
+      async prepare() {
+        return stubPage;
+      },
+      async disconnect() {
+        disconnects += 1;
+      },
+    }),
+    readMessengerMessages: async () => {
+      backreadStarted.resolve();
+      throw new Error('private page details');
+    },
+    waitForShutdown: () => shutdown.promise,
+  });
+  void start.then(() => { settled = true; });
+
+  await backreadStarted.promise;
+  await new Promise<void>(resolve => setImmediate(resolve));
+
+  assert.equal(settled, false);
+  assert.equal(disconnects, 0);
+  shutdown.resolve();
+  const result = await start;
+
+  assert.equal(result.exitCode, 130);
+  assert.deepEqual(result.errors, ['Unable to read Messenger messages.']);
+  assert.ok(!result.errors.join('\n').includes('private page details'));
+  assert.equal(disconnects, 1);
 });
 
 test('start disconnects the session when shutdown is requested during launch', async context => {
@@ -151,6 +266,7 @@ test('start disconnects the session when shutdown is requested during launch', a
     disconnected: new Promise<void>(() => undefined),
     async prepare() {
       prepareCalls += 1;
+      return stubPage;
     },
     async disconnect() {
       disconnects += 1;
@@ -207,6 +323,7 @@ test('start exits with an error and disconnects when CDP disconnects unexpectedl
       async prepare() {
         preparationStarted.resolve();
         await preparation.promise;
+        return stubPage;
       },
       async disconnect() {
         disconnects += 1;

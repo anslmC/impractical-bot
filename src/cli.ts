@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { stdin, stdout } from 'node:process';
 import {
+  generateNvidiaReply,
   loadNvidiaApiKey,
   NvidiaApiKeyError,
   resolveNvidiaEnvironmentPath,
@@ -39,6 +40,14 @@ import {
   validateConfiguration,
   type Configuration,
 } from './config/configuration.js';
+import {
+  composeMessengerReply,
+  type ReplyCompositionResult,
+} from './messages/composer.js';
+import {
+  readMessengerMessages,
+  type BackreadResult,
+} from './messages/backread.js';
 
 type Output = (message: string) => void;
 
@@ -46,6 +55,9 @@ export interface CliRuntimeOptions {
   launchBrowser?: (configuration: Configuration) => Promise<BrowserLaunchSession>;
   promptSecret?: TerminalPrompt;
   validateNvidiaApiKey?: (apiKey: string) => Promise<void>;
+  readMessengerMessages?: typeof readMessengerMessages;
+  generateNvidiaReply?: typeof generateNvidiaReply;
+  composeMessengerReply?: typeof composeMessengerReply;
   waitForShutdown?: () => Promise<void>;
   closeBrowser?: (configuration: Configuration) => Promise<void>;
   navigateMessageDestination?: (
@@ -141,6 +153,13 @@ function promptSecretTerminal(question: string): Promise<string | null> {
 
 function getSafeNvidiaError(error: unknown, fallback: string): string {
   return error instanceof NvidiaApiKeyError ? error.message : fallback;
+}
+
+function writeBackreadResult(result: BackreadResult, writeOutput: Output): void {
+  for (const diagnostic of result.diagnostics) {
+    writeOutput(diagnostic);
+  }
+  writeOutput(`Retrieved ${result.messages.length} messages from the configured conversation.`);
 }
 
 async function ensureNvidiaApiKey(
@@ -448,6 +467,7 @@ async function handleStart(
   writeOutput: Output,
   writeError: Output,
   configurationFilePath: string | undefined,
+  prompt: TerminalPrompt,
   runtime: CliRuntimeOptions,
 ): Promise<number> {
   let configurationResult;
@@ -529,17 +549,57 @@ async function handleStart(
       startupStage = 'prepare';
       writeOutput(`Browser launched and connected (${session.browserVersion}).`);
       const preparationResult = await Promise.race([
-        session.prepare().then(() => 'ready' as const),
-        shutdownPromise.then(() => 'shutdown' as const),
-        session.disconnected.then(() => 'disconnected' as const),
+        session.prepare().then(page => ({ type: 'ready' as const, page })),
+        shutdownPromise.then(() => ({ type: 'shutdown' as const })),
+        session.disconnected.then(() => ({ type: 'disconnected' as const })),
       ]);
-      if (preparationResult === 'shutdown') {
+      if (preparationResult.type === 'shutdown') {
         writeOutput('Shutdown requested; disconnecting Playwright.');
         exitCode = 130;
-      } else if (preparationResult === 'disconnected') {
+      } else if (preparationResult.type === 'disconnected') {
         throw new Error('The browser disconnected during startup preparation.');
       } else {
         writeOutput(`Engine ready at ${configurationResult.configuration.messageDestination}.`);
+        let backread: BackreadResult | undefined;
+        try {
+          backread = await (runtime.readMessengerMessages ?? readMessengerMessages)(
+            preparationResult.page,
+          );
+          writeBackreadResult(backread, writeOutput);
+        } catch {
+          writeError('Unable to read Messenger messages.');
+        }
+        if (backread) {
+          let reply: string | undefined;
+          try {
+            reply = await (runtime.generateNvidiaReply ?? generateNvidiaReply)(apiKey, backread.messages);
+          } catch (error) {
+            writeError(getSafeNvidiaError(error, 'Unable to generate a Messenger reply.'));
+          }
+          if (reply !== undefined) {
+            writeOutput('Generated reply; checking the composer before automatic send.');
+            try {
+              const composition: ReplyCompositionResult = await (
+                runtime.composeMessengerReply ?? composeMessengerReply
+              )(preparationResult.page, reply);
+              if (composition.status === 'sent') {
+                writeOutput('Send control clicked; delivery is not confirmed.');
+              } else {
+                const failures: Record<typeof composition.reason, string> = {
+                  'composer-region-missing': 'the Thread composer region was not found',
+                  'composer-region-ambiguous': 'the Thread composer region was not unique',
+                  'send-control-missing': 'the matching Send control was not found',
+                  'send-control-ambiguous': 'the matching Send control was not unique',
+                  hidden: 'the matching Send control was hidden',
+                  disabled: 'the matching Send control was disabled',
+                };
+                writeError(`Automatic send blocked; ${failures[composition.reason]}. The reply remains unsent.`);
+              }
+            } catch (error) {
+              writeError(`Unable to prepare the Messenger reply: ${error instanceof Error ? error.message : String(error)}`);
+            }
+          }
+        }
         const runtimeResult = await Promise.race([
           shutdownPromise.then(() => 'shutdown' as const),
           session.disconnected.then(() => 'disconnected' as const),
@@ -664,7 +724,7 @@ export async function runCli(
       runtime,
     ),
     updatekey: () => handleUpdateKey(writeOutput, writeError, configurationFilePath, runtime),
-    start: () => handleStart(writeOutput, writeError, configurationFilePath, runtime),
+    start: () => handleStart(writeOutput, writeError, configurationFilePath, prompt, runtime),
     stop: () => handleStop(writeOutput, writeError),
   };
   const handler = command ? handlers[command] : undefined;

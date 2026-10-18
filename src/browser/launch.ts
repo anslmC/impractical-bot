@@ -68,7 +68,7 @@ export interface BrowserLaunchSession {
   endpoint: string;
   browserVersion: string;
   disconnected: Promise<void>;
-  prepare(): Promise<void>;
+  prepare(): Promise<Page>;
   disconnect(): Promise<void>;
 }
 
@@ -506,7 +506,7 @@ export async function prepareConfiguredBrowser(
   browser: Browser,
   configuration: Configuration,
   options: BrowserLaunchOptions = {},
-): Promise<void> {
+): Promise<Page> {
   const validatedConfiguration = validateConfiguration(configuration);
   if (!validatedConfiguration.messageDestination) {
     throw new Error('Configuration is missing its message destination. Run `impbot init` to update it.');
@@ -629,6 +629,7 @@ export async function prepareConfiguredBrowser(
     throw new Error('The final page is not the configured Messenger conversation.');
   }
   console.log(`Final verification: configured conversation ${expectedConversationId} is still selected.`);
+  return page;
 }
 
 function getFacebookPages(browser: Browser): Page[] {
