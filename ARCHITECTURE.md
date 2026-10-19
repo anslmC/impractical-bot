@@ -2,55 +2,78 @@
 
 ## Status and Scope
 
-This document describes intended architecture, not implemented behavior. M0 establishes the Node.js and TypeScript development foundation. The repository does not yet implement CLI commands, browser discovery or lifecycle management, configuration persistence, bot orchestration, message automation, or AI integration.
+The project is a local Node.js CLI, intended to run as one process and one bot instance. It needs no server, database, or plugin system. Production code already provides browser discovery and managed launch, configuration, NVIDIA key validation and reply generation, message backread, and a tested Messenger composer.
 
-The application is intended to be a local Node.js CLI, initially running as one local process and one bot instance. It does not require a server, database, or plugin system. A terminal status dashboard may be added for bot operation.
+The current `start` path is a proven one-shot pipeline: validate the NVIDIA API key, launch and prepare the configured browser/conversation, read rendered messages, generate one reply, attempt to send it, then wait for shutdown. It is not yet the persistent conversation engine described below. Code under `Tools/` contains independent experiments and is not production behavior. This document marks the M2 target as planned unless explicitly identified as implemented/proven.
 
-## Intended Responsibilities
+## Responsibilities
 
-- **CLI (`src/cli/`, `bin/`):** route commands and present terminal interaction; it does not own browser discovery or bot policy.
+- **CLI (`src/cli.ts`, `bin/`):** route commands and coordinate startup, operation, and shutdown.
 - **Configuration (`src/config/`):** load and validate local settings. Configuration, credentials, and runtime state belong outside the repository, under the user's local application-data directory.
-- **Browser (`src/browser/`):** discover Brave, Google Chrome, or Microsoft Edge, prepare a dedicated profile, launch the selected browser with remote debugging bound to loopback, and connect Playwright through that CDP endpoint. Firefox is out of scope.
-- **Bot (`src/bot/`):** coordinate bot lifecycle and the message/AI workflow without taking ownership of browser-discovery details.
-- **Messages (`src/messages/`):** identify the intended conversation, gather rendered messages, and apply message identity and freshness checks.
-- **AI (`src/ai/`):** eventually request a response draft from an AI service. This component must not independently access browser controls, files, or secrets; access to necessary data must be mediated by its caller.
+- **Browser (`src/browser/`):** discover Brave, Google Chrome, or Microsoft Edge, prepare a dedicated profile, launch the selected browser with remote debugging bound to loopback, and connect Playwright through CDP. Firefox is out of scope.
+- **Messages (`src/messages/`):** read rendered messages and provide stable identity, sender, direction, and freshness information to the engine.
+- **AI (`src/ai/`):** validate the NVIDIA API key and generate reply text from caller-provided context. It does not control browser actions, files, or secrets independently.
+- **Conversation engine (M2 target):** coordinate observation, batching, participation decisions, generation, pre-send checks, and lifecycle without owning browser discovery.
 
-These are responsibility boundaries, not a commitment to speculative modules or extra processes. Keep implementation incremental and minimal.
+Keep implementation incremental and reuse the existing tested composer. The engine remains one active generation/send operation at a time, while message observation continues during that operation.
 
-## Intended Command Flow
+## M2 Conversation Flow
 
-1. `impbot init` will discover a supported browser, prepare its dedicated profile and runtime environment, launch it with the appropriate loopback debugging configuration, then automatically open the terminal configuration menu.
-2. `impbot config` will open the same menu on demand, stopping the active bot first when necessary.
-3. `impbot start` will provide the manual bot-start command and eventually establish a terminal status dashboard.
-4. `impbot stop` will stop the bot and the browser process launched and managed by this application. It must not terminate unrelated browser instances.
-5. The browser responsibility will connect Playwright to the managed browser through its loopback-only CDP endpoint. It will retain the intended tab and conversation and will not silently switch either.
-6. Message handling will only provide context when message identity and direction are sufficiently known. AI generation, when added, will produce a proposal; it will not authorize sending.
-7. A separate validation and approval step must precede sending. If a send may have occurred but the outcome is uncertain, the application must not retry automatically.
+The M2 target transitions from the proven one-shot pipeline to a persistent, decision-driven conversation engine:
+
+1. **Initialization:** validate the NVIDIA API key; connect to the configured browser and conversation; handle startup challenges; establish an initial message-ID baseline; load recent messages; and load optional saved context and personality instructions. A startup baseline is context, not a reply trigger.
+2. **Fresh-message observation:** poll a small recent-message window and deduplicate by stable message ID. A `MutationObserver` may wake the engine during idle periods, but it is only a wake-up mechanism; polling and stable-ID comparison determine freshness, and the observer does not classify messages or decide whether to reply.
+3. **Batching:** collect fresh messages during a short quiet period and group related arrivals into one response opportunity.
+4. **Smart decisions:** prioritize genuine reactive opportunities, such as direct mentions and clear requests. Evaluate proactive opportunities separately with local decision rules, cooldowns, and configurable talkativeness. Do not use historical messages as reply triggers.
+5. **Generation:** send recent conversation context, applicable saved context, personality instructions, and other required instructions to NVIDIA. Temperature controls response variation, not participation frequency.
+6. **Pre-send reassessment:** before sending, check for stop or pause requests, newer high-priority messages, stale or redundant replies, and a valid destination. Discard or regenerate a proposal that no longer fits the current conversation state.
+7. **Composition and sending:** reuse the existing tested composer behavior. Track generation success, send attempts, and confirmed delivery as separate outcomes. A successful composer action is a send attempt, not proof of delivery.
+8. **Continuous operation:** return to observation after every processing cycle. Observe incoming activity while generation or sending is active, but do not start a second generation/send operation concurrently.
+
+## Lifecycle and Failure Behavior
+
+These are agreed M2 behaviors; they are not all implemented in the current one-shot path.
+
+- **Pause and resume:** continue observing while paused but suppress replies. On resume, reassess accumulated messages against the current conversation and decision rules rather than blindly replaying queued replies.
+- **Destination switching:** suspend reply processing, discard pending work for the old destination, navigate to and verify the new destination, establish a fresh baseline, and resume only after verification. If switching fails, remain paused and allow retry.
+- **Stop:** reject new work, suppress unsent replies, settle active work where practical without waiting indefinitely, clear pending work, gracefully close the bot-managed browser, release resources, and exit.
+- **Browser or CDP failure:** stop the engine and report the failure; recovery requires another `start`.
+- **Temporary DOM or message-area failure:** suspend processing and retry verification. Recovery must not add duplicate listeners or duplicate message entries.
+- **NVIDIA failures:** use bounded retries and backoff for transient failures; do not blindly retry invalid requests. Retries must preserve a manual pause state.
+- **Uncertain send outcome:** do not blindly resend. Record send attempts separately from confirmed delivery because a composer action alone cannot prove delivery.
+
+## Personality and Saved Context
+
+`personality.txt` is the optional, editable default personality configuration. If it is missing or empty, use a short built-in fallback; loading personality must not block startup. Personality governs conversational style, not whether the bot participates.
+
+Saved conversation context is a future extension. Until it exists, recent messages are sufficient for initial operation. Historical messages provide context only; they are not reply triggers.
 
 ## Safety Invariants
 
 - Track ownership of the browser process launched by the application; never stop unrelated browser instances.
 - Keep CDP bound to loopback and connect only to the managed browser.
-- Do not silently switch browser tabs or conversations.
-- Do not act on messages with unknown sender, direction, or conversation identity.
-- Discard or revalidate stale proposals when the conversation or relevant message context changes.
-- Require validation and approval before sending; AI output alone is not authorization.
-- Never automatically retry a send after an uncertain outcome, to avoid duplicate messages.
+- Do not silently change the active tab or destination; verify a destination switch before resuming replies.
+- Do not make reply decisions from unknown or stale message identity, direction, or conversation state.
+- Reassess proposals immediately before sending and discard stale or redundant work.
+- Do not automatically resend after an uncertain send outcome.
 - Keep credentials, recovery PINs, API keys, session data, and runtime state outside the repository.
-- The AI component must not independently access browser controls, files, or secrets.
+- Keep AI generation separate from participation decisions and browser actions.
 
 ## Milestones
 
-- **M0 - Project foundation:** establish TypeScript, linting, Node's built-in test runner, repository structure, and accurate project documentation.
-- **M1 - Browser and CLI lifecycle:** implement supported-browser discovery and managed launch, local configuration foundations, and the `init`, `config`, `start`, and `stop` command flows with process ownership safeguards.
-- **M2 - Core Bot:** implement Playwright browser actions for navigation, retrieving and backreading messages, and sending messages; integrate NVIDIA AI response generation; and define system instructions governing the bot's behavior.
-- **M3 - End-to-end hardening:** integrate and polish the workflow, improve reliability, and verify failure handling before expanding use.
+- **M0 — Foundation**
+- **M1 — Browser + CLI Lifecycle ("Cranking")**
+- **M2 — Ignition + Running:** transition from the proven one-shot pipeline to a persistent, decision-driven conversation engine.
+- **M3 — Hardening & Polishing**
 
-## Existing Experiments and Open Questions
+M2 development stages, in order, are **fresh-message detection**, **batching/decisions**, **continuous loop**, **lifecycle/recovery**, and **end-to-end testing**. These are work stages within M2, not official milestones.
 
-The JavaScript scripts in `Tools/` are independent experiments, not production components. They connect to an already-running browser at `127.0.0.1:9222`; navigation, PIN entry, composer, and bounded backread experiments provide limited source-level examples. They do not verify managed browser startup, process ownership, complete history retrieval, or production behavior.
+## Implemented and Proven Boundaries
 
-- Messenger selectors and accessible labels may change. Conversation identity, message completeness and ordering, sender/direction classification, approval criteria, and recovery after uncertain sends require implementation and verification.
-- Browser installation discovery, dedicated-profile behavior, browser-process ownership, and recovery when a supported browser is unavailable remain to be implemented and verified.
-- NVIDIA API key storage and startup validation use the documented chat-completions endpoint. Request limits, dynamic message gathering, AI response generation, and the reasoning loop remain future work.
-- A successful send-control click is not proof of message delivery. Setup, operation, and production-level failure testing remain to be defined.
+- Production startup validates the configured NVIDIA API key, launches the managed browser, prepares the configured conversation, and handles login and Messenger startup challenges.
+- Production backread reads rendered messages and applies message identity and direction classification. It is bounded; it does not establish complete conversation history.
+- Production generation uses recent messages to create a reply proposal. The current start path generates once from the backread rather than applying the planned continuous participation policy.
+- The production composer checks that the composer and send control are usable before clicking. A click is reported as an attempt; delivery is not confirmed.
+- Scripts in `Tools/` are exploratory, independent experiments. They can provide evidence for the specific behaviors they exercise but do not establish managed-startup or continuous-engine behavior.
+
+The planned polling, observer wake-up, batching, participation policy, personality loading, saved context, pause/resume, destination-switch recovery, and bounded NVIDIA retry policy still require implementation and end-to-end verification. Messenger's rendered structure can change, so verification should exercise the production path and preserve the send-outcome distinction.
