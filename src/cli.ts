@@ -495,25 +495,31 @@ async function handleStart(
     return 1;
   }
 
-  let apiKey: string | undefined;
-  try {
-    const environmentFilePath = resolveNvidiaEnvironmentPath(configurationFilePath);
-    apiKey = loadNvidiaApiKey(environmentFilePath);
-  } catch {
-    writeError('Unable to load the application NVIDIA API key file.');
-    return 1;
+  const DEBUG_MODE = process.env.IMPRACTICAL_BOT_DEBUG === '1';
+  const ENABLE_DEBUG_AUTO_RESPONSE = false;
+  let apiKey = '';
+  if (!DEBUG_MODE || ENABLE_DEBUG_AUTO_RESPONSE) {
+    try {
+      const environmentFilePath = resolveNvidiaEnvironmentPath(configurationFilePath);
+      apiKey = loadNvidiaApiKey(environmentFilePath) ?? '';
+    } catch {
+      writeError('Unable to load the application NVIDIA API key file.');
+      return 1;
+    }
+    if (!apiKey) {
+      writeError('NVIDIA API key is missing. Run `impbot init` or `impbot updatekey` first.');
+      return 1;
+    }
+    try {
+      await (runtime.validateNvidiaApiKey ?? validateNvidiaApiKey)(apiKey);
+    } catch (error) {
+      writeError(getSafeNvidiaError(error, 'Unable to validate the NVIDIA API key.'));
+      return 1;
+    }
+    writeOutput('NVIDIA API key validated successfully.');
+  } else {
+    writeOutput('Debug mode enabled; skipping NVIDIA API key validation.');
   }
-  if (!apiKey) {
-    writeError('NVIDIA API key is missing. Run `impbot init` or `impbot updatekey` first.');
-    return 1;
-  }
-  try {
-    await (runtime.validateNvidiaApiKey ?? validateNvidiaApiKey)(apiKey);
-  } catch (error) {
-    writeError(getSafeNvidiaError(error, 'Unable to validate the NVIDIA API key.'));
-    return 1;
-  }
-  writeOutput('NVIDIA API key validated successfully.');
 
   let resolveSigint!: () => void;
   const sigintPromise = new Promise<void>(resolve => {
@@ -569,7 +575,7 @@ async function handleStart(
         } catch {
           writeError('Unable to read Messenger messages.');
         }
-        if (backread) {
+        if (backread && ENABLE_DEBUG_AUTO_RESPONSE) {
           let reply: string | undefined;
           try {
             reply = await (runtime.generateNvidiaReply ?? generateNvidiaReply)(apiKey, backread.messages);

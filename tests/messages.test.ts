@@ -22,13 +22,13 @@ function createMessage(messageId: number): TestMessage {
   };
 }
 
-function createPage(batches: TestMessage[][]) {
+function createPage(batches: TestMessage[][], scrollHeight = 4_000) {
   let batchIndex = 0;
   const waitDurations: number[] = [];
   const scrollPositions: number[] = [];
   const scrollElement = {
     clientHeight: 1_000,
-    scrollHeight: 4_000,
+    scrollHeight,
     scrollTop: 0,
   };
   const scrollContainer = {
@@ -182,7 +182,7 @@ test('aggregates overlapping scroll batches oldest-to-newest and caps at 60', as
     resolved: true,
   });
   assert.equal(result.messages[0].ariaLabel, 'At October 18, 2026, 1:15 PM, Sender: message 20');
-  assert.deepEqual(scrollPositions, [4_000, 3_250, 2_500]);
+  assert.deepEqual(scrollPositions, [4_000, 3_250, 3_250, 2_500]);
   assert.deepEqual(waitDurations, [300, 400, 400]);
 });
 
@@ -236,7 +236,7 @@ test('uses accessible sender/body boundaries without stripping genuine message p
   );
 });
 
-test('stops after three scrolls without new message IDs', async () => {
+test('continues scrolling without new IDs until the conversation top', async () => {
   const renderedMessages = [createMessage(1), createMessage(2)];
   const { page, waitDurations, scrollPositions } = createPage([
     renderedMessages,
@@ -246,22 +246,23 @@ test('stops after three scrolls without new message IDs', async () => {
   const result = await readMessengerMessages(page);
 
   assert.equal(result.messages.length, 2);
-  assert.equal(scrollPositions.length, 4);
-  assert.deepEqual(waitDurations, [300, 400, 400, 400]);
+  assert.equal(scrollPositions.at(-1), 3_000);
+  assert.deepEqual(waitDurations, [300, 400, 400, 400, 400, 400, 400, 300]);
 });
 
-test('stops after eight upward scroll attempts when each attempt finds a new ID', async () => {
+test('continues past eight upward scroll attempts when each finds a new ID', async () => {
   const batches = [
     [createMessage(8)],
     ...Array.from({ length: 8 }, (_, index) => [createMessage(7 - index)]),
   ];
-  const { page, waitDurations, scrollPositions } = createPage(batches);
+  const { page, waitDurations, scrollPositions } = createPage(batches, 16_000);
 
   const result = await readMessengerMessages(page);
 
   assert.equal(result.messages.length, 9);
-  assert.equal(scrollPositions.length, 9);
-  assert.equal(waitDurations.length, 9);
+  assert.ok(scrollPositions.length > 9);
+  assert.ok(waitDurations.length > 9);
+  assert.equal(scrollPositions.at(-1), 15_000);
   assert.deepEqual(
     result.messages.map(message => message.id),
     Array.from({ length: 9 }, (_, index) => `message-${index}`),

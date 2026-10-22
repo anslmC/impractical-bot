@@ -180,8 +180,6 @@ test('start prepares the destination, remains alive after readiness, and disconn
     'prepared',
     'engine-ready-logged',
     'read-messages',
-    'generate-reply',
-    'compose-reply',
   ]);
   assert.deepEqual(result.output, [
     'NVIDIA API key validated successfully.',
@@ -189,11 +187,74 @@ test('start prepares the destination, remains alive after readiness, and disconn
     `Engine ready at ${validConfiguration.messageDestination}.`,
     'Found a scrollable conversation container; moving to the latest messages.',
     'Retrieved 2 messages from the configured conversation.',
-    'Generated reply; checking the composer before automatic send.',
-    'Send control clicked; delivery is not confirmed.',
     'Shutdown requested; disconnecting Playwright.',
   ]);
   assert.deepEqual(result.errors, []);
+});
+
+test('start debug mode skips NVIDIA validation and keeps backread read-only', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  const originalDebugMode = process.env.IMPRACTICAL_BOT_DEBUG;
+  process.env.IMPRACTICAL_BOT_DEBUG = '1';
+  let validationCalls = 0;
+  let generationCalls = 0;
+  let compositionCalls = 0;
+  let disconnects = 0;
+  const backreadStarted = deferred<void>();
+  const shutdown = deferred<void>();
+  const session: BrowserLaunchSession = {
+    endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+    browserVersion: 'Brave Chromium test',
+    disconnected: new Promise<void>(() => undefined),
+    async prepare() {
+      return stubPage;
+    },
+    async disconnect() {
+      disconnects += 1;
+    },
+  };
+
+  try {
+    const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+      launchBrowser: async () => session,
+      validateNvidiaApiKey: async () => {
+        validationCalls += 1;
+      },
+      readMessengerMessages: async () => {
+        backreadStarted.resolve();
+        return { diagnostics: ['debug backread diagnostic'], messages: [] };
+      },
+      generateNvidiaReply: async () => {
+        generationCalls += 1;
+        return 'unexpected reply';
+      },
+      composeMessengerReply: async () => {
+        compositionCalls += 1;
+        return { status: 'sent' };
+      },
+      waitForShutdown: () => shutdown.promise,
+    });
+
+    await backreadStarted.promise;
+    shutdown.resolve();
+    const result = await start;
+
+    assert.equal(result.exitCode, 130);
+    assert.equal(validationCalls, 0);
+    assert.equal(generationCalls, 0);
+    assert.equal(compositionCalls, 0);
+    assert.equal(disconnects, 1);
+    assert.ok(result.output.includes('Debug mode enabled; skipping NVIDIA API key validation.'));
+    assert.ok(result.output.includes('debug backread diagnostic'));
+    assert.deepEqual(result.errors, []);
+  } finally {
+    if (originalDebugMode === undefined) {
+      delete process.env.IMPRACTICAL_BOT_DEBUG;
+    } else {
+      process.env.IMPRACTICAL_BOT_DEBUG = originalDebugMode;
+    }
+  }
 });
 
 test('start keeps the ready session alive when backreading fails', async context => {

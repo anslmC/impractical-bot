@@ -3,8 +3,6 @@ import type { ElementHandle, Page } from 'playwright';
 const MESSAGE_SELECTOR =
   '[data-scope="messages_table"][aria-roledescription="message"][data-message-id]';
 const TARGET_MESSAGE_COUNT = 60;
-const MAX_SCROLL_ATTEMPTS = 8;
-const MAX_NO_NEW_MESSAGE_ATTEMPTS = 3;
 
 interface RenderedMessage {
   messageId: string | null;
@@ -251,16 +249,15 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
     diagnostics.push('No rendered messages matched the requested message selector.');
   }
 
-  let noNewMessageAttempts = 0;
-  for (let attempt = 0;
-       scrollContainer && collectedMessages.length < TARGET_MESSAGE_COUNT &&
-       attempt < MAX_SCROLL_ATTEMPTS &&
-       noNewMessageAttempts < MAX_NO_NEW_MESSAGE_ATTEMPTS;
-       attempt += 1) {
+  let reachedConversationTop = false;
+  while (scrollContainer && collectedMessages.length < TARGET_MESSAGE_COUNT) {
+    let previousScrollTop: number;
     try {
-      await scrollContainer.evaluate(element => {
+      previousScrollTop = await scrollContainer.evaluate(element => {
+        const previousPosition = element.scrollTop;
         const increment = Math.max(200, Math.floor(element.clientHeight * 0.75));
-        element.scrollTop = Math.max(0, element.scrollTop - increment);
+        element.scrollTop = Math.max(0, previousPosition - increment);
+        return previousPosition;
       });
     } catch {
       diagnostics.push('Stopped: the conversation scroll container is no longer available.');
@@ -278,14 +275,88 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
       }
     }
 
-    if (newlyFoundMessages.length === 0) {
-      noNewMessageAttempts += 1;
-    } else {
-      noNewMessageAttempts = 0;
-      collectedMessages = [
-        ...newlyFoundMessages,
-        ...collectedMessages,
-      ].slice(-TARGET_MESSAGE_COUNT);
+    const collectedIndexes = new Map(
+      collectedMessages.map((message, index) => [message.messageId, index])
+    );
+    const knownMessagesInSnapshot: RenderedMessage[] = [];
+    const seenSnapshotIds = new Set<string>();
+
+    for (const message of renderedMessages) {
+      const messageIndex = collectedIndexes.get(message.messageId);
+      if (messageIndex !== undefined && !seenSnapshotIds.has(message.messageId!)) {
+        seenSnapshotIds.add(message.messageId!);
+        knownMessagesInSnapshot.push(collectedMessages[messageIndex]);
+      }
+    }
+
+    const knownMessagePositions = knownMessagesInSnapshot
+      .map(message => collectedIndexes.get(message.messageId))
+      .filter((position): position is number => position !== undefined)
+      .sort((left, right) => left - right);
+    knownMessagePositions.forEach((position, index) => {
+      collectedMessages[position] = knownMessagesInSnapshot[index];
+    });
+
+    for (const message of newlyFoundMessages) {
+      const snapshotIndex = renderedMessages.indexOf(message);
+      let insertionIndex = -1;
+
+      for (let index = snapshotIndex + 1; index < renderedMessages.length; index += 1) {
+        const nextIndex = collectedMessages.findIndex(
+          collected => collected.messageId === renderedMessages[index].messageId
+        );
+        if (nextIndex !== -1) {
+          insertionIndex = nextIndex;
+          break;
+        }
+      }
+
+      if (insertionIndex === -1) {
+        for (let index = snapshotIndex - 1; index >= 0; index -= 1) {
+          const previousIndex = collectedMessages.findIndex(
+            collected => collected.messageId === renderedMessages[index].messageId
+          );
+          if (previousIndex !== -1) {
+            insertionIndex = previousIndex + 1;
+            break;
+          }
+        }
+      }
+
+      collectedMessages.splice(insertionIndex === -1 ? 0 : insertionIndex, 0, message);
+    }
+    collectedMessages = collectedMessages.slice(-TARGET_MESSAGE_COUNT);
+
+    if (collectedMessages.length >= TARGET_MESSAGE_COUNT) {
+      break;
+    }
+
+    let currentScrollTop: number;
+    try {
+      currentScrollTop = await scrollContainer.evaluate(element => element.scrollTop);
+    } catch {
+      diagnostics.push('Stopped: the conversation scroll container is no longer available.');
+      break;
+    }
+
+    if (currentScrollTop <= 0) {
+      reachedConversationTop = true;
+      break;
+    }
+
+    if (currentScrollTop === previousScrollTop) {
+      break;
+    }
+  }
+
+  if (reachedConversationTop && scrollContainer) {
+    try {
+      await scrollContainer.evaluate(element => {
+        element.scrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
+      });
+      await page.waitForTimeout(300);
+    } catch {
+      diagnostics.push('Could not restore the conversation scroll container to the bottom.');
     }
   }
 
