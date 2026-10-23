@@ -45,6 +45,7 @@ import {
   composeMessengerReply,
   type ReplyCompositionResult,
 } from './messages/composer.js';
+import { generateAliases } from './messages/alias-engine.js';
 import {
   readMessengerMessages,
   type BackreadResult,
@@ -597,6 +598,7 @@ async function handleStart(
     ? Promise.race([sigintPromise, Promise.resolve().then(() => runtime.waitForShutdown!())])
     : sigintPromise;
   let session: BrowserLaunchSession | undefined;
+  let aliasData: ReturnType<typeof generateAliases> | undefined;
   let exitCode = 0;
   let startupStage: 'launch' | 'prepare' = 'launch';
 
@@ -636,6 +638,15 @@ async function handleStart(
           configurationResult.configuration,
           configurationFilePath,
           writeOutput,
+        );
+        const puppetName = configurationResult.configuration.puppetName;
+        if (!puppetName) {
+          throw new Error('A configured puppet name is required to initialize the alias engine.');
+        }
+        aliasData = generateAliases(puppetName);
+        writeOutput(
+          `DEBUG: Alias engine initialized for puppet name ${JSON.stringify(puppetName)} ` +
+          `(${aliasData.valids.length} aliases).`,
         );
         writeOutput(`Engine ready at ${configurationResult.configuration.messageDestination}.`);
         try {

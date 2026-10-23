@@ -9,6 +9,7 @@ import { runCli, type CliRuntimeOptions } from '../src/cli.js';
 import { NvidiaApiKeyError } from '../src/ai/nvidia.js';
 import type { BrowserLaunchSession } from '../src/browser/launch.js';
 import { loadConfiguration, saveConfiguration, type Configuration } from '../src/config/configuration.js';
+import { generateAliases } from '../src/messages/alias-engine.js';
 import type { BackreadResult } from '../src/messages/backread.js';
 
 async function captureCli(
@@ -185,6 +186,7 @@ test('start prepares the destination, remains alive after readiness, and disconn
     runtime,
     message => {
       if (message.startsWith('Puppet account name updated')) events.push('puppet-name-saved');
+      if (message.startsWith('DEBUG: Alias engine initialized')) events.push('aliases-initialized');
       if (message.startsWith('Engine ready')) events.push('engine-ready-logged');
     },
   );
@@ -210,6 +212,7 @@ test('start prepares the destination, remains alive after readiness, and disconn
     'launched',
     'prepared',
     'puppet-name-saved',
+    'aliases-initialized',
     'engine-ready-logged',
     'window-state-checked',
     'read-messages',
@@ -218,6 +221,7 @@ test('start prepares the destination, remains alive after readiness, and disconn
     'NVIDIA API key validated successfully.',
     'Browser launched and connected (Brave Chromium test).',
     'Puppet account name updated: "Test Puppet".',
+    `DEBUG: Alias engine initialized for puppet name "Test Puppet" (${generateAliases('Test Puppet').valids.length} aliases).`,
     `Engine ready at ${validConfiguration.messageDestination}.`,
     'WARNING: Browser is minimized. Backread may collect fewer messages than expected.',
     'Retrieved 2 messages; expected 30.',
