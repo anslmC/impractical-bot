@@ -78,7 +78,7 @@ test('start prepares the destination, remains alive after readiness, and disconn
   const events: string[] = [];
   let validationCalls = 0;
   const backreadResult: BackreadResult = {
-    diagnostics: ['Found a scrollable conversation container; moving to the latest messages.'],
+    diagnostics: [],
     messages: [{
       id: 'message-1',
       timestamp: {
@@ -111,6 +111,10 @@ test('start prepares the destination, remains alive after readiness, and disconn
       await preparation.promise;
       events.push('prepared');
       return stubPage;
+    },
+    async isWindowMinimized() {
+      events.push('window-state-checked');
+      return true;
     },
     async disconnect() {
       disconnects += 1;
@@ -179,14 +183,15 @@ test('start prepares the destination, remains alive after readiness, and disconn
     'launched',
     'prepared',
     'engine-ready-logged',
+    'window-state-checked',
     'read-messages',
   ]);
   assert.deepEqual(result.output, [
     'NVIDIA API key validated successfully.',
     'Browser launched and connected (Brave Chromium test).',
     `Engine ready at ${validConfiguration.messageDestination}.`,
-    'Found a scrollable conversation container; moving to the latest messages.',
-    'Retrieved 2 messages from the configured conversation.',
+    'WARNING: Browser is minimized. Backread may collect fewer messages than expected.',
+    'Retrieved 2 messages; expected 30.',
     'Shutdown requested; disconnecting Playwright.',
   ]);
   assert.deepEqual(result.errors, []);

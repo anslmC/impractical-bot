@@ -159,7 +159,7 @@ function writeBackreadResult(result: BackreadResult, writeOutput: Output): void 
   for (const diagnostic of result.diagnostics) {
     writeOutput(diagnostic);
   }
-  writeOutput(`Retrieved ${result.messages.length} messages from the configured conversation.`);
+  writeOutput(`Retrieved ${result.messages.length} messages; expected 30.`);
 }
 
 async function ensureNvidiaApiKey(
@@ -566,6 +566,13 @@ async function handleStart(
         throw new Error('The browser disconnected during startup preparation.');
       } else {
         writeOutput(`Engine ready at ${configurationResult.configuration.messageDestination}.`);
+        try {
+          if (await session.isWindowMinimized?.(preparationResult.page)) {
+            writeOutput('WARNING: Browser is minimized. Backread may collect fewer messages than expected.');
+          }
+        } catch {
+          writeError('Unable to detect browser window state.');
+        }
         let backread: BackreadResult | undefined;
         try {
           backread = await (runtime.readMessengerMessages ?? readMessengerMessages)(

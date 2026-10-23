@@ -69,6 +69,7 @@ export interface BrowserLaunchSession {
   browserVersion: string;
   disconnected: Promise<void>;
   prepare(): Promise<Page>;
+  isWindowMinimized?(page: Page): Promise<boolean | undefined>;
   disconnect(): Promise<void>;
 }
 
@@ -553,13 +554,17 @@ export async function prepareConfiguredBrowser(
   const alreadyAtConfiguredConversation = isFacebookUrl(currentPageUrl) &&
     currentPageUrl.origin === destinationUrl.origin &&
     conversationId(currentPageUrl) === expectedConversationId;
+  console.log(`DEBUG: alreadyAtConfiguredConversation=${alreadyAtConfiguredConversation}`);
   if (!alreadyAtConfiguredConversation) {
     await waitForSuccessLogin(facebookPages, options.loginTimeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS);
+    console.log(`DEBUG: navigating to ${destinationUrl.href}`);
+    await page.goto(destinationUrl.href, {
+      waitUntil: 'domcontentloaded',
+      timeout: options.navigationTimeoutMs ?? 30_000,
+    });
+  } else {
+    console.log('DEBUG: skipping conversation navigation');
   }
-  await page.goto(destinationUrl.href, {
-    waitUntil: 'domcontentloaded',
-    timeout: options.navigationTimeoutMs ?? 30_000,
-  });
   await waitForConfiguredConversation(
     page,
     expectedConversationId,
@@ -965,6 +970,15 @@ export async function launchConfiguredBrowser(
           return Promise.reject(new Error('The configured browser disconnected before startup preparation.'));
         }
         return prepareConfiguredBrowser(browser, validatedConfiguration, options);
+      },
+      async isWindowMinimized(page: Page) {
+        const cdpSession = await page.context().newCDPSession(page);
+        try {
+          const { bounds } = await cdpSession.send('Browser.getWindowForTarget');
+          return bounds.windowState === 'minimized';
+        } finally {
+          await cdpSession.detach().catch(() => undefined);
+        }
       },
       disconnect() {
         disconnectPromise ??= browser.isConnected() ? browser.close() : Promise.resolve();

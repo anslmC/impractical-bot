@@ -2,7 +2,10 @@ import type { ElementHandle, Page } from 'playwright';
 
 const MESSAGE_SELECTOR =
   '[data-scope="messages_table"][aria-roledescription="message"][data-message-id]';
-const TARGET_MESSAGE_COUNT = 60;
+const DEBUG_BACKREAD = false;
+const TARGET_MESSAGE_COUNT = 30;
+const TOP_SETTLE_MAX_SNAPSHOTS = 5;
+const TOP_SETTLE_STABLE_COMPARISONS = 2;
 
 interface RenderedMessage {
   messageId: string | null;
@@ -199,7 +202,6 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
   }
 
   if (scrollContainer) {
-    diagnostics.push('Found a scrollable conversation container; moving to the latest messages.');
     await scrollContainer.evaluate(element => {
       element.scrollTop = element.scrollHeight;
     });
@@ -249,10 +251,19 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
     diagnostics.push('No rendered messages matched the requested message selector.');
   }
 
-  let reachedConversationTop = false;
+  let topSettleSnapshotCount = 0;
+  let stableTopSnapshotComparisons = 0;
+  let previousTopMessageCount: number | null = null;
+  let previousTopOldestMessageId: string | null = null;
   while (scrollContainer && collectedMessages.length < TARGET_MESSAGE_COUNT) {
     let previousScrollTop: number;
+    let previousMessageIds: string[];
     try {
+      previousMessageIds = await messageLocator.evaluateAll(elements =>
+        elements
+          .map(element => element.getAttribute('data-message-id'))
+          .filter((messageId): messageId is string => messageId !== null)
+      );
       previousScrollTop = await scrollContainer.evaluate(element => {
         const previousPosition = element.scrollTop;
         const increment = Math.max(200, Math.floor(element.clientHeight * 0.75));
@@ -264,7 +275,18 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
       break;
     }
 
-    await page.waitForTimeout(400);
+    const progressHandle = await page.waitForFunction(
+      ({ selector, previousIds }) => {
+        const previousMessageIds = new Set(previousIds);
+        return Array.from(document.querySelectorAll(selector)).some(element => {
+          const messageId = element.getAttribute('data-message-id');
+          return messageId !== null && !previousMessageIds.has(messageId);
+        });
+      },
+      { selector: MESSAGE_SELECTOR, previousIds: previousMessageIds },
+      { timeout: 1_500, polling: 100 },
+    ).catch(() => undefined);
+    await progressHandle?.dispose();
     const renderedMessages = await collectRenderedMessages();
     const newlyFoundMessages: RenderedMessage[] = [];
 
@@ -274,7 +296,6 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
         newlyFoundMessages.push(message);
       }
     }
-
     const collectedIndexes = new Map(
       collectedMessages.map((message, index) => [message.messageId, index])
     );
@@ -340,8 +361,35 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
     }
 
     if (currentScrollTop <= 0) {
-      reachedConversationTop = true;
-      break;
+      const oldestMessageId = collectedMessages[0]?.messageId ?? null;
+      if (topSettleSnapshotCount > 0 &&
+          collectedMessages.length === previousTopMessageCount &&
+          oldestMessageId === previousTopOldestMessageId) {
+        stableTopSnapshotComparisons += 1;
+      } else {
+        stableTopSnapshotComparisons = 0;
+      }
+      topSettleSnapshotCount += 1;
+      previousTopMessageCount = collectedMessages.length;
+      previousTopOldestMessageId = oldestMessageId;
+
+      if (stableTopSnapshotComparisons >= TOP_SETTLE_STABLE_COMPARISONS) {
+        break;
+      }
+      if (topSettleSnapshotCount >= TOP_SETTLE_MAX_SNAPSHOTS) {
+        diagnostics.push(
+          'Stopped settling at the conversation top after 5 snapshots without stable messages.'
+        );
+        break;
+      }
+      continue;
+    }
+
+    if (topSettleSnapshotCount > 0) {
+      topSettleSnapshotCount = 0;
+      stableTopSnapshotComparisons = 0;
+      previousTopMessageCount = null;
+      previousTopOldestMessageId = null;
     }
 
     if (currentScrollTop === previousScrollTop) {
@@ -349,7 +397,7 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
     }
   }
 
-  if (reachedConversationTop && scrollContainer) {
+  if (scrollContainer) {
     try {
       await scrollContainer.evaluate(element => {
         element.scrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
@@ -375,6 +423,28 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
       ariaLabel: message.ariaLabel,
     };
   });
+
+  const aggregateMessages = messages.flatMap(message => {
+    const lines: string[] = [];
+    if (message.sender === 'UNKNOWN' || message.direction === 'UNKNOWN') {
+      const rawLabel = message.ariaLabel === null
+        ? '(missing)'
+        : JSON.stringify(message.ariaLabel);
+      lines.push(`UNKNOWN diagnostic | ID: ${message.id} | raw aria-label: ${rawLabel}`);
+    }
+    const text = message.message.replace(/\s+/g, ' ') || '(no text content)';
+    lines.push(
+      `${message.id} | ${JSON.stringify(message.timestamp)} | ${message.sender} | ` +
+      `${message.direction} | ${text}`,
+    );
+    return lines;
+  });
+  if (DEBUG_BACKREAD) {
+    diagnostics.push([
+      `Collected ${messages.length} unique messages (oldest to newest):`,
+      ...aggregateMessages,
+    ].map(line => `[DEBUG] ${line}`).join('\n'));
+  }
 
   return { messages, diagnostics };
 }
