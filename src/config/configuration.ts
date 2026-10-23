@@ -27,6 +27,7 @@ export interface Configuration {
   cdpPort?: number;
   startupUrl?: string;
   messageDestination?: string;
+  puppetName?: string;
 }
 
 export type ConfigurationWithoutPin = Omit<Configuration, 'pin'>;
@@ -60,6 +61,7 @@ const CONFIGURATION_KEYS = new Set([
   'cdpPort',
   'startupUrl',
   'messageDestination',
+  'puppetName',
 ]);
 const BROWSER_EXECUTABLE_NAMES: Record<BrowserId, string> = {
   brave: 'brave.exe',
@@ -173,6 +175,16 @@ function validateConfigurationFields(value: unknown): ConfigurationWithoutPin {
       throw new Error('messageDestination must be a valid HTTP or HTTPS URL.');
     }
   }
+  if (
+    value.puppetName !== undefined &&
+    (
+      typeof value.puppetName !== 'string' ||
+      (value.puppetName.length > 0 && value.puppetName !== value.puppetName.trim()) ||
+      /[\u0000-\u001f\u007f]/.test(value.puppetName)
+    )
+  ) {
+    throw new Error('puppetName must be a trimmed string without control characters.');
+  }
 
   return {
     version: CONFIGURATION_VERSION,
@@ -185,6 +197,7 @@ function validateConfigurationFields(value: unknown): ConfigurationWithoutPin {
     ...(value.messageDestination === undefined
       ? {}
       : { messageDestination: value.messageDestination as string }),
+    ...(value.puppetName === undefined ? {} : { puppetName: value.puppetName as string }),
   };
 }
 

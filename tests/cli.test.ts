@@ -59,7 +59,33 @@ const validConfiguration: Configuration = {
   startupUrl: 'https://www.facebook.com',
   messageDestination: 'https://www.facebook.com/messages/t/1618007223454558',
 };
-const stubPage = {} as unknown as Page;
+const profileButton = {
+  count: async () => 1,
+  isVisible: async () => true,
+  isEnabled: async () => true,
+  click: async () => undefined,
+};
+const profileLink = {
+  count: async () => 1,
+  isVisible: async () => true,
+  getAttribute: async () => '/me/',
+  innerText: async () => 'Test Puppet',
+};
+const profileDialog = {
+  waitFor: async () => undefined,
+  locator: (selector: string) => {
+    assert.equal(selector, 'a[href="/me/"]');
+    return profileLink;
+  },
+};
+const stubPage = {
+  getByRole: (role: string, options: { name: string }) => {
+    if (role === 'button' && options.name === 'Your profile') return profileButton;
+    if (role === 'dialog' && options.name === 'Your profile') return profileDialog;
+    throw new Error(`Unexpected role lookup: ${role} ${options.name}`);
+  },
+  keyboard: { press: async () => undefined },
+} as unknown as Page;
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -158,6 +184,7 @@ test('start prepares the destination, remains alive after readiness, and disconn
     undefined,
     runtime,
     message => {
+      if (message.startsWith('Puppet account name updated')) events.push('puppet-name-saved');
       if (message.startsWith('Engine ready')) events.push('engine-ready-logged');
     },
   );
@@ -175,13 +202,14 @@ test('start prepares the destination, remains alive after readiness, and disconn
   const result = await start;
 
   assert.equal(result.exitCode, 130);
-  assert.deepEqual(receivedConfiguration, validConfiguration);
+  assert.deepEqual(receivedConfiguration, { ...validConfiguration, puppetName: 'Test Puppet' });
   assert.equal(disconnects, 1);
   assert.equal(validationCalls, 1);
   assert.deepEqual(events, [
     'validated-1',
     'launched',
     'prepared',
+    'puppet-name-saved',
     'engine-ready-logged',
     'window-state-checked',
     'read-messages',
@@ -189,12 +217,71 @@ test('start prepares the destination, remains alive after readiness, and disconn
   assert.deepEqual(result.output, [
     'NVIDIA API key validated successfully.',
     'Browser launched and connected (Brave Chromium test).',
+    'Puppet account name updated: "Test Puppet".',
     `Engine ready at ${validConfiguration.messageDestination}.`,
     'WARNING: Browser is minimized. Backread may collect fewer messages than expected.',
     'Retrieved 2 messages; expected 30.',
     'Shutdown requested; disconnecting Playwright.',
   ]);
   assert.deepEqual(result.errors, []);
+  const savedConfiguration = loadConfiguration(configurationFilePath);
+  assert.equal(savedConfiguration.status, 'valid');
+  if (savedConfiguration.status === 'valid') {
+    assert.equal(savedConfiguration.configuration.puppetName, 'Test Puppet');
+  }
+});
+
+test('start preserves the saved puppet name and continues when profile retrieval fails', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration({ ...validConfiguration, puppetName: 'Existing Puppet' }, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const shutdown = deferred<void>();
+  const failingPage = {
+    getByRole: () => {
+      throw new Error('profile control unavailable');
+    },
+  } as unknown as Page;
+  let disconnects = 0;
+  const result = await captureCli(
+    ['start'],
+    configurationFilePath,
+    undefined,
+    undefined,
+    {
+      validateNvidiaApiKey: async () => undefined,
+      launchBrowser: async () => ({
+        endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+        browserVersion: 'Brave Chromium test',
+        disconnected: new Promise<void>(() => undefined),
+        async prepare() {
+          return failingPage;
+        },
+        async disconnect() {
+          disconnects += 1;
+        },
+      }),
+      readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+      waitForShutdown: () => shutdown.promise,
+    },
+    message => {
+      if (message.startsWith('Engine ready')) shutdown.resolve();
+    },
+  );
+
+  assert.equal(result.exitCode, 130);
+  const retrievalFailureIndex = result.output.findIndex(message =>
+    message.startsWith('Puppet account name retrieval failed')
+  );
+  const readyIndex = result.output.findIndex(message => message.startsWith('Engine ready'));
+  assert.ok(retrievalFailureIndex >= 0);
+  assert.ok(readyIndex > retrievalFailureIndex);
+  assert.equal(disconnects, 1);
+  assert.deepEqual(result.errors, []);
+  const savedConfiguration = loadConfiguration(configurationFilePath);
+  assert.equal(savedConfiguration.status, 'valid');
+  if (savedConfiguration.status === 'valid') {
+    assert.equal(savedConfiguration.configuration.puppetName, 'Existing Puppet');
+  }
 });
 
 test('start debug mode skips NVIDIA validation and keeps backread read-only', async context => {
@@ -988,9 +1075,9 @@ test('config reports when configuration is missing', async context => {
   assert.deepEqual(result.errors, []);
 });
 
-test('config reports persisted browser, profile, port, and startup URL', async context => {
+test('config reports persisted settings and puppet name', async context => {
   const filePath = createTemporaryConfigPath(context);
-  saveConfiguration(validConfiguration, filePath);
+  saveConfiguration({ ...validConfiguration, puppetName: 'Test Puppet' }, filePath);
 
   const result = await captureCli(['config'], filePath);
 
@@ -1003,6 +1090,7 @@ test('config reports persisted browser, profile, port, and startup URL', async c
   assert.match(result.output[0], /CDP port: 9222/);
   assert.match(result.output[0], /Startup URL: https:\/\/www\.facebook\.com/);
   assert.match(result.output[0], /Message destination: https:\/\/www\.facebook\.com\/messages\/t\/1618007223454558/);
+  assert.match(result.output[0], /Puppet name: Test Puppet/);
   assert.deepEqual(result.errors, []);
 
   saveConfiguration({
@@ -1013,6 +1101,11 @@ test('config reports persisted browser, profile, port, and startup URL', async c
   }, filePath);
   const skippedPinResult = await captureCli(['config'], filePath);
   assert.match(skippedPinResult.output[0], /Messenger restoration PIN: null/);
+  assert.match(skippedPinResult.output[0], /Puppet name: Not set/);
+
+  saveConfiguration({ ...validConfiguration, puppetName: '' }, filePath);
+  const emptyPuppetNameResult = await captureCli(['config'], filePath);
+  assert.match(emptyPuppetNameResult.output[0], /Puppet name: Not set/);
 });
 
 test('help options and no command display usage', async () => {

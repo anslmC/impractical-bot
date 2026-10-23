@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { stdin, stdout } from 'node:process';
+import type { Page } from 'playwright';
 import {
   generateNvidiaReply,
   loadNvidiaApiKey,
@@ -276,8 +277,73 @@ function handleConfig(writeOutput: Output, writeError: Output, filePath?: string
     `  CDP port: ${configuration.cdpPort ?? 'not configured'}`,
     `  Startup URL: ${configuration.startupUrl ?? 'not configured'}`,
     `  Message destination: ${configuration.messageDestination ?? 'not configured'}`,
+    `  Puppet name: ${configuration.puppetName || 'Not set'}`,
   ].join('\n'));
   return 0;
+}
+
+function isValidPuppetName(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value === value.trim() &&
+    !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+async function retrievePuppetName(page: Page): Promise<string> {
+  const profileButton = page.getByRole('button', { name: 'Your profile', exact: true });
+  if (await profileButton.count() !== 1 || !await profileButton.isVisible() ||
+      !await profileButton.isEnabled()) {
+    throw new Error('The visible Your profile button was not uniquely available.');
+  }
+
+  try {
+    await profileButton.click();
+    const profileDialog = page.getByRole('dialog', { name: 'Your profile', exact: true });
+    await profileDialog.waitFor({ state: 'visible', timeout: 20_000 });
+    const profileLink = profileDialog.locator('a[href="/me/"]');
+    if (await profileLink.count() !== 1 || !await profileLink.isVisible() ||
+        await profileLink.getAttribute('href') !== '/me/') {
+      throw new Error('The /me/ link was not uniquely available in the profile dialog.');
+    }
+
+    const puppetName = (await profileLink.innerText()).trim();
+    if (!isValidPuppetName(puppetName)) {
+      throw new Error('The profile dialog did not contain a valid displayed account name.');
+    }
+    return puppetName;
+  } finally {
+    await page.keyboard.press('Escape').catch(() => {});
+  }
+}
+
+async function updatePuppetName(
+  page: Page,
+  configuration: Configuration,
+  configurationFilePath: string | undefined,
+  writeOutput: Output,
+): Promise<void> {
+  let puppetName: string;
+  try {
+    puppetName = await retrievePuppetName(page);
+  } catch (error) {
+    writeOutput(
+      'Puppet account name retrieval failed; keeping the existing configured value. ' +
+      `${error instanceof Error ? error.message : 'Unknown retrieval error.'}`,
+    );
+    return;
+  }
+
+  try {
+    const savedConfiguration = saveConfiguration(
+      { ...configuration, puppetName },
+      configurationFilePath,
+    );
+    configuration.puppetName = savedConfiguration.puppetName;
+    writeOutput(`Puppet account name updated: ${JSON.stringify(puppetName)}.`);
+  } catch (error) {
+    writeOutput(
+      `Puppet account name retrieved as ${JSON.stringify(puppetName)}, but saving failed; ` +
+      `keeping the existing configured value. ${error instanceof Error ? error.message : 'Unknown save error.'}`,
+    );
+  }
 }
 
 async function handleChangeBrowser(
@@ -565,6 +631,12 @@ async function handleStart(
       } else if (preparationResult.type === 'disconnected') {
         throw new Error('The browser disconnected during startup preparation.');
       } else {
+        await updatePuppetName(
+          preparationResult.page,
+          configurationResult.configuration,
+          configurationFilePath,
+          writeOutput,
+        );
         writeOutput(`Engine ready at ${configurationResult.configuration.messageDestination}.`);
         try {
           if (await session.isWindowMinimized?.(preparationResult.page)) {

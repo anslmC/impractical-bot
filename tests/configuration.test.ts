@@ -27,6 +27,7 @@ const validConfiguration: Configuration = {
   cdpPort: 9222,
   startupUrl: 'https://www.facebook.com',
   messageDestination: 'https://www.facebook.com/messages',
+  puppetName: 'Test Puppet',
 };
 
 function createTemporaryConfigPath(context: TestContext): string {
@@ -76,6 +77,7 @@ test('valid configuration saves atomically and loads with its schema', context =
     ...validConfiguration,
     browser: 'chrome',
     executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    puppetName: 'Updated Puppet',
   };
   assert.deepEqual(saveConfiguration(updatedConfiguration, filePath), updatedConfiguration);
   assert.deepEqual(loadConfiguration(filePath), {
@@ -157,16 +159,18 @@ test('validation rejects invalid browsers, paths, and CDP ports', () => {
   }
 });
 
-test('legacy configurations without messageDestination remain valid', context => {
+test('legacy configurations without optional fields remain valid', context => {
   const filePath = createTemporaryConfigPath(context);
   const legacyConfiguration: Record<string, unknown> = { ...validConfiguration };
   delete legacyConfiguration.messageDestination;
+  delete legacyConfiguration.puppetName;
 
   saveConfiguration(legacyConfiguration, filePath);
   const loaded = loadConfiguration(filePath);
   assert.equal(loaded.status, 'valid');
   if (loaded.status === 'valid') {
     assert.equal(loaded.configuration.messageDestination, undefined);
+    assert.equal(loaded.configuration.puppetName, undefined);
   }
 });
 
@@ -191,6 +195,10 @@ test('validation defaults the PIN restoration setting and rejects invalid values
   delete legacyConfiguration.skipPinRestoration;
   assert.equal(validateConfiguration(legacyConfiguration).skipPinRestoration, false);
 
+  const legacyWithoutPuppetName: Record<string, unknown> = { ...validConfiguration };
+  delete legacyWithoutPuppetName.puppetName;
+  assert.equal(validateConfiguration(legacyWithoutPuppetName).puppetName, undefined);
+
   for (const skipPinRestoration of [undefined, null, 'false', 0]) {
     assert.throws(
       () => validateConfiguration({ ...validConfiguration, skipPinRestoration }),
@@ -201,6 +209,17 @@ test('validation defaults the PIN restoration setting and rejects invalid values
     () => validateConfiguration({ ...validConfiguration, unexpected: true }),
     /unsupported field 'unexpected'/,
   );
+});
+
+test('puppetName allows an empty unset sentinel and rejects malformed names', () => {
+  assert.equal(validateConfiguration({ ...validConfiguration, puppetName: '' }).puppetName, '');
+  for (const puppetName of [null, '   ', ' Test Puppet ', `Test${String.fromCharCode(10)}Puppet`]) {
+    assert.throws(
+      () => validateConfiguration({ ...validConfiguration, puppetName }),
+      /puppetName must be a trimmed string without control characters/,
+    );
+  }
+  assert.equal(validateConfiguration(validConfiguration).puppetName, 'Test Puppet');
 });
 
 test('PIN validation requires six digits when enabled and null when skipped', () => {
