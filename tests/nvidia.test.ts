@@ -6,6 +6,7 @@ import { test, type TestContext } from 'node:test';
 import {
   loadNvidiaApiKey,
   NvidiaApiKeyError,
+  NvidiaRequestError,
   generateNvidiaReply,
   resolveNvidiaEnvironmentPath,
   saveNvidiaApiKey,
@@ -95,9 +96,9 @@ test('NVIDIA validation sends a minimal non-streaming Bearer-authenticated reque
     'Content-Type': 'application/json',
   });
   assert.deepEqual(JSON.parse(String(requestedOptions?.body)), {
-    model: 'openai/gpt-oss-20b',
+    model: 'nvidia/nemotron-3.5-lightning-30b-a3b',
     messages: [{ role: 'user', content: 'Reply with OK.' }],
-    reasoning_effort: 'low',
+    chat_template_kwargs: { enable_thinking: true },
     max_tokens: 4096,
     stream: false,
   });
@@ -151,7 +152,7 @@ test('reply generation sends known-direction messages in order and extracts trim
     'Content-Type': 'application/json',
   });
   assert.deepEqual(JSON.parse(String(requestedOptions?.body)), {
-    model: 'openai/gpt-oss-20b',
+    model: 'nvidia/nemotron-3.5-lightning-30b-a3b',
     messages: [
       {
         role: 'system',
@@ -161,10 +162,95 @@ test('reply generation sends known-direction messages in order and extracts trim
       { role: 'assistant', content: 'I think so.' },
       { role: 'user', content: 'Blair: Great, what time works?' },
     ],
-    reasoning_effort: 'low',
-    max_tokens: 160,
+    chat_template_kwargs: { enable_thinking: true },
+    max_tokens: 4096,
     stream: false,
   });
+});
+
+test('reply generation coalesces consecutive roles and ends with the incoming turn', async () => {
+  let requestedOptions: RequestInit | undefined;
+
+  await generateNvidiaReply('nvapi-test-key', [{
+    id: 'incoming-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Alex',
+    direction: 'INCOMING',
+    message: 'First incoming.',
+    ariaLabel: null,
+  }, {
+    id: 'incoming-2',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Blair',
+    direction: 'INCOMING',
+    message: 'Second incoming.',
+    ariaLabel: null,
+  }, {
+    id: 'outgoing-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'You',
+    direction: 'OUTGOING',
+    message: 'First outgoing.',
+    ariaLabel: null,
+  }, {
+    id: 'outgoing-2',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'You',
+    direction: 'OUTGOING',
+    message: 'Second outgoing.',
+    ariaLabel: null,
+  }, {
+    id: 'incoming-3',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Casey',
+    direction: 'INCOMING',
+    message: 'Latest incoming.',
+    ariaLabel: null,
+  }], {
+    fetch: async (_input, init) => {
+      requestedOptions = init;
+      return successfulCompletion('Reply');
+    },
+  });
+
+  const body = JSON.parse(String(requestedOptions?.body));
+  assert.deepEqual(body.messages.slice(1), [
+    { role: 'user', content: 'Alex: First incoming.\nBlair: Second incoming.' },
+    { role: 'assistant', content: 'First outgoing.\nSecond outgoing.' },
+    { role: 'user', content: 'Casey: Latest incoming.' },
+  ]);
+});
+
+test('reply generation repeats the latest actual incoming turn after a trailing assistant turn', async () => {
+  let requestedOptions: RequestInit | undefined;
+
+  await generateNvidiaReply('nvapi-test-key', [{
+    id: 'incoming-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Alex',
+    direction: 'INCOMING',
+    message: 'Can you check this?',
+    ariaLabel: null,
+  }, {
+    id: 'outgoing-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'You',
+    direction: 'OUTGOING',
+    message: 'I will check.',
+    ariaLabel: null,
+  }], {
+    fetch: async (_input, init) => {
+      requestedOptions = init;
+      return successfulCompletion('Reply');
+    },
+  });
+
+  const body = JSON.parse(String(requestedOptions?.body));
+  assert.deepEqual(body.messages.slice(1), [
+    { role: 'user', content: 'Alex: Can you check this?' },
+    { role: 'assistant', content: 'I will check.' },
+    { role: 'user', content: 'Alex: Can you check this?' },
+  ]);
 });
 
 test('reply generation rejects when no known-direction non-empty context is available', async () => {
@@ -206,7 +292,7 @@ test('reply generation rejects empty output and malformed responses', async () =
     await assert.rejects(
       generateNvidiaReply('nvapi-test-key', context, { fetch: async () => response }),
       error => {
-        assert.ok(error instanceof NvidiaApiKeyError);
+        assert.ok(error instanceof NvidiaRequestError);
         assert.equal(error.kind, 'service');
         return true;
       },
@@ -214,7 +300,7 @@ test('reply generation rejects empty output and malformed responses', async () =
   }
 });
 
-test('reply generation preserves authentication and service API error handling', async () => {
+test('reply generation preserves authentication and reports HTTP status and body', async () => {
   const context = [{
     id: 'incoming-1',
     timestamp: { original: null, normalized: null, resolved: false },
@@ -224,19 +310,77 @@ test('reply generation preserves authentication and service API error handling',
     ariaLabel: null,
   }];
 
-  for (const [status, kind] of [[401, 'authentication'], [202, 'service'], [429, 'service']] as const) {
-    await assert.rejects(
-      generateNvidiaReply('nvapi-test-key', context, {
-        fetch: async () => new Response('', { status }),
-      }),
-      error => {
-        assert.ok(error instanceof NvidiaApiKeyError);
-        assert.equal(error.kind, kind);
-        assert.ok(!error.message.includes('nvapi-test-key'));
-        return true;
-      },
-    );
-  }
+  await assert.rejects(
+    generateNvidiaReply('nvapi-test-key', context, {
+      fetch: async () => new Response('', { status: 401 }),
+    }),
+    error => {
+      assert.ok(error instanceof NvidiaApiKeyError);
+      assert.equal(error.kind, 'authentication');
+      assert.match(error.message, /HTTP 401/);
+      assert.ok(!error.message.includes('nvapi-test-key'));
+      return true;
+    },
+  );
+
+  const apiKey = 'nvapi-secret-test-key';
+  const responseBody = JSON.stringify({
+    error: 'Request denied',
+    authorization: `Bearer ${apiKey}`,
+    NVIDIA_API_KEY: apiKey,
+  });
+  await assert.rejects(
+    generateNvidiaReply(apiKey, context, {
+      fetch: async () => new Response(responseBody, { status: 422 }),
+    }),
+    error => {
+      assert.ok(error instanceof NvidiaRequestError);
+      assert.equal(error.kind, 'service');
+      assert.match(error.message, /HTTP 422/);
+      assert.match(error.message, /Request denied/);
+      assert.match(error.message, /\[REDACTED\]/);
+      assert.ok(!error.message.includes(apiKey));
+      return true;
+    },
+  );
+
+  await assert.rejects(
+    generateNvidiaReply('nvapi-test-key', context, {
+      fetch: async () => new Response('request pending', { status: 202 }),
+    }),
+    error => {
+      assert.ok(error instanceof NvidiaRequestError);
+      assert.equal(error.kind, 'service');
+      assert.match(error.message, /HTTP 202/);
+      assert.match(error.message, /request pending/);
+      return true;
+    },
+  );
+});
+
+test('reply generation preserves the original network exception as cause', async () => {
+  const apiKey = 'nvapi-secret-test-key';
+  const networkFailure = new TypeError(`Connection failed using Bearer ${apiKey}`);
+
+  await assert.rejects(
+    generateNvidiaReply(apiKey, [{
+      id: 'incoming-1',
+      timestamp: { original: null, normalized: null, resolved: false },
+      sender: 'Alex',
+      direction: 'INCOMING',
+      message: 'Hello.',
+      ariaLabel: null,
+    }], { fetch: async () => { throw networkFailure; } }),
+    error => {
+      assert.ok(error instanceof NvidiaRequestError);
+      assert.equal(error.kind, 'network');
+      assert.equal(error.cause, networkFailure);
+      assert.match(error.message, /Unable to reach NVIDIA/);
+      assert.ok(!error.message.includes(apiKey));
+      assert.ok(!error.message.includes('Bearer'));
+      return true;
+    },
+  );
 });
 
 test('NVIDIA 401 responses are authentication failures without exposing the key', async () => {
@@ -255,16 +399,18 @@ test('NVIDIA 401 responses are authentication failures without exposing the key'
   );
 });
 
-test('NVIDIA transport failures are network errors and do not expose the key', async () => {
+test('NVIDIA validation transport failures preserve cause without exposing the key', async () => {
   const key = 'nvapi-secret-test-key';
+  const networkFailure = new TypeError(`request failed for ${key}`);
 
   await assert.rejects(
     validateNvidiaApiKey(key, {
-      fetch: async () => { throw new TypeError(`request failed for ${key}`); },
+      fetch: async () => { throw networkFailure; },
     }),
     error => {
       assert.ok(error instanceof NvidiaApiKeyError);
       assert.equal(error.kind, 'network');
+      assert.equal(error.cause, networkFailure);
       assert.ok(!error.message.includes(key));
       return true;
     },

@@ -16,18 +16,24 @@ import { resolveConfigurationPaths } from '../config/configuration.js';
 import type { BackreadMessage } from '../messages/backread.js';
 
 const NVIDIA_CHAT_COMPLETIONS_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
-const NVIDIA_CHAT_COMPLETIONS_MODEL = 'openai/gpt-oss-20b';
+const NVIDIA_CHAT_COMPLETIONS_MODEL = 'nvidia/nemotron-3.5-lightning-30b-a3b';
 const DEFAULT_REQUEST_TIMEOUT_MS = 50_000;
 
 export type NvidiaApiKeyErrorKind = 'authentication' | 'network' | 'service';
 
 export class NvidiaApiKeyError extends Error {
-  constructor(
-    readonly kind: NvidiaApiKeyErrorKind,
-    message: string,
-  ) {
-    super(message);
+  constructor(readonly kind: NvidiaApiKeyErrorKind, message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = 'NvidiaApiKeyError';
+  }
+}
+
+export type NvidiaRequestErrorKind = 'network' | 'service';
+
+export class NvidiaRequestError extends Error {
+  constructor(readonly kind: NvidiaRequestErrorKind, message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'NvidiaRequestError';
   }
 }
 
@@ -37,6 +43,38 @@ export interface NvidiaRequestOptions {
 }
 
 export type NvidiaValidationOptions = NvidiaRequestOptions;
+
+function redactCredentials(value: string, apiKey: string): string {
+  const withApiKeyRedacted = apiKey
+    ? value.replaceAll(apiKey, '[REDACTED]')
+    : value;
+  return withApiKeyRedacted.replace(
+    /(["']?(?:[\w-]*api[_-]?key|access[_-]?token|authorization|password)["']?\s*[:=]\s*["']?)(?:bearer\s+)?[^\s,"'}]+/gi,
+    '$1[REDACTED]',
+  );
+}
+
+async function readErrorResponse(response: Response, apiKey: string): Promise<{
+  status: number;
+  body: string;
+}> {
+  const status = response.status;
+  let body: string;
+  try {
+    body = await response.text();
+  } catch {
+    body = '(response body could not be read)';
+  }
+  const redactedBody = redactCredentials(body.trim(), apiKey);
+  return {
+    status,
+    body: redactedBody || '(empty response body)',
+  };
+}
+
+function formatHttpFailure(status: number, body: string): string {
+  return `HTTP ${status}. Response body: ${body}`;
+}
 
 export function resolveNvidiaEnvironmentPath(configurationFilePath?: string): string {
   const selectedConfigurationPath = configurationFilePath ?? resolveConfigurationPaths().filePath;
@@ -147,32 +185,42 @@ export async function validateNvidiaApiKey(
       body: JSON.stringify({
         model: NVIDIA_CHAT_COMPLETIONS_MODEL,
         messages: [{ role: 'user', content: 'Reply with OK.' }],
-        reasoning_effort: 'low',
+        chat_template_kwargs: { enable_thinking: false  },
         max_tokens: 4096,
         stream: false,
       }),
       signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS),
     });
-  } catch {
+  } catch (error) {
     throw new NvidiaApiKeyError(
       'network',
       'Unable to reach NVIDIA to validate the API key. Check the network connection and try again.',
+      { cause: error },
     );
   }
 
+  const failure = response.status === 200
+    ? undefined
+    : await readErrorResponse(response, apiKey);
   if (response.status === 401) {
-    throw new NvidiaApiKeyError('authentication', 'NVIDIA rejected the API key. Check the saved key.');
+    throw new NvidiaApiKeyError(
+      'authentication',
+      `NVIDIA rejected the API key. ${formatHttpFailure(failure!.status, failure!.body)}`,
+    );
   }
   if (response.status === 202) {
     throw new NvidiaApiKeyError(
       'service',
-      'NVIDIA accepted the validation request but left it pending. Try again later.',
+      `NVIDIA accepted the validation request but left it pending. ` +
+      `${formatHttpFailure(failure!.status, failure!.body)} Try again later.`,
     );
   }
   if (response.status !== 200) {
     throw new NvidiaApiKeyError(
       'service',
-      `NVIDIA could not validate the API key (HTTP ${response.status}). This does not establish that the key is invalid.`,
+      `NVIDIA could not validate the API key. ` +
+      `${formatHttpFailure(failure!.status, failure!.body)} ` +
+      'This does not establish that the key is invalid.',
     );
   }
 
@@ -183,7 +231,11 @@ export async function validateNvidiaApiKey(
     if (error instanceof SyntaxError) {
       throw new NvidiaApiKeyError('service', 'NVIDIA returned an unexpected validation response.');
     }
-    throw new NvidiaApiKeyError('network', 'The NVIDIA validation response could not be read. Try again.');
+    throw new NvidiaApiKeyError(
+      'network',
+      'The NVIDIA validation response could not be read. Try again.',
+      { cause: error },
+    );
   }
   if (!isCompletionResponse(body)) {
     throw new NvidiaApiKeyError('service', 'NVIDIA returned an unexpected validation response.');
@@ -199,23 +251,38 @@ export async function generateNvidiaReply(
     throw new NvidiaApiKeyError('authentication', 'The NVIDIA API key is empty or malformed.');
   }
 
-  const conversationMessages = messages.flatMap(message => {
+  const conversationMessages: { role: 'user' | 'assistant'; content: string }[] = [];
+  let latestIncomingMessage: string | undefined;
+  for (const message of messages) {
     if (message.direction === 'UNKNOWN') {
-      return [];
+      continue;
     }
     const content = message.message.trim();
     if (!content) {
-      return [];
+      continue;
     }
     const isIncoming = message.direction === 'INCOMING';
     const sender = message.sender !== 'UNKNOWN' ? `${message.sender}: ` : '';
-    return [{
-      role: isIncoming ? 'user' : 'assistant',
-      content: isIncoming ? `${sender}${content}` : content,
-    }];
-  });
+    const formattedContent = isIncoming ? `${sender}${content}` : content;
+    const role = isIncoming ? 'user' : 'assistant';
+    const previousMessage = conversationMessages.at(-1);
+    if (previousMessage?.role === role) {
+      previousMessage.content += `\n${formattedContent}`;
+    } else {
+      conversationMessages.push({ role, content: formattedContent });
+    }
+    if (isIncoming) {
+      latestIncomingMessage = formattedContent;
+    }
+  }
   if (conversationMessages.length === 0) {
     throw new Error('No usable Messenger messages are available to generate a reply.');
+  }
+  if (!latestIncomingMessage) {
+    throw new Error('No incoming Messenger messages are available to generate a reply.');
+  }
+  if (conversationMessages.at(-1)?.role === 'assistant') {
+    conversationMessages.push({ role: 'user', content: latestIncomingMessage });
   }
 
   let response: Response;
@@ -235,32 +302,40 @@ export async function generateNvidiaReply(
           },
           ...conversationMessages,
         ],
-        reasoning_effort: 'low',
-        max_tokens: 160,
+        chat_template_kwargs: { enable_thinking: true },
+        max_tokens: 4096,
         stream: false,
       }),
       signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS),
     });
-  } catch {
-    throw new NvidiaApiKeyError(
+  } catch (error) {
+    throw new NvidiaRequestError(
       'network',
       'Unable to reach NVIDIA to generate a reply. Check the network connection and try again.',
+      { cause: error },
     );
   }
 
+  const failure = response.status === 200
+    ? undefined
+    : await readErrorResponse(response, apiKey);
   if (response.status === 401) {
-    throw new NvidiaApiKeyError('authentication', 'NVIDIA rejected the API key. Check the saved key.');
+    throw new NvidiaApiKeyError(
+      'authentication',
+      `NVIDIA rejected the API key. ${formatHttpFailure(failure!.status, failure!.body)}`,
+    );
   }
   if (response.status === 202) {
-    throw new NvidiaApiKeyError(
+    throw new NvidiaRequestError(
       'service',
-      'NVIDIA accepted the reply request but left it pending. Try again later.',
+      `NVIDIA accepted the reply request but left it pending. ` +
+      `${formatHttpFailure(failure!.status, failure!.body)} Try again later.`,
     );
   }
   if (response.status !== 200) {
-    throw new NvidiaApiKeyError(
+    throw new NvidiaRequestError(
       'service',
-      `NVIDIA could not generate a reply (HTTP ${response.status}). This does not establish that the key is invalid.`,
+      `NVIDIA could not generate a reply. ${formatHttpFailure(failure!.status, failure!.body)}`,
     );
   }
 
@@ -269,18 +344,26 @@ export async function generateNvidiaReply(
     body = await response.json() as unknown;
   } catch (error) {
     if (error instanceof SyntaxError) {
-      throw new NvidiaApiKeyError('service', 'NVIDIA returned an unexpected reply response.');
+      throw new NvidiaRequestError(
+        'service',
+        'NVIDIA returned an unexpected reply response.',
+        { cause: error },
+      );
     }
-    throw new NvidiaApiKeyError('network', 'The NVIDIA reply response could not be read. Try again.');
+    throw new NvidiaRequestError(
+      'network',
+      'The NVIDIA reply response could not be read. Try again.',
+      { cause: error },
+    );
   }
   if (!isCompletionResponse(body)) {
-    throw new NvidiaApiKeyError('service', 'NVIDIA returned an unexpected reply response.');
+    throw new NvidiaRequestError('service', 'NVIDIA returned an unexpected reply response.');
   }
 
   const reply = (body as { choices: { message: { content: string } }[] })
     .choices[0].message.content.trim();
   if (!reply) {
-    throw new NvidiaApiKeyError('service', 'NVIDIA returned an empty reply.');
+    throw new NvidiaRequestError('service', 'NVIDIA returned an empty reply.');
   }
   return reply;
 }
