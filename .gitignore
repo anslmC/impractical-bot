@@ -1,8 +1,8 @@
 # Dependencies
 /node_modules/
 
-# Local tools
-/Tools/
+# Local personal notes
+notes
 
 # Build and test output
 /dist/
