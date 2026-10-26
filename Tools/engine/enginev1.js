@@ -350,6 +350,24 @@ async function main() {
   const contextStore = createContextStore({ maxMessages: CONTEXT_STORE_CAPACITY });
   let packetScheduler;
   let packetBuilderState;
+  let pollRng;
+  const stopRngPolling = (message) => {
+    if (rngPollTimer === undefined) {
+      return;
+    }
+    clearInterval(rngPollTimer);
+    rngPollTimer = undefined;
+    if (message) {
+      console.log(message);
+    }
+  };
+  const startRngPolling = (message = '[rng] Polling resumed: main poller active') => {
+    if (rngPollTimer !== undefined || !pollRng) {
+      return;
+    }
+    rngPollTimer = setInterval(pollRng, RNG_POLL_INTERVAL_MS);
+    console.log(message);
+  };
   const completeRngPacket = (packetId, succeeded, error) => {
     if (packetId !== rngPacketInFlightId) {
       return;
@@ -410,6 +428,7 @@ async function main() {
       return;
     }
     mode = 'idle';
+    stopRngPolling('[rng] Polling paused: main poller idle');
     console.log('[poller] Idle; no genuinely new message was detected before the threshold.');
     await setWakerActive(true);
     pollDelayResolve?.();
@@ -438,6 +457,7 @@ async function main() {
       return;
     }
     mode = 'polling';
+    startRngPolling();
     wakePending = true;
     console.log('[poller] Wake-up signal received; verifying rendered messages now.');
     void setWakerActive(false);
@@ -634,7 +654,7 @@ async function main() {
       state: packetBuilderState,
     }).state;
 
-    const pollRng = () => {
+    pollRng = () => {
       console.log('[rng] Evaluating cycle');
       const skipReason = getRngSkipReason({
         mainPollInProgress,
@@ -651,6 +671,13 @@ async function main() {
         return;
       }
       lastRngSkipReason = null;
+      const latestMessage = contextStore.getRecent(1)[0];
+      if (latestMessage?.sender === 'You' && latestMessage.direction === 'OUTGOING') {
+        console.log(
+          '[rng] Skipping dice roll: latest Context Store message is OUTGOING.'
+        );
+        return;
+      }
       if (Math.random() >= RNG_YES_PROBABILITY) {
         console.log('[rng] Roll: NO (25% chance)');
         return;
@@ -691,7 +718,7 @@ async function main() {
         console.error(`[rng] Could not submit an RNG packet: ${details}`);
       }
     };
-    rngPollTimer = setInterval(pollRng, RNG_POLL_INTERVAL_MS);
+    startRngPolling('[rng] Polling started');
 
     console.log(DEBUG_ENGINE
       ? `[poller] Active; sampling every ${POLL_INTERVAL_MS} ms.`
@@ -807,7 +834,7 @@ async function main() {
     }
   } finally {
     process.removeListener('SIGINT', onInterrupt);
-    clearInterval(rngPollTimer);
+    stopRngPolling();
     clearTimeout(rngCooldownTimer);
     clearTimeout(idleTimer);
     if (packetScheduler) {

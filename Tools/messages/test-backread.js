@@ -17,11 +17,11 @@ function loadConfiguration() {
 
   const configurationPath = join(localAppData, 'Impractical Bot', 'config.json');
   const configuration = JSON.parse(readFileSync(configurationPath, 'utf8'));
-  if (sender === 'UNKNOWN' || match[1].trim() !== sender) {
-    return textWithoutSenderHeading;
+  if (!configuration || !Number.isInteger(configuration.cdpPort) ||
+      configuration.cdpPort < 1 || configuration.cdpPort > 65535) {
+    throw new Error('The configured CDP port is missing or invalid.');
   }
-
-  return match[2].trim();
+  return configuration;
 }
 
 async function main() {
@@ -103,7 +103,10 @@ async function main() {
           })(),
         }))
       );
-      return elements.map(extractMessageDetails);
+      return elements.map(element => ({
+        ...extractMessageDetails(element),
+        ariaLabel: element.ariaLabel,
+      }));
     };
 
     const seenMessageIds = new Set();
