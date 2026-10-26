@@ -1,4 +1,4 @@
-const { buildPacketTurn } = require('../components/packet-builder');
+const { buildPacketTurn } = require('../components/mention-packet-builder');
 
 function describeStructure(value) {
   if (Array.isArray(value)) {

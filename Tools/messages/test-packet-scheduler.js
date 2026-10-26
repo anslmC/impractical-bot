@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const {
   buildPacketTurn,
   createPacketBuilderState,
-} = require('../components/packet-builder');
+} = require('../components/mention-packet-builder');
 const { createPacketScheduler } = require('../components/packet-scheduler');
 
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));

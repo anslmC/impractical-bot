@@ -11,7 +11,8 @@ const { composeMessengerReply } = require('../components/composer');
 const {
   buildPacketTurn,
   createPacketBuilderState,
-} = require('../components/packet-builder');
+} = require('../components/mention-packet-builder');
+const { buildRngPacket } = require('../components/rng-packet-builder');
 const { createContextStore } = require('../components/context-store');
 const { createPacketScheduler } = require('../components/packet-scheduler');
 const { extractMessageDetails } = require('../components/message-extraction');
@@ -24,6 +25,10 @@ const WAKER_MESSAGE_SELECTOR = '[data-message-id]';
 const MESSAGE_LIMIT = 8;
 const CONTEXT_STORE_CAPACITY = 60;
 const POLL_INTERVAL_MS = 3000;
+const RNG_POLL_INTERVAL_MS = 15000;
+const RNG_CONTEXT_MESSAGE_LIMIT = 10;
+const RNG_YES_PROBABILITY = 0.75;
+const RNG_COOLDOWN_MS = 50000;
 const IDLE_THRESHOLD_MS = 30000;
 const LOG_PREFIX = '__MESSENGER_WAKER__:';
 const DEBUG_ENGINE = true;
@@ -144,6 +149,35 @@ function canReadContextStore(packetScheduler, packetBuilderState, packetAwaiting
     !schedulerState.activePacket &&
     schedulerState.pendingPackets.length === 0 &&
     !packetBuilderState.pendingPacket;
+}
+
+function getRngSkipReason({
+  mainPollInProgress,
+  packetScheduler,
+  packetBuilderState,
+  rngOperationActive,
+  rngCooldownActive,
+}) {
+  if (mainPollInProgress) {
+    return 'main poll in progress';
+  }
+  if (packetBuilderState.pendingPacket) {
+    return 'mention packet open or awaiting submission';
+  }
+  const { activePacket, pendingPackets } = packetScheduler.getState();
+  if (activePacket?.mentionMessages?.length > 0) {
+    return 'mention packet active';
+  }
+  if (pendingPackets.some(packet => packet.mentionMessages?.length > 0)) {
+    return 'mention packet queued';
+  }
+  if (rngOperationActive) {
+    return 'RNG operation already active';
+  }
+  if (rngCooldownActive) {
+    return 'RNG cooldown active';
+  }
+  return null;
 }
 
 function readContextStore(
@@ -301,6 +335,13 @@ async function main() {
   let stopRequested = false;
   let mode = 'polling';
   let wakerActive = false;
+  let mainPollInProgress = false;
+  let rngOperationActive = false;
+  let rngCooldownActive = false;
+  let rngPacketInFlightId = null;
+  let lastRngSkipReason = null;
+  let rngPollTimer;
+  let rngCooldownTimer;
   let pollDelayResolve;
   let idleTimer;
   let idleDeadline;
@@ -308,6 +349,28 @@ async function main() {
   let wakeSignal = createWakeSignal();
   const contextStore = createContextStore({ maxMessages: CONTEXT_STORE_CAPACITY });
   let packetScheduler;
+  let packetBuilderState;
+  const completeRngPacket = (packetId, succeeded, error) => {
+    if (packetId !== rngPacketInFlightId) {
+      return;
+    }
+    rngPacketInFlightId = null;
+    rngOperationActive = false;
+    const outcome = succeeded
+      ? 'success'
+      : `failure: ${error instanceof Error ? error.message : String(error)}`;
+    console.log(`[rng] Processing completed: ${packetId} (${outcome})`);
+    if (stopRequested) {
+      return;
+    }
+    rngCooldownActive = true;
+    console.log(`[rng] Cooldown started: ${RNG_COOLDOWN_MS / 1000}s`);
+    rngCooldownTimer = setTimeout(() => {
+      rngCooldownTimer = undefined;
+      rngCooldownActive = false;
+      console.log('[rng] Cooldown ended');
+    }, RNG_COOLDOWN_MS);
+  };
   const onInterrupt = () => {
     if (stopRequested) {
       return;
@@ -435,13 +498,30 @@ async function main() {
         'Open Facebook Messages in Brave and run this script again.'
       );
     }
-    packetScheduler = createPacketScheduler(createPacketProcessor({
+    const processPacket = createPacketProcessor({
       page,
       apiKey,
       generateReply: generateNvidiaReply,
       composeReply: composeMessengerReply,
       debugMode,
-    }));
+    });
+    packetScheduler = createPacketScheduler(async packet => {
+      if (packet.packetId === rngPacketInFlightId) {
+        console.log(`[rng] Processing started: ${packet.packetId}`);
+      }
+      let succeeded = false;
+      let processingError;
+      try {
+        const result = await processPacket(packet);
+        succeeded = true;
+        return result;
+      } catch (error) {
+        processingError = error;
+        throw error;
+      } finally {
+        completeRngPacket(packet.packetId, succeeded, processingError);
+      }
+    });
 
     page.on('console', message => {
       const text = message.text();
@@ -536,7 +616,7 @@ async function main() {
     );
     console.log(`Baseline recorded: ${seenMessageIds.size} unique message IDs.`);
 
-    let packetBuilderState = createPacketBuilderState();
+    packetBuilderState = createPacketBuilderState();
     appendContextMessages(
       contextStore,
       baseline,
@@ -553,6 +633,65 @@ async function main() {
         })),
       state: packetBuilderState,
     }).state;
+
+    const pollRng = () => {
+      console.log('[rng] Evaluating cycle');
+      const skipReason = getRngSkipReason({
+        mainPollInProgress,
+        packetScheduler,
+        packetBuilderState,
+        rngOperationActive,
+        rngCooldownActive,
+      });
+      if (skipReason) {
+        if (skipReason !== lastRngSkipReason) {
+          console.log(`[rng] Skipped: ${skipReason}`);
+        }
+        lastRngSkipReason = skipReason;
+        return;
+      }
+      lastRngSkipReason = null;
+      if (Math.random() >= RNG_YES_PROBABILITY) {
+        console.log('[rng] Roll: NO (25% chance)');
+        return;
+      }
+      console.log('[rng] Roll: YES (75% chance)');
+
+      rngOperationActive = true;
+      try {
+        const recentMessages = contextStore.getRecent(RNG_CONTEXT_MESSAGE_LIMIT);
+        console.log(`[rng] Context snapshot: ${recentMessages.length} messages`);
+        const hasUsableIncomingMessage = recentMessages.some(message =>
+          message.direction === 'INCOMING' && message.message.trim().length > 0
+        );
+        if (!hasUsableIncomingMessage) {
+          rngOperationActive = false;
+          console.log('[rng] Skipped: no usable incoming Messenger message');
+          console.log('[rng] No cooldown; normal polling resumes');
+          return;
+        }
+
+        const packet = buildRngPacket(recentMessages);
+        rngPacketInFlightId = packet.packetId;
+        console.log(
+          `[rng] Packet created: ${packet.packetId} ` +
+          `(${packet.contextMessages.length} context messages)`
+        );
+        if (!packetScheduler.submit(packet)) {
+          rngPacketInFlightId = null;
+          rngOperationActive = false;
+          console.log(`[rng] Scheduler rejected packet: ${packet.packetId}`);
+          return;
+        }
+        console.log('[rng] Submitted to scheduler');
+      } catch (error) {
+        rngPacketInFlightId = null;
+        rngOperationActive = false;
+        const details = error instanceof Error ? error.message : String(error);
+        console.error(`[rng] Could not submit an RNG packet: ${details}`);
+      }
+    };
+    rngPollTimer = setInterval(pollRng, RNG_POLL_INTERVAL_MS);
 
     console.log(DEBUG_ENGINE
       ? `[poller] Active; sampling every ${POLL_INTERVAL_MS} ms.`
@@ -585,84 +724,91 @@ async function main() {
         continue;
       }
 
-      const messages = await readLatestMessages();
-      if (stopRequested) {
-        break;
-      }
-
-      const newMessages = [];
-      for (const message of messages) {
-        if (message.messageId && !seenMessageIds.has(message.messageId)) {
-          seenMessageIds.add(message.messageId);
-          newMessages.push(message);
+      mainPollInProgress = true;
+      try {
+        const messages = await readLatestMessages();
+        if (stopRequested) {
+          break;
         }
-      }
 
-      const newMessagesWithMentions = newMessages.map(message => ({
-        ...message,
-        mention: containsMention(message.message, aliases),
-      }));
-      const mentionCount = newMessagesWithMentions.filter(message => message.mention).length;
-      console.log(
-        `Poll: ${newMessages.length} new messages checked; ${mentionCount} mention detected.`
-      );
-      for (const message of newMessagesWithMentions) {
-        console.log(
-          ` New message: id=${message.messageId}; mention=${message.mention}; ` +
-          `text=${JSON.stringify(message.message.replace(/\s+/g, ' ') || '(no text content)')}`
-        );
-      }
+        const newMessages = [];
+        for (const message of messages) {
+          if (message.messageId && !seenMessageIds.has(message.messageId)) {
+            seenMessageIds.add(message.messageId);
+            newMessages.push(message);
+          }
+        }
 
-      const newMessageIds = new Set(newMessagesWithMentions.map(message => message.messageId));
-      const recentContext = messages
-        .filter(message => message.messageId && !newMessageIds.has(message.messageId))
-        .map(message => ({
+        const newMessagesWithMentions = newMessages.map(message => ({
           ...message,
           mention: containsMention(message.message, aliases),
         }));
-      const hadPendingPacket = packetBuilderState.pendingPacket !== null;
-      const result = buildPacketTurn({
-        newMessages: newMessagesWithMentions,
-        recentContext,
-        state: packetBuilderState,
-      });
-      packetBuilderState = result.state;
-      appendContextMessages(
-        contextStore,
-        newMessages,
-        packetScheduler,
-        packetBuilderState,
-        result.packet !== null,
-      );
-
-      if (result.pendingPacket && !hadPendingPacket) {
-        printPacketBoundary('PACKET OPENED', result.pendingPacket.packetId);
-        console.log(`Packet opened this poll: ${result.pendingPacket.packetId}`);
-        logPacket('Initial packet contents', result.pendingPacket);
-      } else if (result.pendingPacket) {
+        const mentionCount = newMessagesWithMentions.filter(message => message.mention).length;
         console.log(
-          `Packet ${result.pendingPacket.packetId} is pending` +
-          ' (still pending).'
+          `Poll: ${newMessages.length} new messages checked; ${mentionCount} mention detected.`
         );
-      }
-      if (result.packet) {
-        printPacketBoundary('PACKET FINALIZED', result.packet.packetId);
-        console.log(`Closure reason: ${describePacketClosureReason(newMessagesWithMentions.length)}`);
-        logPacket('Final packet contents', result.packet);
-        if (packetScheduler.submit(result.packet)) {
-          printQueueSnapshot(packetScheduler);
+        for (const message of newMessagesWithMentions) {
+          console.log(
+            ` New message: id=${message.messageId}; mention=${message.mention}; ` +
+            `text=${JSON.stringify(message.message.replace(/\s+/g, ' ') || '(no text content)')}`
+          );
         }
-      }
 
-      if (newMessagesWithMentions.length > 0) {
-        consumeWakeSignal();
-        await resetIdleTimer();
-      } else if (idleDeadline <= Date.now() && !wakePending) {
-        await enterIdle();
+        const newMessageIds = new Set(newMessagesWithMentions.map(message => message.messageId));
+        const recentContext = messages
+          .filter(message => message.messageId && !newMessageIds.has(message.messageId))
+          .map(message => ({
+            ...message,
+            mention: containsMention(message.message, aliases),
+          }));
+        const hadPendingPacket = packetBuilderState.pendingPacket !== null;
+        const result = buildPacketTurn({
+          newMessages: newMessagesWithMentions,
+          recentContext,
+          state: packetBuilderState,
+        });
+        packetBuilderState = result.state;
+        appendContextMessages(
+          contextStore,
+          newMessages,
+          packetScheduler,
+          packetBuilderState,
+          result.packet !== null,
+        );
+
+        if (result.pendingPacket && !hadPendingPacket) {
+          printPacketBoundary('PACKET OPENED', result.pendingPacket.packetId);
+          console.log(`Packet opened this poll: ${result.pendingPacket.packetId}`);
+          logPacket('Initial packet contents', result.pendingPacket);
+        } else if (result.pendingPacket) {
+          console.log(
+            `Packet ${result.pendingPacket.packetId} is pending` +
+            ' (still pending).'
+          );
+        }
+        if (result.packet) {
+          printPacketBoundary('PACKET FINALIZED', result.packet.packetId);
+          console.log(`Closure reason: ${describePacketClosureReason(newMessagesWithMentions.length)}`);
+          logPacket('Final packet contents', result.packet);
+          if (packetScheduler.submit(result.packet)) {
+            printQueueSnapshot(packetScheduler);
+          }
+        }
+
+        if (newMessagesWithMentions.length > 0) {
+          consumeWakeSignal();
+          await resetIdleTimer();
+        } else if (idleDeadline <= Date.now() && !wakePending) {
+          await enterIdle();
+        }
+      } finally {
+        mainPollInProgress = false;
       }
     }
   } finally {
     process.removeListener('SIGINT', onInterrupt);
+    clearInterval(rngPollTimer);
+    clearTimeout(rngCooldownTimer);
     clearTimeout(idleTimer);
     if (packetScheduler) {
       await packetScheduler.waitForIdle();

@@ -3,7 +3,7 @@ const { test } = require('node:test');
 const {
   buildPacketTurn,
   createPacketBuilderState,
-} = require('../components/packet-builder');
+} = require('../components/mention-packet-builder');
 const { extractMessageDetails } = require('../components/message-extraction');
 
 function message(messageId, text, mention = false) {
