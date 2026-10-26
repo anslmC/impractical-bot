@@ -9,8 +9,8 @@ import { runCli, type CliRuntimeOptions } from '../src/cli.js';
 import { NvidiaApiKeyError } from '../src/ai/nvidia.js';
 import type { BrowserLaunchSession } from '../src/browser/launch.js';
 import { loadConfiguration, saveConfiguration, type Configuration } from '../src/config/configuration.js';
-import { generateAliases } from '../src/messages/alias-engine.js';
-import type { BackreadResult } from '../src/messages/backread.js';
+import { generateAliases } from '../src/components/alias-engine.js';
+import type { BackreadResult } from '../src/components/backread.js';
 
 async function captureCli(
   args: string[],

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { generateAliases } from '../src/messages/alias-engine.js';
+import { generateAliases } from '../src/components/alias-engine.js';
 
 test('preserves the raw Base candidate and puts it first in valids', () => {
   const aliases = generateAliases('PleaseGetout  daily Name');

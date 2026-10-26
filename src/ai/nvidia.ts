@@ -13,7 +13,7 @@ import { randomUUID } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import { config as loadDotenv, parse } from 'dotenv';
 import { resolveConfigurationPaths } from '../config/configuration.js';
-import type { BackreadMessage } from '../messages/backread.js';
+import type { BackreadMessage } from '../components/backread.js';
 
 const NVIDIA_CHAT_COMPLETIONS_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
 const NVIDIA_CHAT_COMPLETIONS_MODEL = 'nvidia/nemotron-3.5-lightning-30b-a3b';

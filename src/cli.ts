@@ -44,12 +44,12 @@ import {
 import {
   composeMessengerReply,
   type ReplyCompositionResult,
-} from './messages/composer.js';
-import { generateAliases } from './messages/alias-engine.js';
+} from './components/composer.js';
+import { generateAliases } from './components/alias-engine.js';
 import {
   readMessengerMessages,
   type BackreadResult,
-} from './messages/backread.js';
+} from './components/backread.js';
 
 type Output = (message: string) => void;
 

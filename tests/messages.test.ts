@@ -4,7 +4,7 @@ import type { Page } from 'playwright';
 import {
   classifyMessageLabel,
   readMessengerMessages,
-} from '../src/messages/backread.js';
+} from '../src/components/backread.js';
 
 interface TestMessage {
   messageId: string | null;
@@ -25,6 +25,7 @@ function createMessage(messageId: number): TestMessage {
 function createPage(batches: TestMessage[][], scrollHeight = 4_000) {
   let batchIndex = 0;
   const waitDurations: number[] = [];
+  const progressWaits: { timeout?: number; polling?: number }[] = [];
   const scrollPositions: number[] = [];
   const scrollElement = {
     clientHeight: 1_000,
@@ -45,7 +46,6 @@ function createPage(batches: TestMessage[][], scrollHeight = 4_000) {
     }),
     evaluateAll: async (callback: (elements: Element[]) => unknown) => {
       const batch = batches[Math.min(batchIndex, batches.length - 1)] ?? [];
-      batchIndex += 1;
       const elements = batch.map(message => ({
         getAttribute: (name: string) =>
           name === 'data-message-id' ? message.messageId :
@@ -73,9 +73,25 @@ function createPage(batches: TestMessage[][], scrollHeight = 4_000) {
     waitForTimeout: async (milliseconds: number) => {
       waitDurations.push(milliseconds);
     },
+    waitForFunction: async (
+      _callback: (argument: { selector: string; previousIds: string[] }) => boolean,
+      { previousIds }: { selector: string; previousIds: string[] },
+      options: { timeout?: number; polling?: number },
+    ) => {
+      progressWaits.push(options);
+      const nextBatchIndex = Math.min(batchIndex + 1, batches.length - 1);
+      const batch = batches[nextBatchIndex] ?? [];
+      if (!batch.some(message =>
+        message.messageId !== null && !previousIds.includes(message.messageId)
+      )) {
+        throw new Error('Timed out waiting for new messages.');
+      }
+      batchIndex = nextBatchIndex;
+      return { dispose: async () => undefined };
+    },
   } as unknown as Page;
 
-  return { page, waitDurations, scrollPositions };
+  return { page, waitDurations, progressWaits, scrollPositions };
 }
 
 test('classifies legacy and observed Messenger labels without inventing dates', () => {
@@ -161,7 +177,7 @@ test('classifies legacy and observed Messenger labels without inventing dates', 
   );
 });
 
-test('aggregates overlapping scroll batches oldest-to-newest and caps at 60', async () => {
+test('aggregates overlapping scroll batches oldest-to-newest and caps at 30', async () => {
   const latest = Array.from({ length: 20 }, (_, index) => createMessage(index + 60));
   const middle = Array.from({ length: 26 }, (_, index) => createMessage(index + 40));
   const oldest = Array.from({ length: 26 }, (_, index) => createMessage(index + 20));
@@ -169,21 +185,21 @@ test('aggregates overlapping scroll batches oldest-to-newest and caps at 60', as
 
   const result = await readMessengerMessages(page);
 
-  assert.equal(result.messages.length, 60);
+  assert.equal(result.messages.length, 30);
   assert.deepEqual(
     result.messages.map(message => message.id),
-    Array.from({ length: 60 }, (_, index) => `message-${index + 20}`),
+    Array.from({ length: 30 }, (_, index) => `message-${index + 50}`),
   );
-  assert.equal(new Set(result.messages.map(message => message.id)).size, 60);
-  assert.equal(result.messages[0].message, 'message 20');
+  assert.equal(new Set(result.messages.map(message => message.id)).size, 30);
+  assert.equal(result.messages[0].message, 'message 50');
   assert.deepEqual(result.messages[0].timestamp, {
     original: 'October 18, 2026, 1:15 PM',
     normalized: '2026-10-18T13:15:00',
     resolved: true,
   });
-  assert.equal(result.messages[0].ariaLabel, 'At October 18, 2026, 1:15 PM, Sender: message 20');
-  assert.deepEqual(scrollPositions, [4_000, 3_250, 3_250, 2_500]);
-  assert.deepEqual(waitDurations, [300, 400, 400]);
+  assert.equal(result.messages[0].ariaLabel, 'At October 18, 2026, 1:15 PM, Sender: message 50');
+  assert.deepEqual(scrollPositions, [4_000, 3_250, 3_000]);
+  assert.deepEqual(waitDurations, [300, 300]);
 });
 
 test('uses accessible sender/body boundaries without stripping genuine message prefixes', async () => {
@@ -238,7 +254,7 @@ test('uses accessible sender/body boundaries without stripping genuine message p
 
 test('continues scrolling without new IDs until the conversation top', async () => {
   const renderedMessages = [createMessage(1), createMessage(2)];
-  const { page, waitDurations, scrollPositions } = createPage([
+  const { page, waitDurations, progressWaits, scrollPositions } = createPage([
     renderedMessages,
     renderedMessages,
   ]);
@@ -247,7 +263,9 @@ test('continues scrolling without new IDs until the conversation top', async () 
 
   assert.equal(result.messages.length, 2);
   assert.equal(scrollPositions.at(-1), 3_000);
-  assert.deepEqual(waitDurations, [300, 400, 400, 400, 400, 400, 400, 300]);
+  assert.deepEqual(waitDurations, [300, 300]);
+  assert.equal(progressWaits.length, 8);
+  assert.ok(progressWaits.every(wait => wait.timeout === 1_500 && wait.polling === 100));
 });
 
 test('continues past eight upward scroll attempts when each finds a new ID', async () => {
@@ -255,13 +273,13 @@ test('continues past eight upward scroll attempts when each finds a new ID', asy
     [createMessage(8)],
     ...Array.from({ length: 8 }, (_, index) => [createMessage(7 - index)]),
   ];
-  const { page, waitDurations, scrollPositions } = createPage(batches, 16_000);
+  const { page, progressWaits, scrollPositions } = createPage(batches, 16_000);
 
   const result = await readMessengerMessages(page);
 
   assert.equal(result.messages.length, 9);
   assert.ok(scrollPositions.length > 9);
-  assert.ok(waitDurations.length > 9);
+  assert.ok(progressWaits.length > 8);
   assert.equal(scrollPositions.at(-1), 15_000);
   assert.deepEqual(
     result.messages.map(message => message.id),
@@ -269,14 +287,14 @@ test('continues past eight upward scroll attempts when each finds a new ID', asy
   );
 });
 
-test('keeps only the latest 60 rendered messages when already over target', async () => {
+test('keeps only the latest 30 rendered messages when already over target', async () => {
   const renderedMessages = Array.from({ length: 70 }, (_, index) => createMessage(index));
   const { page, scrollPositions } = createPage([renderedMessages]);
 
   const result = await readMessengerMessages(page);
 
-  assert.equal(result.messages.length, 60);
-  assert.equal(result.messages[0].id, 'message-10');
-  assert.equal(result.messages[59].id, 'message-69');
-  assert.deepEqual(scrollPositions, [4_000]);
+  assert.equal(result.messages.length, 30);
+  assert.equal(result.messages[0].id, 'message-40');
+  assert.equal(result.messages[29].id, 'message-69');
+  assert.deepEqual(scrollPositions, [4_000, 3_000]);
 });

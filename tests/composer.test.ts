@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { Page } from 'playwright';
-import { composeMessengerReply } from '../src/messages/composer.js';
+import { composeMessengerReply } from '../src/components/composer.js';
 
 interface ComposerMockOptions {
   textboxCount?: number;

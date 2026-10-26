@@ -11,7 +11,7 @@ The current `start` path is a proven one-shot pipeline: validate the NVIDIA API 
 - **CLI (`src/cli.ts`, `bin/`):** route commands and coordinate startup, operation, and shutdown.
 - **Configuration (`src/config/`):** load and validate local settings. Configuration, credentials, and runtime state belong outside the repository, under the user's local application-data directory.
 - **Browser (`src/browser/`):** discover Brave, Google Chrome, or Microsoft Edge, prepare a dedicated profile, launch the selected browser with remote debugging bound to loopback, and connect Playwright through CDP. Firefox is out of scope.
-- **Messages (`src/messages/`):** read rendered messages and provide stable identity, sender, direction, and freshness information to the engine.
+- **Messages (`src/components/`):** read rendered messages and provide stable identity, sender, direction, and freshness information to the engine.
 - **AI (`src/ai/`):** validate the NVIDIA API key and generate reply text from caller-provided context. It does not control browser actions, files, or secrets independently.
 - **Conversation engine (M2 target):** coordinate observation, batching, participation decisions, generation, pre-send checks, and lifecycle without owning browser discovery.
 
