@@ -98,7 +98,7 @@ test('NVIDIA validation sends a minimal non-streaming Bearer-authenticated reque
   assert.deepEqual(JSON.parse(String(requestedOptions?.body)), {
     model: 'nvidia/nemotron-3.5-lightning-30b-a3b',
     messages: [{ role: 'user', content: 'Reply with OK.' }],
-    chat_template_kwargs: { enable_thinking: true },
+    chat_template_kwargs: { enable_thinking: false },
     max_tokens: 4096,
     stream: false,
   });
@@ -162,10 +162,35 @@ test('reply generation sends known-direction messages in order and extracts trim
       { role: 'assistant', content: 'I think so.' },
       { role: 'user', content: 'Blair: Great, what time works?' },
     ],
-    chat_template_kwargs: { enable_thinking: true },
+    chat_template_kwargs: { enable_thinking: false },
     max_tokens: 4096,
     stream: false,
   });
+});
+
+test('reply generation uses a supplied system instruction before conversation messages', async () => {
+  let requestedOptions: RequestInit | undefined;
+
+  await generateNvidiaReply('nvapi-test-key', [{
+    id: 'incoming-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Alex',
+    direction: 'INCOMING',
+    message: 'Hello.',
+    ariaLabel: null,
+  }], {
+    systemInstruction: 'Supplied instruction.',
+    fetch: async (_input, init) => {
+      requestedOptions = init;
+      return successfulCompletion('Hi.');
+    },
+  });
+
+  const body = JSON.parse(String(requestedOptions?.body));
+  assert.deepEqual(body.messages, [
+    { role: 'system', content: 'Supplied instruction.' },
+    { role: 'user', content: 'Alex: Hello.' },
+  ]);
 });
 
 test('reply generation coalesces consecutive roles and ends with the incoming turn', async () => {

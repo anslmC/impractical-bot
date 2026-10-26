@@ -8,6 +8,7 @@ const {
 } = require('../../dist/src/ai/nvidia.js');
 const { generateAliases } = require('../../dist/src/messages/alias-engine.js');
 const { composeMessengerReply } = require('../components/composer');
+const { getDefaultPersonalityInstruction } = require('../components/personality');
 const {
   buildPacketTurn,
   createPacketBuilderState,
@@ -518,10 +519,15 @@ async function main() {
         'Open Facebook Messages in Brave and run this script again.'
       );
     }
+    const systemInstruction = getDefaultPersonalityInstruction();
     const processPacket = createPacketProcessor({
       page,
       apiKey,
-      generateReply: generateNvidiaReply,
+      generateReply: (requestApiKey, messages) => generateNvidiaReply(
+        requestApiKey,
+        messages,
+        { systemInstruction },
+      ),
       composeReply: composeMessengerReply,
       debugMode,
     });

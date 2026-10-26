@@ -18,6 +18,7 @@ import type { BackreadMessage } from '../messages/backread.js';
 const NVIDIA_CHAT_COMPLETIONS_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
 const NVIDIA_CHAT_COMPLETIONS_MODEL = 'nvidia/nemotron-3.5-lightning-30b-a3b';
 const DEFAULT_REQUEST_TIMEOUT_MS = 50_000;
+const DEFAULT_SYSTEM_INSTRUCTION = 'Write a short, natural Messenger reply that matches the conversation\'s tone and directly addresses the latest incoming message. Aim for roughly 3–12 words when appropriate, but do not force an exact word count; use more words when needed for a natural answer. Avoid unsolicited email copy, calls to action, headings, labels, and unrelated prefixes such as "Verse 3.1". Return only the reply text. This reply is a proposal until the application sends it.';
 
 export type NvidiaApiKeyErrorKind = 'authentication' | 'network' | 'service';
 
@@ -39,6 +40,7 @@ export class NvidiaRequestError extends Error {
 
 export interface NvidiaRequestOptions {
   fetch?: typeof fetch;
+  systemInstruction?: string;
   timeoutMs?: number;
 }
 
@@ -298,7 +300,7 @@ export async function generateNvidiaReply(
         messages: [
           {
             role: 'system',
-            content: 'Write a short, natural Messenger reply that matches the conversation\'s tone and directly addresses the latest incoming message. Aim for roughly 3–12 words when appropriate, but do not force an exact word count; use more words when needed for a natural answer. Avoid unsolicited email copy, calls to action, headings, labels, and unrelated prefixes such as "Verse 3.1". Return only the reply text. This reply is a proposal until the application sends it.',
+            content: options.systemInstruction ?? DEFAULT_SYSTEM_INSTRUCTION,
           },
           ...conversationMessages,
         ],
