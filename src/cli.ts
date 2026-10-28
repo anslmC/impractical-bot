@@ -389,8 +389,12 @@ async function updatePuppetName(
   }
 
   try {
+    const latest = readConfigurationForOwnedWrite(configurationFilePath);
+    if (latest.status !== 'valid') {
+      throw new Error(latest.reason);
+    }
     const savedConfiguration = saveConfiguration(
-      { ...configuration, puppetName },
+      { ...latest.configuration, puppetName },
       configurationFilePath,
     );
     configuration.puppetName = savedConfiguration.puppetName;
@@ -435,6 +439,50 @@ function loadLatestConfiguration(
     return undefined;
   }
   return result.configuration;
+}
+
+type OwnedWriteConfiguration =
+  | { status: 'valid'; configuration: Configuration }
+  | { status: 'invalid'; reason: string };
+
+// Runtime persistence handlers and the startup puppet-name write reload the file
+// immediately before saving so a value persisted after the engine snapshot is not
+// replaced by stale data. Only the fields owned by the operation are overlaid.
+function readConfigurationForOwnedWrite(
+  configurationFilePath: string | undefined,
+): OwnedWriteConfiguration {
+  let result;
+  try {
+    result = loadConfiguration(configurationFilePath);
+  } catch (error) {
+    return {
+      status: 'invalid',
+      reason: `Unable to load configuration: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+
+  if (result.status === 'missing') {
+    return {
+      status: 'invalid',
+      reason: 'Configuration has not been initialized. Run `impbot init` first.',
+    };
+  }
+  if (result.status === 'malformed') {
+    return { status: 'invalid', reason: `Configuration is malformed: ${result.message}` };
+  }
+  if (result.status === 'unsupported-version') {
+    return {
+      status: 'invalid',
+      reason: `Configuration schema version ${result.version} is not supported.`,
+    };
+  }
+  if (result.status === 'pin-required') {
+    return {
+      status: 'invalid',
+      reason: 'Messenger PIN configuration is required. Run `impbot init` to reconfigure it.',
+    };
+  }
+  return { status: 'valid', configuration: result.configuration };
 }
 
 function loadChangeBrowserConfiguration(
@@ -1027,9 +1075,13 @@ async function handleStart(
           return combustionController.changeDestination(destination, {
             resume: options.resume,
             persist: newDestination => {
+              const latest = readConfigurationForOwnedWrite(configurationFilePath);
+              if (latest.status !== 'valid') {
+                throw new Error(latest.reason);
+              }
               const savedConfiguration = saveConfiguration(
                 {
-                  ...configurationResult.configuration,
+                  ...latest.configuration,
                   messageDestination: newDestination,
                 },
                 configurationFilePath,
@@ -1048,10 +1100,17 @@ async function handleStart(
           }
 
           const previousTemperament = resolveBotTemperament(configurationResult.configuration);
+          const latestTemperament = readConfigurationForOwnedWrite(configurationFilePath);
+          if (latestTemperament.status !== 'valid') {
+            return {
+              status: 'failed',
+              reason: `The temperament could not be saved. ${latestTemperament.reason}`,
+            };
+          }
           try {
             const savedConfiguration = saveConfiguration(
               {
-                ...configurationResult.configuration,
+                ...latestTemperament.configuration,
                 botTemperament: temperament,
               },
               configurationFilePath,
@@ -1070,10 +1129,19 @@ async function handleStart(
           try {
             combustionController.setTemperament(temperament);
           } catch (error) {
+            const latestRollback = readConfigurationForOwnedWrite(configurationFilePath);
+            if (latestRollback.status !== 'valid') {
+              return {
+                status: 'failed',
+                reason:
+                  'The runtime temperament update failed and the persisted temperament ' +
+                  `could not be restored. ${latestRollback.reason}`,
+              };
+            }
             try {
               const restoredConfiguration = saveConfiguration(
                 {
-                  ...configurationResult.configuration,
+                  ...latestRollback.configuration,
                   botTemperament: previousTemperament,
                 },
                 configurationFilePath,
@@ -1111,10 +1179,17 @@ async function handleStart(
           const previousMode = resolveBotPersonalityMode(configurationResult.configuration);
           const previousInstruction =
             configurationResult.configuration.customPersonalityInstruction;
+          const latestPersonality = readConfigurationForOwnedWrite(configurationFilePath);
+          if (latestPersonality.status !== 'valid') {
+            return {
+              status: 'failed',
+              reason: `The personality could not be saved. ${latestPersonality.reason}`,
+            };
+          }
           try {
             const savedConfiguration = saveConfiguration(
               {
-                ...configurationResult.configuration,
+                ...latestPersonality.configuration,
                 botPersonality: mode,
                 ...(mode === 'custom'
                   ? { customPersonalityInstruction: instruction }
@@ -1142,10 +1217,19 @@ async function handleStart(
             );
             combustionController.setPersonality(resolvedInstruction);
           } catch (error) {
+            const latestRollback = readConfigurationForOwnedWrite(configurationFilePath);
+            if (latestRollback.status !== 'valid') {
+              return {
+                status: 'failed',
+                reason:
+                  'The runtime personality update failed and the persisted personality ' +
+                  `could not be restored. ${latestRollback.reason}`,
+              };
+            }
             try {
               const restoredConfiguration = saveConfiguration(
                 {
-                  ...configurationResult.configuration,
+                  ...latestRollback.configuration,
                   botPersonality: previousMode,
                   ...(previousMode === 'custom'
                     ? { customPersonalityInstruction: previousInstruction }

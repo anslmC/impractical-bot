@@ -22,8 +22,11 @@ import type { CombustionController } from '../src/components/combustion.js';
 import { createContextStore } from '../src/components/context-store.js';
 import {
   getRuntimeControlEndpoint,
+  requestRuntimeChangeDestination,
   requestRuntimePause,
   requestRuntimeResume,
+  requestRuntimeSetPersonality,
+  requestRuntimeSetTemperament,
   RuntimeControlEndpointError,
   RuntimeControlTimeoutError,
 } from '../src/runtime-control.js';
@@ -98,6 +101,43 @@ function createTestCombustionController(
     async stop() {
       onStop?.();
       resolveStopped();
+    },
+  };
+}
+
+async function startTestEngine(
+  configurationFilePath: string,
+  createController: () => CombustionController = () => createTestCombustionController(),
+) {
+  const ready = deferred<void>();
+  const shutdown = deferred<void>();
+  const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
+    launchBrowser: async () => ({
+      endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+      browserVersion: 'Brave Chromium test',
+      disconnected: new Promise<void>(() => undefined),
+      async prepare() {
+        return stubPage;
+      },
+      async disconnect() {
+        return undefined;
+      },
+    }),
+    readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+    startCombustion: async () => createController(),
+    waitForShutdown: () => shutdown.promise,
+  }, message => {
+    if (message.startsWith('Engine ready')) ready.resolve();
+  });
+
+  await ready.promise;
+  return {
+    async stop() {
+      const stopped = await captureCli(['stop'], configurationFilePath);
+      assert.equal(stopped.exitCode, 0);
+      shutdown.resolve();
+      return start;
     },
   };
 }
@@ -439,6 +479,49 @@ test('start preserves the saved puppet name and continues when profile retrieval
   if (savedConfiguration.status === 'valid') {
     assert.equal(savedConfiguration.configuration.puppetName, 'Existing Puppet');
   }
+});
+
+test('start preserves configuration persisted while the engine was starting', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const shutdown = deferred<void>();
+  const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
+    launchBrowser: async () => {
+      // Another process persists a change during the startup window.
+      saveConfiguration(
+        { ...validConfiguration, botTemperament: 'talkative' },
+        configurationFilePath,
+      );
+      return {
+        endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+        browserVersion: 'Brave Chromium test',
+        disconnected: new Promise<void>(() => undefined),
+        async prepare() {
+          return stubPage;
+        },
+        async disconnect() {
+          return undefined;
+        },
+      };
+    },
+    readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+    waitForShutdown: () => shutdown.promise,
+  }, message => {
+    if (message.startsWith('Engine ready')) ready.resolve();
+  });
+
+  await ready.promise;
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.botTemperament, 'talkative');
+    assert.equal(saved.configuration.puppetName, 'Test Puppet');
+  }
+  shutdown.resolve();
+  assert.equal((await start).exitCode, 130);
 });
 
 test('start debug mode skips NVIDIA validation and keeps backread read-only', async context => {
@@ -1562,6 +1645,58 @@ test('changebrowser reports a runtime-control failure without closing the browse
   }
 });
 
+test('runtime persistence refuses to recreate a configuration removed after the engine loaded', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const engine = await startTestEngine(configurationFilePath);
+  rmSync(configurationFilePath, { force: true });
+
+  const destinationResult = await requestRuntimeChangeDestination(
+    configurationFilePath,
+    'https://www.facebook.com/messages/t/987654321',
+  );
+  assert.equal(destinationResult.status, 'failed');
+  if (destinationResult.status === 'failed') {
+    assert.match(destinationResult.reason, /Configuration has not been initialized/);
+  }
+
+  const temperamentResult = await requestRuntimeSetTemperament(configurationFilePath, 'quiet');
+  assert.equal(temperamentResult.status, 'failed');
+  if (temperamentResult.status === 'failed') {
+    assert.match(temperamentResult.reason, /temperament could not be saved/);
+    assert.match(temperamentResult.reason, /Configuration has not been initialized/);
+  }
+
+  const personalityResult = await requestRuntimeSetPersonality(
+    configurationFilePath,
+    'default',
+    '',
+  );
+  assert.equal(personalityResult.status, 'failed');
+  if (personalityResult.status === 'failed') {
+    assert.match(personalityResult.reason, /personality could not be saved/);
+    assert.match(personalityResult.reason, /Configuration has not been initialized/);
+  }
+
+  // The stale engine snapshot must not recreate the removed configuration file.
+  assert.equal(existsSync(configurationFilePath), false);
+
+  writeFileSync(configurationFilePath, '{ malformed', 'utf8');
+  const malformedResult = await requestRuntimeChangeDestination(
+    configurationFilePath,
+    'https://www.facebook.com/messages/t/987654321',
+  );
+  assert.equal(malformedResult.status, 'failed');
+  if (malformedResult.status === 'failed') {
+    assert.match(malformedResult.reason, /Configuration is malformed/);
+  }
+  // A malformed file must not be replaced by the engine's stale snapshot either.
+  assert.equal(readFileSync(configurationFilePath, 'utf8'), '{ malformed');
+
+  assert.equal((await engine.stop()).exitCode, 0);
+});
+
 test('updatekey refuses while an engine is running without prompting or changing the stored key', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
@@ -1953,6 +2088,30 @@ test('changegcUrl updates a running engine through runtime control', async conte
   const stopped = await captureCli(['stop'], configurationFilePath);
   assert.equal(stopped.exitCode, 0);
   assert.equal((await start).exitCode, 0);
+});
+
+test('changegcUrl preserves unrelated configuration persisted after the engine loaded', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const engine = await startTestEngine(configurationFilePath);
+  // Another process changes an unrelated field after the engine snapshot was read.
+  saveConfiguration(
+    { ...validConfiguration, puppetName: 'Concurrent Puppet' },
+    configurationFilePath,
+  );
+
+  const destination = 'https://www.facebook.com/messages/t/987654321';
+  const change = await captureCli(['changegcUrl'], configurationFilePath, async () => destination);
+
+  assert.equal(change.exitCode, 0);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.messageDestination, destination);
+    assert.equal(saved.configuration.puppetName, 'Concurrent Puppet');
+  }
+  assert.equal((await engine.stop()).exitCode, 0);
 });
 
 test('changegcUrl rejection preserves a running engine destination and requires resume', async context => {
@@ -2734,6 +2893,59 @@ test('setbottemp rolls back persisted configuration when the runtime update fail
   assert.equal((await start).exitCode, 0);
 });
 
+test('setbottemp preserves unrelated configuration persisted after the engine loaded', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const engine = await startTestEngine(configurationFilePath);
+  saveConfiguration(
+    { ...validConfiguration, puppetName: 'Concurrent Puppet' },
+    configurationFilePath,
+  );
+
+  const change = await captureCli(['setbottemp'], configurationFilePath, async () => '3');
+
+  assert.equal(change.exitCode, 0);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.botTemperament, 'talkative');
+    assert.equal(saved.configuration.puppetName, 'Concurrent Puppet');
+  }
+  assert.equal((await engine.stop()).exitCode, 0);
+});
+
+test('setbottemp rollback preserves unrelated configuration persisted after the engine loaded', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const engine = await startTestEngine(configurationFilePath, () => createTestCombustionController(
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    () => {
+      throw new Error('runtime rejected the temperament update');
+    },
+  ));
+  saveConfiguration(
+    { ...validConfiguration, puppetName: 'Concurrent Puppet' },
+    configurationFilePath,
+  );
+
+  const change = await captureCli(['setbottemp'], configurationFilePath, async () => '3');
+
+  assert.equal(change.exitCode, 1);
+  assert.match(change.errors[0], /runtime temperament update failed/);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.botTemperament, 'balanced');
+    assert.equal(saved.configuration.puppetName, 'Concurrent Puppet');
+  }
+  assert.equal((await engine.stop()).exitCode, 0);
+});
+
 test('setbottemp reports persistence failure without applying the runtime update', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
@@ -3033,6 +3245,72 @@ test('setpersonality rolls back persisted configuration when the runtime update 
   const stopped = await captureCli(['stop'], configurationFilePath);
   assert.equal(stopped.exitCode, 0);
   assert.equal((await start).exitCode, 0);
+});
+
+test('setpersonality preserves unrelated configuration persisted after the engine loaded', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const engine = await startTestEngine(configurationFilePath);
+  saveConfiguration(
+    { ...validConfiguration, puppetName: 'Concurrent Puppet' },
+    configurationFilePath,
+  );
+  const answers = ['custom', 'Sarcastic.', '.'];
+
+  const change = await captureCli(
+    ['setpersonality'],
+    configurationFilePath,
+    async () => answers.shift() ?? null,
+  );
+
+  assert.equal(change.exitCode, 0);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.botPersonality, 'custom');
+    assert.equal(saved.configuration.customPersonalityInstruction, 'Sarcastic.');
+    assert.equal(saved.configuration.puppetName, 'Concurrent Puppet');
+  }
+  assert.equal((await engine.stop()).exitCode, 0);
+});
+
+test('setpersonality rollback preserves unrelated configuration persisted after the engine loaded', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const engine = await startTestEngine(configurationFilePath, () => createTestCombustionController(
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    () => {
+      throw new Error('runtime rejected the personality update');
+    },
+  ));
+  saveConfiguration(
+    { ...validConfiguration, puppetName: 'Concurrent Puppet' },
+    configurationFilePath,
+  );
+  const answers = ['custom', 'Unstable tone.', '.'];
+
+  const change = await captureCli(
+    ['setpersonality'],
+    configurationFilePath,
+    async () => answers.shift() ?? null,
+  );
+
+  assert.equal(change.exitCode, 1);
+  assert.match(change.errors[0], /runtime personality update failed/);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.botPersonality, 'default');
+    assert.equal(saved.configuration.customPersonalityInstruction, undefined);
+    assert.equal(saved.configuration.puppetName, 'Concurrent Puppet');
+  }
+  assert.equal((await engine.stop()).exitCode, 0);
 });
 
 test('setpersonality reports persistence failure without applying the runtime update', async context => {
