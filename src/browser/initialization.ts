@@ -3,13 +3,16 @@ import { randomInt } from 'node:crypto';
 import { win32 } from 'node:path';
 import {
   BOT_TEMPERAMENTS,
+  BOT_PERSONALITY_MODES,
   CONFIGURATION_VERSION,
   DEFAULT_BOT_TEMPERAMENT,
+  DEFAULT_BOT_PERSONALITY_MODE,
   getBotTemperamentYesProbability,
   loadConfiguration,
   resolveConfigurationPaths,
   saveConfiguration,
   type BotTemperament,
+  type BotPersonalityMode,
   type BrowserId,
   type Configuration,
   type ConfigurationWithoutPin,
@@ -129,6 +132,87 @@ export async function promptBotTemperament(
       return 'talkative';
     }
     writeError('Choose Quiet, Balanced, or Talkative. The bot temperament was not changed.');
+  }
+}
+
+export type PersonalitySelection =
+  | { mode: 'default' }
+  | { mode: 'custom'; instruction: string };
+
+export async function promptMultilinePersonality(
+  prompt: TerminalPrompt,
+  writeOutput: (message: string) => void,
+  writeError: (message: string) => void,
+): Promise<string | null> {
+  writeOutput(
+    'Enter your custom personality instructions. Finish by entering a line that contains only a period (.) and pressing Enter.',
+  );
+  const lines: string[] = [];
+  while (true) {
+    const answer = await prompt(lines.length === 0 ? '> ' : '  ... ');
+    if (answer === null) {
+      return null;
+    }
+    if (answer.trim() === '.') {
+      break;
+    }
+    lines.push(answer);
+  }
+  const instruction = lines.join('\n').trim();
+  if (instruction.length === 0) {
+    writeError('Custom personality instructions must not be empty.');
+    return null;
+  }
+  return instruction;
+}
+
+export async function promptBotPersonality(
+  prompt: TerminalPrompt,
+  writeOutput: (message: string) => void,
+  writeError: (message: string) => void,
+  currentMode: BotPersonalityMode = DEFAULT_BOT_PERSONALITY_MODE,
+  currentInstruction?: string,
+): Promise<PersonalitySelection | null> {
+  const labels: Record<BotPersonalityMode, string> = {
+    default: 'Default',
+    custom: 'Custom',
+  };
+  writeOutput('Bot personality:');
+  for (const mode of BOT_PERSONALITY_MODES) {
+    writeOutput(
+      `  ${mode === currentMode ? '*' : ' '} ${labels[mode]}: ` +
+        (mode === 'default'
+          ? 'Existing personality behavior'
+          : 'Your own custom instruction block'),
+    );
+  }
+
+  while (true) {
+    const answer = await prompt(
+      `Select personality [default, custom] (default: ${labels[currentMode]}): `,
+    );
+    if (answer === null) {
+      return null;
+    }
+
+    const normalized = answer.trim().toLowerCase();
+    if (normalized === '') {
+      if (currentMode === 'custom' && currentInstruction !== undefined) {
+        return { mode: 'custom', instruction: currentInstruction };
+      }
+      return { mode: 'default' };
+    }
+    if (normalized === 'default') {
+      return { mode: 'default' };
+    }
+    if (normalized === 'custom') {
+      const instruction = await promptMultilinePersonality(prompt, writeOutput, writeError);
+      if (instruction === null) {
+        return null;
+      }
+      return { mode: 'custom', instruction };
+    }
+    writeError('Choose Default or Custom. The personality was not changed.');
   }
 }
 
@@ -267,6 +351,8 @@ function configurationForSelection(
   pinSettings: PinRestorationSettings,
   botTemperament: BotTemperament,
   existingConfiguration?: ConfigurationWithoutPin,
+  botPersonality?: BotPersonalityMode,
+  customPersonalityInstruction?: string,
 ): Configuration {
   const profilePath = getBrowserProfilePath(candidate.browser, configurationFilePath);
   const browser: BrowserId = candidate.browser;
@@ -281,6 +367,10 @@ function configurationForSelection(
     startupUrl: existingConfiguration?.startupUrl ?? 'https://www.facebook.com',
     messageDestination,
     botTemperament,
+    ...(botPersonality === undefined ? {} : { botPersonality }),
+    ...(customPersonalityInstruction === undefined
+      ? {}
+      : { customPersonalityInstruction }),
   };
 }
 
@@ -506,6 +596,24 @@ export async function initializeConfiguration(
     botTemperament = selectedTemperament;
   }
 
+  let botPersonality = existingConfiguration?.botPersonality ?? DEFAULT_BOT_PERSONALITY_MODE;
+  let customPersonalityInstruction = existingConfiguration?.customPersonalityInstruction;
+  if (existingConfiguration === undefined) {
+    const selection = await promptBotPersonality(
+      options.prompt,
+      writeOutput,
+      writeError,
+      DEFAULT_BOT_PERSONALITY_MODE,
+    );
+    if (selection === null) {
+      writeOutput('Initialization cancelled. No configuration was written.');
+      return 'cancelled';
+    }
+    botPersonality = selection.mode;
+    customPersonalityInstruction =
+      selection.mode === 'custom' ? selection.instruction : undefined;
+  }
+
   const configuration = configurationForSelection(
     selection.candidate,
     configurationFilePath,
@@ -513,6 +621,8 @@ export async function initializeConfiguration(
     pinSettings,
     botTemperament,
     existingConfiguration,
+    botPersonality,
+    customPersonalityInstruction,
   );
   try {
     saveConfiguration(configuration, configurationFilePath);

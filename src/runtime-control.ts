@@ -1,11 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { win32 } from 'node:path';
-import { resolveConfigurationPaths, isBotTemperament, type BotTemperament } from './config/configuration.js';
+import { resolveConfigurationPaths, isBotTemperament, isBotPersonalityMode, type BotTemperament, type BotPersonalityMode } from './config/configuration.js';
 
 const PROTOCOL = 'IMPBOT_RUNTIME/1';
 const HANDSHAKE_TIMEOUT_MS = 5_000;
-const MAX_LINE_LENGTH = 4_096;
+const MAX_LINE_LENGTH = 65_536;
 
 export class RuntimeAlreadyRunningError extends Error {
   constructor() {
@@ -53,6 +53,15 @@ export type RuntimeSetTemperamentResult =
   | { status: 'failed'; instanceId: string; reason: string }
   | { status: 'not-running' };
 
+export type RuntimePersonalityChangeResult =
+  | { status: 'changed' }
+  | { status: 'failed'; reason: string };
+
+export type RuntimeSetPersonalityResult =
+  | { status: 'changed'; instanceId: string; mode: BotPersonalityMode; instruction: string }
+  | { status: 'failed'; instanceId: string; reason: string }
+  | { status: 'not-running' };
+
 type RuntimeState = 'starting' | 'running' | 'paused' | 'changing' | 'stopping';
 
 export interface RuntimeDestinationChangeOptions {
@@ -70,6 +79,10 @@ export interface RuntimeControlHandlers {
   requestSetTemperament?: (
     temperament: BotTemperament,
   ) => RuntimeTemperamentChangeResult | Promise<RuntimeTemperamentChangeResult>;
+  requestSetPersonality?: (
+    mode: BotPersonalityMode,
+    instruction: string,
+  ) => RuntimePersonalityChangeResult | Promise<RuntimePersonalityChangeResult>;
 }
 
 function encodeProtocolText(value: string): string {
@@ -273,6 +286,56 @@ export async function createRuntimeControl(
       state = 'changing';
       try {
         const result = await runtimeHandlers.requestSetTemperament(temperament);
+        if (isStopping()) {
+          return `ERROR ${instanceId} ABORTED\n`;
+        }
+        state = previousState;
+        if (result.status === 'changed') {
+          return `CHANGED ${instanceId}\n`;
+        }
+        return `FAILED ${instanceId} ${encodeProtocolText(result.reason)}\n`;
+      } catch (error) {
+        if (!isStopping()) {
+          state = previousState;
+        }
+        return `FAILED ${instanceId} ${encodeProtocolText(
+          error instanceof Error ? error.message : String(error),
+        )}\n`;
+      }
+    }
+
+    const personalityPrefix = `PERSONALITY ${instanceId} `;
+    if (command.startsWith(personalityPrefix)) {
+      if (state === 'stopping') {
+        return `ERROR ${instanceId} INVALID_STATE\n`;
+      }
+      if (state === 'changing') {
+        return `ERROR ${instanceId} BUSY\n`;
+      }
+      if (!runtimeHandlers.requestSetPersonality) {
+        return `ERROR ${instanceId} UNSUPPORTED\n`;
+      }
+      if (state !== 'running' && state !== 'paused') {
+        return `ERROR ${instanceId} INVALID_STATE\n`;
+      }
+
+      const rest = command.slice(personalityPrefix.length);
+      const space = rest.indexOf(' ');
+      if (space < 0) {
+        return `ERROR ${instanceId} INVALID_REQUEST\n`;
+      }
+      const mode = decodeProtocolText(rest.slice(0, space));
+      const instruction = decodeProtocolText(rest.slice(space + 1));
+      if (!isBotPersonalityMode(mode)) {
+        return `ERROR ${instanceId} INVALID_REQUEST\n`;
+      }
+      if (mode === 'custom' && (!instruction || instruction.trim().length === 0)) {
+        return `ERROR ${instanceId} INVALID_REQUEST\n`;
+      }
+      const previousState = state;
+      state = 'changing';
+      try {
+        const result = await runtimeHandlers.requestSetPersonality(mode, instruction);
         if (isStopping()) {
           return `ERROR ${instanceId} ABORTED\n`;
         }
@@ -619,6 +682,68 @@ export async function requestRuntimeSetTemperament(
     }
     throw new RuntimeControlEndpointError(
       'The engine returned an invalid temperament change response.',
+    );
+  } catch (error) {
+    if (isPipeMissing(error)) {
+      return { status: 'not-running' };
+    }
+    throw error;
+  } finally {
+    socket.destroy();
+  }
+}
+
+export async function requestRuntimeSetPersonality(
+  configurationFilePath: string | undefined,
+  mode: BotPersonalityMode,
+  instruction: string,
+): Promise<RuntimeSetPersonalityResult> {
+  if (process.platform !== 'win32') {
+    throw new RuntimeControlEndpointError('Runtime control is only supported on Windows.');
+  }
+
+  const endpoint = getRuntimeControlEndpoint(configurationFilePath);
+  const socket = createConnection(endpoint);
+  try {
+    let instanceId: string;
+    try {
+      const greeting = await readLine(socket);
+      const match = greeting.match(new RegExp(`^${PROTOCOL} ([0-9a-f-]{36})$`, 'i'));
+      if (!match) {
+        throw new RuntimeControlEndpointError(
+          'The runtime-control endpoint is not owned by an impractical-bot engine; ' +
+          'no personality change request was sent.',
+        );
+      }
+      instanceId = match[1];
+    } catch (error) {
+      if (isPipeMissing(error)) {
+        return { status: 'not-running' };
+      }
+      throw error;
+    }
+
+    socket.setTimeout(0);
+    socket.write(`PERSONALITY ${instanceId} ${encodeProtocolText(mode)} ${encodeProtocolText(instruction)}\n`);
+    const response = await readLine(socket, 0);
+    if (response === `CHANGED ${instanceId}`) {
+      return { status: 'changed', instanceId, mode, instruction };
+    }
+    if (response.startsWith(`FAILED ${instanceId} `)) {
+      return {
+        status: 'failed',
+        instanceId,
+        reason: decodeProtocolText(response.slice(`FAILED ${instanceId} `.length)),
+      };
+    }
+    if (response.startsWith(`ERROR ${instanceId} `)) {
+      const reason = response.slice(`ERROR ${instanceId} `.length);
+      throw new RuntimeControlEndpointError(
+        `The engine rejected the personality change request (${reason}).`,
+      );
+    }
+    throw new RuntimeControlEndpointError(
+      'The engine returned an invalid personality change response.',
     );
   } catch (error) {
     if (isPipeMissing(error)) {

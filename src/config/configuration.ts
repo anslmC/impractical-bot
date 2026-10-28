@@ -17,8 +17,17 @@ export const BROWSER_IDS = ['brave', 'chrome', 'edge'] as const;
 export const BOT_TEMPERAMENTS = ['quiet', 'balanced', 'talkative'] as const;
 export const DEFAULT_BOT_TEMPERAMENT = 'balanced' as const;
 
+export const BOT_PERSONALITY_MODES = ['default', 'custom'] as const;
+export const DEFAULT_BOT_PERSONALITY_MODE = 'default' as const;
+
+// Bounded so a custom instruction can always be transported over the runtime
+// control protocol (see MAX_LINE_LENGTH in runtime-control.ts) without
+// truncation or fragmentation.
+export const MAX_PERSONALITY_INSTRUCTION_CHARS = 4000;
+
 export type BrowserId = typeof BROWSER_IDS[number];
 export type BotTemperament = typeof BOT_TEMPERAMENTS[number];
+export type BotPersonalityMode = typeof BOT_PERSONALITY_MODES[number];
 
 export const BOT_TEMPERAMENT_YES_PROBABILITIES: Readonly<Record<BotTemperament, number>> = {
   quiet: 0.1,
@@ -38,6 +47,8 @@ export interface Configuration {
   messageDestination?: string;
   puppetName?: string;
   botTemperament?: BotTemperament;
+  botPersonality?: BotPersonalityMode;
+  customPersonalityInstruction?: string;
 }
 
 export function isBotTemperament(value: unknown): value is BotTemperament {
@@ -52,6 +63,16 @@ export function resolveBotTemperament(
 
 export function getBotTemperamentYesProbability(temperament: BotTemperament): number {
   return BOT_TEMPERAMENT_YES_PROBABILITIES[temperament];
+}
+
+export function isBotPersonalityMode(value: unknown): value is BotPersonalityMode {
+  return typeof value === 'string' && (BOT_PERSONALITY_MODES as readonly string[]).includes(value);
+}
+
+export function resolveBotPersonalityMode(
+  configuration: Pick<Configuration, 'botPersonality'>,
+): BotPersonalityMode {
+  return configuration.botPersonality ?? DEFAULT_BOT_PERSONALITY_MODE;
 }
 
 export type ConfigurationWithoutPin = Omit<Configuration, 'pin'>;
@@ -88,6 +109,8 @@ const CONFIGURATION_KEYS = new Set([
   'messageDestination',
   'puppetName',
   'botTemperament',
+  'botPersonality',
+  'customPersonalityInstruction',
 ]);
 const BROWSER_EXECUTABLE_NAMES: Record<BrowserId, string> = {
   brave: 'brave.exe',
@@ -214,6 +237,34 @@ function validateConfigurationFields(value: unknown): ConfigurationWithoutPin {
   if (value.botTemperament !== undefined && !isBotTemperament(value.botTemperament)) {
     throw new Error("botTemperament must be one of 'quiet', 'balanced', or 'talkative'.");
   }
+  if (value.botPersonality !== undefined && !isBotPersonalityMode(value.botPersonality)) {
+    throw new Error("botPersonality must be one of 'default' or 'custom'.");
+  }
+  if (value.customPersonalityInstruction !== undefined) {
+    if (typeof value.customPersonalityInstruction !== 'string') {
+      throw new Error('customPersonalityInstruction must be a string.');
+    }
+    if (value.customPersonalityInstruction.length === 0) {
+      throw new Error('customPersonalityInstruction must not be empty.');
+    }
+    if (/[\u0000-\u0008\u000b-\u000d\u000e-\u001f\u007f]/.test(value.customPersonalityInstruction)) {
+      throw new Error(
+        'customPersonalityInstruction must not contain control characters other than newlines and tabs.',
+      );
+    }
+    if (value.customPersonalityInstruction.length > MAX_PERSONALITY_INSTRUCTION_CHARS) {
+      throw new Error(
+        `customPersonalityInstruction must not exceed ${MAX_PERSONALITY_INSTRUCTION_CHARS} characters.`,
+      );
+    }
+  }
+  if (
+    value.botPersonality === 'custom' &&
+    (!value.customPersonalityInstruction ||
+      value.customPersonalityInstruction.trim().length === 0)
+  ) {
+    throw new Error('customPersonalityInstruction is required when botPersonality is custom.');
+  }
 
   return {
     version: CONFIGURATION_VERSION,
@@ -230,6 +281,12 @@ function validateConfigurationFields(value: unknown): ConfigurationWithoutPin {
     botTemperament: isBotTemperament(value.botTemperament)
       ? value.botTemperament
       : DEFAULT_BOT_TEMPERAMENT,
+    botPersonality: isBotPersonalityMode(value.botPersonality)
+      ? value.botPersonality
+      : DEFAULT_BOT_PERSONALITY_MODE,
+    ...(value.customPersonalityInstruction === undefined
+      ? {}
+      : { customPersonalityInstruction: value.customPersonalityInstruction }),
   };
 }
 

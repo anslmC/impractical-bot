@@ -12,6 +12,7 @@ import type { Configuration } from '../config/configuration.js';
 import {
   getBotTemperamentYesProbability,
   resolveBotTemperament,
+  resolveBotPersonalityMode,
   type BotTemperament,
 } from '../config/configuration.js';
 import type { ContextMessage, ContextStore } from './context-store.js';
@@ -29,7 +30,7 @@ import {
 import { createPacketProcessor } from './packet-processor.js';
 import { createPacketScheduler } from './packet-scheduler.js';
 import { createPauseGate } from './pause-gate.js';
-import { getDefaultPersonalityInstruction } from './personality.js';
+import { getPersonalityInstruction } from './personality.js';
 import { buildRngPacket, type RngPacket } from './rng-packet-builder.js';
 
 const MESSAGE_SELECTOR =
@@ -86,6 +87,7 @@ export interface CombustionController {
   pause(): Promise<void>;
   resume(): Promise<void>;
   setTemperament(temperament: BotTemperament): void;
+  setPersonality(instruction: string): void;
   changeDestination(
     destination: string,
     options: DestinationChangeOptions,
@@ -923,7 +925,10 @@ export async function startCombustion({
 
   try {
     console.log(`[engine] Starting Combustion for ${configuration.messageDestination}.`);
-    const systemInstruction = getDefaultPersonalityInstruction();
+    let systemInstruction = getPersonalityInstruction(
+      resolveBotPersonalityMode(configuration),
+      configuration.customPersonalityInstruction,
+    );
     const processPacket = createPacketProcessor<
       PacketBuilderMessage,
       string,
@@ -1120,6 +1125,9 @@ export async function startCombustion({
       resume: resumeEngine,
       setTemperament(temperament) {
         botTemperament = temperament;
+      },
+      setPersonality(instruction) {
+        systemInstruction = instruction;
       },
       changeDestination,
       async stop() {

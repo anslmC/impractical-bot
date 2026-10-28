@@ -8,8 +8,14 @@ import type { InitializationOptions, InitializationStatus, TerminalPrompt } from
 import { runCli, type CliRuntimeOptions } from '../src/cli.js';
 import { NvidiaApiKeyError } from '../src/ai/nvidia.js';
 import type { BrowserLaunchSession } from '../src/browser/launch.js';
-import { loadConfiguration, saveConfiguration, type Configuration } from '../src/config/configuration.js';
+import {
+  MAX_PERSONALITY_INSTRUCTION_CHARS,
+  loadConfiguration,
+  saveConfiguration,
+  type Configuration,
+} from '../src/config/configuration.js';
 import { generateAliases } from '../src/components/alias-engine.js';
+import { getDefaultBehavioralInstruction, getDefaultPersonalityInstruction } from '../src/components/personality.js';
 import type { BackreadResult } from '../src/components/backread.js';
 import type { CombustionController } from '../src/components/combustion.js';
 import { createContextStore } from '../src/components/context-store.js';
@@ -55,6 +61,7 @@ function createTestCombustionController(
   onResume?: () => void,
   onChangeDestination?: CombustionController['changeDestination'],
   onSetTemperament?: CombustionController['setTemperament'],
+  onSetPersonality?: CombustionController['setPersonality'],
 ): CombustionController {
   let resolveStopped!: () => void;
   const stopped = new Promise<void>(resolve => {
@@ -70,6 +77,9 @@ function createTestCombustionController(
     },
     setTemperament(temperament) {
       onSetTemperament?.(temperament);
+    },
+    setPersonality(instruction) {
+      onSetPersonality?.(instruction);
     },
     async changeDestination(destination, options) {
       if (onChangeDestination) {
@@ -111,6 +121,7 @@ const validConfiguration: Configuration = {
   startupUrl: 'https://www.facebook.com',
   messageDestination: 'https://www.facebook.com/messages/t/1618007223454558',
   botTemperament: 'balanced',
+  botPersonality: 'default',
 };
 const profileButton = {
   count: async () => 1,
@@ -1550,6 +1561,9 @@ test('stop waits for Combustion cleanup before disconnecting Playwright and clos
       setTemperament() {
         return undefined;
       },
+      setPersonality() {
+        return undefined;
+      },
       async changeDestination(destination, options) {
         await options.persist?.(destination);
         return { status: 'changed', resumed: options.resume };
@@ -2046,6 +2060,328 @@ test('setbottemp reports persistence failure without applying the runtime update
   assert.equal((await start).exitCode, 0);
 });
 
+test('setpersonality while stopped persists a custom block without launching a browser or engine', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  let launchAttempted = false;
+  let runtimeCalled = false;
+  const answers = ['custom', 'Sarcastic and deadpan.', 'Never cheerful.', '.'];
+
+  const result = await captureCli(
+    ['setpersonality'],
+    configurationFilePath,
+    async () => answers.shift() ?? null,
+    undefined,
+    {
+      requestRuntimeSetPersonality: async (path, mode, instruction) => {
+        runtimeCalled = true;
+        assert.equal(path, configurationFilePath);
+        assert.equal(mode, 'custom');
+        assert.equal(instruction, 'Sarcastic and deadpan.\nNever cheerful.');
+        return { status: 'not-running' };
+      },
+      launchBrowser: async () => {
+        launchAttempted = true;
+        throw new Error('must not launch');
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(runtimeCalled, true);
+  assert.equal(launchAttempted, false);
+  assert.match(result.output.at(-1) ?? '', /Personality saved: custom/);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.botPersonality, 'custom');
+    assert.equal(
+      saved.configuration.customPersonalityInstruction,
+      'Sarcastic and deadpan.\nNever cheerful.',
+    );
+  }
+});
+
+test('setpersonality rejects an oversized custom block before persistence', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  const answers = [
+    'custom',
+    'x'.repeat(MAX_PERSONALITY_INSTRUCTION_CHARS + 1),
+    '.',
+  ];
+
+  const result = await captureCli(
+    ['setpersonality'],
+    configurationFilePath,
+    async () => answers.shift() ?? null,
+    undefined,
+    {
+      requestRuntimeSetPersonality: async () => ({ status: 'not-running' }),
+    },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.errors[0], /must not exceed \d+ characters/);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.botPersonality, 'default');
+    assert.equal(saved.configuration.customPersonalityInstruction, undefined);
+  }
+});
+
+test('setpersonality switching back to Default clears the stored custom instruction', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(
+    {
+      ...validConfiguration,
+      botPersonality: 'custom',
+      customPersonalityInstruction: 'Sarcastic and deadpan.',
+    },
+    configurationFilePath,
+  );
+
+  const result = await captureCli(
+    ['setpersonality'],
+    configurationFilePath,
+    async () => 'default',
+    undefined,
+    {
+      requestRuntimeSetPersonality: async () => ({ status: 'not-running' }),
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.botPersonality, 'default');
+    assert.equal(saved.configuration.customPersonalityInstruction, undefined);
+  }
+});
+
+test('setpersonality cancellation leaves the persisted configuration unchanged', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  let runtimeCalls = 0;
+
+  const result = await captureCli(
+    ['setpersonality'],
+    configurationFilePath,
+    async () => null,
+    undefined,
+    {
+      requestRuntimeSetPersonality: async () => {
+        runtimeCalls += 1;
+        return { status: 'not-running' };
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(runtimeCalls, 0);
+  assert.match(result.output.at(-1) ?? '', /cancelled/);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.botPersonality, 'default');
+  }
+});
+
+test('setpersonality updates a running engine and persists without restarting it', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const receivedInstructions: string[] = [];
+  let launchCalls = 0;
+  const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
+    launchBrowser: async () => {
+      launchCalls += 1;
+      return {
+        endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+        browserVersion: 'Brave Chromium test',
+        disconnected: new Promise<void>(() => undefined),
+        async prepare() {
+          return stubPage;
+        },
+        async disconnect() {
+          return undefined;
+        },
+      };
+    },
+    readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+    startCombustion: async () => createTestCombustionController(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      instruction => {
+        receivedInstructions.push(instruction);
+      },
+    ),
+  }, message => {
+    if (message.startsWith('Engine ready')) ready.resolve();
+  });
+
+  await ready.promise;
+  const answers = ['custom', 'Cold and impersonal.', '.'];
+  const change = await captureCli(
+    ['setpersonality'],
+    configurationFilePath,
+    async () => answers.shift() ?? null,
+  );
+  assert.equal(change.exitCode, 0);
+  assert.match(change.output.at(-1) ?? '', /Personality changed: custom/);
+  assert.equal(launchCalls, 1);
+  assert.deepEqual(receivedInstructions, [
+    `Cold and impersonal.\n\n${getDefaultBehavioralInstruction()}`,
+  ]);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.botPersonality, 'custom');
+    assert.equal(saved.configuration.customPersonalityInstruction, 'Cold and impersonal.');
+  }
+
+  const revert = await captureCli(['setpersonality'], configurationFilePath, async () => 'default');
+  assert.equal(revert.exitCode, 0);
+  assert.equal(receivedInstructions[1], getDefaultPersonalityInstruction());
+
+  const stopped = await captureCli(['stop'], configurationFilePath);
+  assert.equal(stopped.exitCode, 0);
+  assert.equal((await start).exitCode, 0);
+});
+
+test('setpersonality rolls back persisted configuration when the runtime update fails', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
+    launchBrowser: async () => ({
+      endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+      browserVersion: 'Brave Chromium test',
+      disconnected: new Promise<void>(() => undefined),
+      async prepare() {
+        return stubPage;
+      },
+      async disconnect() {
+        return undefined;
+      },
+    }),
+    readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+    startCombustion: async () => createTestCombustionController(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      () => {
+        throw new Error('runtime rejected the personality update');
+      },
+    ),
+  }, message => {
+    if (message.startsWith('Engine ready')) ready.resolve();
+  });
+
+  await ready.promise;
+  const answers = ['custom', 'Unstable tone.', '.'];
+  const change = await captureCli(
+    ['setpersonality'],
+    configurationFilePath,
+    async () => answers.shift() ?? null,
+  );
+  assert.equal(change.exitCode, 1);
+  assert.match(change.errors[0], /runtime personality update failed/);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.botPersonality, 'default');
+    assert.equal(saved.configuration.customPersonalityInstruction, undefined);
+  }
+
+  const stopped = await captureCli(['stop'], configurationFilePath);
+  assert.equal(stopped.exitCode, 0);
+  assert.equal((await start).exitCode, 0);
+});
+
+test('setpersonality reports persistence failure without applying the runtime update', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const receivedInstructions: string[] = [];
+  const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
+    launchBrowser: async () => ({
+      endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+      browserVersion: 'Brave Chromium test',
+      disconnected: new Promise<void>(() => undefined),
+      async prepare() {
+        return stubPage;
+      },
+      async disconnect() {
+        return undefined;
+      },
+    }),
+    readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+    startCombustion: async () => createTestCombustionController(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      instruction => {
+        receivedInstructions.push(instruction);
+      },
+    ),
+  }, message => {
+    if (message.startsWith('Engine ready')) ready.resolve();
+  });
+
+  await ready.promise;
+  const change = await captureCli(
+    ['setpersonality'],
+    configurationFilePath,
+    async () => {
+      writeFileSync(configurationFilePath, '{ malformed');
+      return 'default';
+    },
+  );
+  assert.equal(change.exitCode, 1);
+  assert.match(change.errors[0], /personality could not be saved/);
+  assert.deepEqual(receivedInstructions, []);
+
+  const stopped = await captureCli(['stop'], configurationFilePath);
+  assert.equal(stopped.exitCode, 0);
+  assert.equal((await start).exitCode, 0);
+});
+
+test('config reports only the setpersonality mode and never the custom instruction text', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(
+    {
+      ...validConfiguration,
+      botPersonality: 'custom',
+      customPersonalityInstruction: 'Top secret tone directive.',
+    },
+    filePath,
+  );
+
+  const result = await captureCli(['config'], filePath);
+
+  assert.equal(result.exitCode, 0);
+  assert.match(result.output[0], /setpersonality: custom/);
+  assert.doesNotMatch(result.output[0], /Top secret tone directive/);
+  assert.doesNotMatch(result.output.join('\n'), /Top secret tone directive/);
+  assert.deepEqual(result.errors, []);
+});
+
 test('config reports when configuration is missing', async context => {
   const result = await captureCli(['config'], createTemporaryConfigPath(context));
 
@@ -2099,6 +2435,7 @@ test('help options and no command display usage', async () => {
     assert.match(result.output[0], /changebrowser\s+Change the configured browser/);
     assert.match(result.output[0], /changegcUrl\s+Change the message destination/);
     assert.match(result.output[0], /setbottemp\s+Set the bot temperament/);
+    assert.match(result.output[0], /setpersonality\s+Set the bot personality/);
     assert.doesNotMatch(result.output[0], /changemsgdestination/);
     assert.doesNotMatch(result.output[0], /changemessagedestination/);
     assert.match(result.output[0], /updatekey\s+Replace the NVIDIA API key/);

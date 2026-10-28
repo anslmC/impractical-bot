@@ -6,7 +6,7 @@ import { extractMessageDetails } from '../src/components/message-extraction.js';
 import { createPacketProcessor } from '../src/components/packet-processor.js';
 import { createPacketScheduler } from '../src/components/packet-scheduler.js';
 import { createPauseGate } from '../src/components/pause-gate.js';
-import { getDefaultPersonalityInstruction } from '../src/components/personality.js';
+import { getDefaultPersonalityInstruction, getDefaultBehavioralInstruction, getPersonalityInstruction } from '../src/components/personality.js';
 import { buildRngPacket } from '../src/components/rng-packet-builder.js';
 
 test('context store keeps observation order and returns cloned messages', () => {
@@ -527,6 +527,35 @@ test('default personality keeps the active reply instruction', () => {
     getDefaultPersonalityInstruction(),
     'Write a short, natural Messenger reply that matches the conversation\'s tone and directly addresses the latest incoming message. Adapt to the group\'s languages, slang, expressions, and conversational style. Match its tone and social context: keep your playful, warm, spontaneous style, using emojis selectively when they add genuine nuance, humor, or emphasis and fit the group\'s tone and moment; let many replies rely on words alone, avoid stacked or chained emojis, vary their use naturally rather than following a fixed frequency or quota, and do not compensate with repeated interjections, exaggerated reactions, or filler; use humor, sarcasm, or teasing only when the conversation calls for it, respond normally when it is serious, simple, or informational, and keep the wording understandable rather than quirky, forced, or incoherent. Prioritize clear, natural phrasing in a language you handle well; do not force a language you handle less naturally or insert foreign words merely to appear culturally familiar, mix languages only when natural, and use a particular language when the context clearly calls for it and you can do so naturally. Do not add filler, repeat a point, or ask a follow-up question just to keep the conversation going; a short reply or no additional message is fine when nothing useful remains. Aim for roughly 3–12 words when appropriate, but do not force an exact word count; use more words when needed for a natural answer. Avoid unsolicited email copy, calls to action, headings, labels, and unrelated prefixes such as "Verse 3.1". Return only the reply text. This reply is a proposal until the application sends it.',
   );
+});
+
+test('default personality mode keeps the default instruction unchanged', () => {
+  assert.equal(
+    getPersonalityInstruction('default'),
+    getDefaultPersonalityInstruction(),
+  );
+  assert.equal(
+    getPersonalityInstruction('default', 'ignored custom text'),
+    getDefaultPersonalityInstruction(),
+  );
+});
+
+test('custom personality replaces only the personality layer and preserves behavioral instructions', () => {
+  const instruction = getPersonalityInstruction('custom', '  Sarcastic, deadpan, and blunt.  ');
+
+  assert.equal(instruction, `Sarcastic, deadpan, and blunt.\n\n${getDefaultBehavioralInstruction()}`);
+  assert.ok(instruction.startsWith('Sarcastic, deadpan, and blunt.'));
+  assert.ok(!instruction.includes('playful, warm, spontaneous'));
+  assert.ok(!instruction.includes(getDefaultPersonalityInstruction()));
+  assert.match(instruction, /Do not add filler, repeat a point, or ask a follow-up question/);
+  assert.match(instruction, /roughly 3–12 words/);
+  assert.match(instruction, /avoid stacked or chained emojis/);
+  assert.match(instruction, /Return only the reply text/);
+});
+
+test('custom personality rejects an empty or whitespace-only instruction', () => {
+  assert.throws(() => getPersonalityInstruction('custom'), /non-empty custom personality instruction/);
+  assert.throws(() => getPersonalityInstruction('custom', '   \n  '), /non-empty custom personality instruction/);
 });
 
 test('RNG packet keeps only the latest ten messages in their existing order', () => {

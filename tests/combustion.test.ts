@@ -4,7 +4,12 @@ import { runInNewContext } from 'node:vm';
 import type { Page } from 'playwright';
 import { startCombustion, shouldRngRespond } from '../src/components/combustion.js';
 import { createContextStore } from '../src/components/context-store.js';
+import {
+  getDefaultBehavioralInstruction,
+  getDefaultPersonalityInstruction,
+} from '../src/components/personality.js';
 import type { Configuration } from '../src/config/configuration.js';
+import * as nvidiaModule from '../src/ai/nvidia.js';
 
 const MESSAGE_SELECTOR =
   '[data-scope="messages_table"][aria-roledescription="message"][data-message-id]';
@@ -374,6 +379,139 @@ test('RNG decisions use the configured temperament and update without restarting
     Math.random = originalRandom;
     console.log = originalLog;
     context.mock.timers.reset();
+  }
+});
+
+test('Personality changes at runtime apply to subsequent AI replies', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 1;
+
+  const capturedSystemInstructions: Array<string | undefined> = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const mutableNvidiaModule = nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  };
+  mutableNvidiaModule.generateNvidiaReply = async (
+    apiKey: string,
+    messages: readonly unknown[],
+    options: { systemInstruction?: string } = {},
+  ): Promise<string> => {
+    void apiKey;
+    void messages;
+    capturedSystemInstructions.push(options.systemInstruction);
+    return 'mocked reply';
+  };
+
+  const flush = (): Promise<void> => new Promise(resolve => setImmediate(resolve));
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3000);
+    await flush();
+  };
+
+  const mockPage = createMockPage({ messageCount: 1 });
+  const basePage = mockPage.page;
+  const originalLocator = basePage.locator.bind(basePage);
+  const injectedMessages: Array<{ messageId: string; message: string }> = [];
+
+  const messageLocator = {
+    evaluateAll: async (
+      callback: (items: unknown[], limit: number) => unknown[],
+      limit: number,
+    ): Promise<unknown[]> => {
+      const elements = injectedMessages.map(message => ({
+        getAttribute(name: string) {
+          if (name === 'data-message-id') {
+            return message.messageId;
+          }
+          if (name === 'aria-label') {
+            return `At October 18, 2026, 1:15 PM, Alex: ${message.message}`;
+          }
+          return null;
+        },
+        cloneNode() {
+          return {
+            innerText: message.message,
+            querySelectorAll: () => [],
+          };
+        },
+      }));
+      return runInNewContext(
+        `(${callback.toString()})(items, limit)`,
+        { items: elements, limit },
+      ) as unknown[];
+    },
+  };
+
+  function createLocator(count: number) {
+    return {
+      count: () => count,
+      fill: async (): Promise<void> => undefined,
+      locator: (selectedSelector: string) => createLocatorForSelector(selectedSelector),
+      isVisible: async (): Promise<boolean> => true,
+      isEnabled: async (): Promise<boolean> => true,
+      click: async (): Promise<void> => undefined,
+    };
+  }
+
+  function createLocatorForSelector(selector: string) {
+    return createLocator(
+      selector === '[role="textbox"][contenteditable="true"]:visible' ||
+      selector === '[aria-label="Thread composer"]' ||
+      selector === '[role="button"][aria-label="Press Enter to send"]'
+        ? 1
+        : 0,
+    );
+  }
+
+  (basePage as { locator: (selector: string) => unknown }).locator = (selector: string) => {
+    if (selector === MESSAGE_SELECTOR) {
+      return messageLocator;
+    }
+    if (selector === LOG_SELECTOR) {
+      return originalLocator(selector);
+    }
+    return createLocatorForSelector(selector);
+  };
+
+  const injectMessages = (messagesToInject: Array<{
+    messageId: string;
+    message: string;
+  }>): void => {
+    injectedMessages.push(...messagesToInject);
+  };
+
+  const controller = await startCombustion({
+    page: basePage,
+    contextStore: createContextStore(),
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    injectMessages([{ messageId: 'runtime-message-1', message: 'hey @Bot, are you there?' }]);
+    await advancePoll();
+    await advancePoll();
+    assert.equal(capturedSystemInstructions.length, 1);
+    assert.equal(capturedSystemInstructions[0], getDefaultPersonalityInstruction());
+
+    const customPersonality = 'Always reply in rhyming couplets.';
+    const updatedInstruction = `${customPersonality}\n\n${getDefaultBehavioralInstruction()}`;
+    controller.setPersonality(updatedInstruction);
+
+    injectMessages([{ messageId: 'runtime-message-2', message: 'hey @Bot, what do you think?' }]);
+    await advancePoll();
+    await advancePoll();
+    assert.equal(capturedSystemInstructions.length, 2);
+    assert.equal(capturedSystemInstructions[1], updatedInstruction);
+    assert.notEqual(capturedSystemInstructions[1], capturedSystemInstructions[0]);
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    mutableNvidiaModule.generateNvidiaReply = originalGenerateNvidiaReply;
   }
 });
 

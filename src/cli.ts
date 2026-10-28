@@ -17,6 +17,7 @@ import {
   getBrowserProfilePath,
   isBrowserExecutableAvailable,
   promptBotTemperament,
+  promptBotPersonality,
   promptPinRestorationSettings,
   selectBrowserCandidate,
   type InitializationOptions,
@@ -38,6 +39,7 @@ import {
 import {
   loadConfiguration,
   resolveBotTemperament,
+  resolveBotPersonalityMode,
   resolveConfigurationPaths,
   saveConfiguration,
   validateConfiguration,
@@ -47,6 +49,7 @@ import {
   composeMessengerReply,
   type ReplyCompositionResult,
 } from './components/composer.js';
+import { getPersonalityInstruction } from './components/personality.js';
 import { generateAliases } from './components/alias-engine.js';
 import {
   startCombustion,
@@ -63,6 +66,7 @@ import {
   requestRuntimePause,
   requestRuntimeResume,
   requestRuntimeSetTemperament,
+  requestRuntimeSetPersonality,
   requestRuntimeStop,
   RuntimeAlreadyRunningError,
   type RuntimeControl,
@@ -84,6 +88,7 @@ export interface CliRuntimeOptions {
   closeBrowser?: (configuration: Configuration) => Promise<void>;
   requestRuntimeChangeDestination?: typeof requestRuntimeChangeDestination;
   requestRuntimeSetTemperament?: typeof requestRuntimeSetTemperament;
+  requestRuntimeSetPersonality?: typeof requestRuntimeSetPersonality;
   discoverBrowsers?: (options?: BrowserDiscoveryOptions) => Promise<BrowserCandidate[]>;
   browserExecutableExists?: (path: string) => boolean;
 }
@@ -96,6 +101,7 @@ Commands:
   changebrowser  Change the configured browser
   changegcUrl  Change the message destination
   setbottemp  Set the bot temperament
+  setpersonality  Set the bot personality
   updatekey  Replace the NVIDIA API key
   start    Start impractical-bot
   pause    Pause impractical-bot
@@ -300,6 +306,7 @@ function handleConfig(writeOutput: Output, writeError: Output, filePath?: string
     `  Startup URL: ${configuration.startupUrl ?? 'not configured'}`,
     `  Message destination: ${configuration.messageDestination ?? 'not configured'}`,
     `  Bot temperament: ${resolveBotTemperament(configuration)}`,
+    `  setpersonality: ${resolveBotPersonalityMode(configuration)}`,
     `  Puppet name: ${configuration.puppetName || 'Not set'}`,
   ].join('\n'));
   return 0;
@@ -661,6 +668,94 @@ async function handleSetBotTemperament(
   return 1;
 }
 
+async function handleSetPersonality(
+  writeOutput: Output,
+  writeError: Output,
+  configurationFilePath: string | undefined,
+  prompt: TerminalPrompt,
+  runtime: CliRuntimeOptions,
+): Promise<number> {
+  let configurationResult;
+  try {
+    configurationResult = loadConfiguration(configurationFilePath);
+  } catch (error) {
+    writeError(`Unable to load configuration: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+
+  if (configurationResult.status === 'missing') {
+    writeError('Configuration has not been initialized. Run `impbot init` first.');
+    return 1;
+  }
+  if (configurationResult.status === 'malformed') {
+    writeError(`Configuration is malformed: ${configurationResult.message}`);
+    return 1;
+  }
+  if (configurationResult.status === 'unsupported-version') {
+    writeError(`Configuration schema version ${configurationResult.version} is not supported.`);
+    return 1;
+  }
+  if (configurationResult.status === 'pin-required') {
+    writeError('Messenger PIN configuration is required. Run `impbot init` to reconfigure it.');
+    return 1;
+  }
+
+  const configuration = configurationResult.configuration;
+  const currentMode = resolveBotPersonalityMode(configuration);
+  const selection = await promptBotPersonality(
+    prompt,
+    writeOutput,
+    writeError,
+    currentMode,
+    configuration.customPersonalityInstruction,
+  );
+  if (selection === null) {
+    writeOutput('Personality change cancelled. The current configuration was not changed.');
+    return 0;
+  }
+
+  let result;
+  try {
+    result = await (runtime.requestRuntimeSetPersonality ?? requestRuntimeSetPersonality)(
+      configurationFilePath,
+      selection.mode,
+      selection.mode === 'custom' ? selection.instruction : '',
+    );
+  } catch (error) {
+    writeError(`Unable to change personality: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+
+  if (result.status === 'not-running') {
+    try {
+      saveConfiguration(
+        {
+          ...configuration,
+          botPersonality: selection.mode,
+          customPersonalityInstruction:
+            selection.mode === 'custom' ? selection.instruction : undefined,
+        },
+        configurationFilePath,
+      );
+    } catch (error) {
+      writeError(`Unable to save personality: ${error instanceof Error ? error.message : String(error)}`);
+      return 1;
+    }
+
+    writeOutput(`Personality saved: ${selection.mode}.`);
+    return 0;
+  }
+
+  if (result.status === 'changed') {
+    writeOutput(`Personality changed: ${selection.mode}. Engine ${result.instanceId} updated.`);
+    return 0;
+  }
+
+  writeError(`Personality change failed: ${result.reason}`);
+  writeOutput('The previous personality remains active and configured.');
+  return 1;
+}
+
 async function handleStart(
   writeOutput: Output,
   writeError: Output,
@@ -826,6 +921,83 @@ async function handleStart(
               status: 'failed',
               reason:
                 'The runtime temperament update failed; the previous temperament remains ' +
+                'active and configured. ' +
+                `${error instanceof Error ? error.message : String(error)}`,
+            };
+          }
+
+          return { status: 'changed' };
+        },
+        requestSetPersonality: async (mode, instruction) => {
+          if (!combustionController) {
+            return {
+              status: 'failed',
+              reason: 'The engine is not ready to change personalities.',
+            };
+          }
+
+          const previousMode = resolveBotPersonalityMode(configurationResult.configuration);
+          const previousInstruction =
+            configurationResult.configuration.customPersonalityInstruction;
+          try {
+            const savedConfiguration = saveConfiguration(
+              {
+                ...configurationResult.configuration,
+                botPersonality: mode,
+                ...(mode === 'custom'
+                  ? { customPersonalityInstruction: instruction }
+                  : { customPersonalityInstruction: undefined }),
+              },
+              configurationFilePath,
+            );
+            configurationResult.configuration.botPersonality =
+              savedConfiguration.botPersonality;
+            configurationResult.configuration.customPersonalityInstruction =
+              savedConfiguration.customPersonalityInstruction;
+          } catch (error) {
+            return {
+              status: 'failed',
+              reason:
+                'The personality could not be saved. ' +
+                `${error instanceof Error ? error.message : String(error)}`,
+            };
+          }
+
+          try {
+            const resolvedInstruction = getPersonalityInstruction(
+              mode,
+              mode === 'custom' ? instruction : undefined,
+            );
+            combustionController.setPersonality(resolvedInstruction);
+          } catch (error) {
+            try {
+              const restoredConfiguration = saveConfiguration(
+                {
+                  ...configurationResult.configuration,
+                  botPersonality: previousMode,
+                  ...(previousMode === 'custom'
+                    ? { customPersonalityInstruction: previousInstruction }
+                    : { customPersonalityInstruction: undefined }),
+                },
+                configurationFilePath,
+              );
+              configurationResult.configuration.botPersonality =
+                restoredConfiguration.botPersonality;
+              configurationResult.configuration.customPersonalityInstruction =
+                restoredConfiguration.customPersonalityInstruction;
+            } catch (rollbackError) {
+              return {
+                status: 'failed',
+                reason:
+                  'The runtime personality update failed and the persisted personality ' +
+                  'could not be restored. ' +
+                  `${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+              };
+            }
+            return {
+              status: 'failed',
+              reason:
+                'The runtime personality update failed; the previous personality remains ' +
                 'active and configured. ' +
                 `${error instanceof Error ? error.message : String(error)}`,
             };
@@ -1186,6 +1358,13 @@ export async function runCli(
       runtime,
     ),
     setbottemp: () => handleSetBotTemperament(
+      writeOutput,
+      writeError,
+      configurationFilePath,
+      prompt,
+      runtime,
+    ),
+    setpersonality: () => handleSetPersonality(
       writeOutput,
       writeError,
       configurationFilePath,

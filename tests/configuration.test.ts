@@ -11,8 +11,11 @@ import { dirname, join, win32 } from 'node:path';
 import { test, type TestContext } from 'node:test';
 import {
   BOT_TEMPERAMENT_YES_PROBABILITIES,
+  MAX_PERSONALITY_INSTRUCTION_CHARS,
   getBotTemperamentYesProbability,
+  isBotPersonalityMode,
   loadConfiguration,
+  resolveBotPersonalityMode,
   resolveConfigurationPaths,
   saveConfiguration,
   validateConfiguration,
@@ -31,6 +34,7 @@ const validConfiguration: Configuration = {
   messageDestination: 'https://www.facebook.com/messages',
   puppetName: 'Test Puppet',
   botTemperament: 'balanced',
+  botPersonality: 'default',
 };
 
 function createTemporaryConfigPath(context: TestContext): string {
@@ -340,4 +344,95 @@ test('missing temperament defaults to Balanced and invalid values are rejected',
       /botTemperament must be one of 'quiet', 'balanced', or 'talkative'/,
     );
   }
+});
+
+test('legacy configurations without a personality default to Default mode', context => {
+  const legacyConfiguration: Record<string, unknown> = { ...validConfiguration };
+  delete legacyConfiguration.botPersonality;
+
+  const validated = validateConfiguration(legacyConfiguration);
+  assert.equal(validated.botPersonality, 'default');
+  assert.equal(resolveBotPersonalityMode(validated), 'default');
+
+  const filePath = createTemporaryConfigPath(context);
+  writeFileSync(filePath, JSON.stringify(legacyConfiguration));
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.equal(loaded.configuration.botPersonality, 'default');
+    assert.equal(loaded.configuration.customPersonalityInstruction, undefined);
+  }
+});
+
+test('personality mode validation rejects unknown modes and requires a custom instruction', () => {
+  assert.equal(isBotPersonalityMode('default'), true);
+  assert.equal(isBotPersonalityMode('custom'), true);
+  assert.equal(isBotPersonalityMode('loud'), false);
+
+  for (const botPersonality of [null, 'loud', 1, false]) {
+    assert.throws(
+      () => validateConfiguration({ ...validConfiguration, botPersonality }),
+      /botPersonality must be one of 'default' or 'custom'/,
+    );
+  }
+
+  assert.throws(
+    () => validateConfiguration({ ...validConfiguration, botPersonality: 'custom' }),
+    /customPersonalityInstruction is required when botPersonality is custom/,
+  );
+  assert.throws(
+    () => validateConfiguration({
+      ...validConfiguration,
+      botPersonality: 'custom',
+      customPersonalityInstruction: '   ',
+    }),
+    /customPersonalityInstruction is required when botPersonality is custom/,
+  );
+});
+
+test('a custom personality instruction persists with newlines and reloads intact', context => {
+  const customPersonalityInstruction = 'Sarcastic and deadpan.\nNever cheerful.\n\nMatch the room.';
+  const filePath = createTemporaryConfigPath(context);
+  const saved = saveConfiguration(
+    { ...validConfiguration, botPersonality: 'custom', customPersonalityInstruction },
+    filePath,
+  );
+  assert.equal(saved.botPersonality, 'custom');
+  assert.equal(saved.customPersonalityInstruction, customPersonalityInstruction);
+
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.equal(loaded.configuration.botPersonality, 'custom');
+    assert.equal(loaded.configuration.customPersonalityInstruction, customPersonalityInstruction);
+    assert.equal(resolveBotPersonalityMode(loaded.configuration), 'custom');
+  }
+
+  const text = readFileSync(filePath, 'utf8');
+  assert.ok(text.includes('botPersonality'));
+  assert.ok(text.includes('customPersonalityInstruction'));
+});
+
+test('custom personality instructions reject control characters and oversized text', () => {
+  assert.throws(
+    () => validateConfiguration({
+      ...validConfiguration,
+      botPersonality: 'custom',
+      customPersonalityInstruction: 'bad\u0007text',
+    }),
+    /must not contain control characters/,
+  );
+  assert.throws(
+    () => validateConfiguration({
+      ...validConfiguration,
+      botPersonality: 'custom',
+      customPersonalityInstruction: 'x'.repeat(MAX_PERSONALITY_INSTRUCTION_CHARS + 1),
+    }),
+    /must not exceed \d+ characters/,
+  );
+  assert.doesNotThrow(() => validateConfiguration({
+    ...validConfiguration,
+    botPersonality: 'custom',
+    customPersonalityInstruction: 'x'.repeat(MAX_PERSONALITY_INSTRUCTION_CHARS),
+  }));
 });

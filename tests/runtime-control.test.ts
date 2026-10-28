@@ -11,6 +11,7 @@ import {
   requestRuntimePause,
   requestRuntimeResume,
   requestRuntimeSetTemperament,
+  requestRuntimeSetPersonality,
   requestRuntimeStop,
   RuntimeAlreadyRunningError,
   RuntimeControlEndpointError,
@@ -47,6 +48,29 @@ async function sendRuntimeCommand(
     const greeting = await readPipeLine(socket);
     const instanceId = greeting.split(' ')[1];
     socket.write(`${command} ${instanceId}\n`);
+    return await readPipeLine(socket);
+  } finally {
+    socket.destroy();
+  }
+}
+
+function encodeProtocolText(value: string): string {
+  return Buffer.from(value, 'utf8').toString('base64url');
+}
+
+async function sendPersonalityCommand(
+  configurationPath: string,
+  modeToken: string,
+  instructionToken?: string,
+): Promise<string> {
+  const socket = createConnection(getRuntimeControlEndpoint(configurationPath));
+  try {
+    const greeting = await readPipeLine(socket);
+    const instanceId = greeting.split(' ')[1];
+    const payload = instructionToken === undefined
+      ? `PERSONALITY ${instanceId} ${modeToken}`
+      : `PERSONALITY ${instanceId} ${modeToken} ${instructionToken}`;
+    socket.write(`${payload}\n`);
     return await readPipeLine(socket);
   } finally {
     socket.destroy();
@@ -147,6 +171,10 @@ test('runtime stop, pause, and resume report not-running when no owner exists', 
   );
   assert.deepEqual(
     await requestRuntimeSetTemperament(configurationPath, 'quiet'),
+    { status: 'not-running' },
+  );
+  assert.deepEqual(
+    await requestRuntimeSetPersonality(configurationPath, 'custom', 'deadpan'),
     { status: 'not-running' },
   );
 });
@@ -465,4 +493,126 @@ test('runtime control reports temperament failure without changing engine state'
   }
   assert.match(await sendRuntimeCommand(configurationPath, 'PAUSE'), /^PAUSED /);
   assert.equal(pauseRequests, 1);
+});
+
+test('runtime control changes personality without pausing, resuming, or restarting the engine', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  const received: Array<{ mode: string; instruction: string }> = [];
+  let pauseRequests = 0;
+  let resumeRequests = 0;
+  const control = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => undefined,
+    requestPause: () => {
+      pauseRequests += 1;
+    },
+    requestResume: () => {
+      resumeRequests += 1;
+    },
+    requestSetPersonality: (mode, instruction) => {
+      received.push({ mode, instruction });
+      return { status: 'changed' };
+    },
+  });
+  context.after(async () => {
+    control.complete(1);
+    await control.close();
+  });
+  control.setState('running');
+
+  const instruction = 'Sarcastic and deadpan.\nNever cheerful.\n\nMatch the room.';
+  const result = await requestRuntimeSetPersonality(configurationPath, 'custom', instruction);
+  assert.equal(result.status, 'changed');
+  if (result.status === 'changed') {
+    assert.equal(result.mode, 'custom');
+    assert.equal(result.instruction, instruction);
+    assert.match(result.instanceId, /^[0-9a-f-]{36}$/i);
+  }
+  assert.deepEqual(received, [{ mode: 'custom', instruction }]);
+  assert.equal(pauseRequests, 0);
+  assert.equal(resumeRequests, 0);
+  assert.match(await sendRuntimeCommand(configurationPath, 'PAUSE'), /^PAUSED /);
+  assert.equal(pauseRequests, 1);
+
+  assert.equal(
+    (await requestRuntimeSetPersonality(configurationPath, 'default', '')).status,
+    'changed',
+  );
+  assert.deepEqual(received[1], { mode: 'default', instruction: '' });
+  assert.equal(resumeRequests, 0);
+});
+
+test('runtime control reports personality failure without changing engine state', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  let pauseRequests = 0;
+  const control = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => undefined,
+    requestPause: () => {
+      pauseRequests += 1;
+    },
+    requestSetPersonality: () => ({
+      status: 'failed',
+      reason: 'The personality could not be saved.',
+    }),
+  });
+  context.after(async () => {
+    control.complete(1);
+    await control.close();
+  });
+  control.setState('running');
+
+  const result = await requestRuntimeSetPersonality(configurationPath, 'custom', 'deadpan');
+  assert.equal(result.status, 'failed');
+  if (result.status === 'failed') {
+    assert.equal(result.reason, 'The personality could not be saved.');
+  }
+  assert.match(await sendRuntimeCommand(configurationPath, 'PAUSE'), /^PAUSED /);
+  assert.equal(pauseRequests, 1);
+});
+
+test('runtime control validates personality requests before invoking the handler', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  let calls = 0;
+  const control = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => undefined,
+    requestSetPersonality: () => {
+      calls += 1;
+      return { status: 'changed' };
+    },
+  });
+  context.after(async () => {
+    control.complete(1);
+    await control.close();
+  });
+  control.setState('running');
+
+  assert.match(
+    await sendPersonalityCommand(configurationPath, encodeProtocolText('loud'), encodeProtocolText('x')),
+    /INVALID_REQUEST$/,
+  );
+  assert.match(
+    await sendPersonalityCommand(configurationPath, encodeProtocolText('custom'), encodeProtocolText('')),
+    /INVALID_REQUEST$/,
+  );
+  assert.match(
+    await sendPersonalityCommand(configurationPath, encodeProtocolText('custom')),
+    /INVALID_REQUEST$/,
+  );
+  assert.equal(calls, 0);
+});
+
+test('runtime control reports personality as unsupported when no handler is registered', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  const control = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => undefined,
+  });
+  context.after(async () => {
+    control.complete(1);
+    await control.close();
+  });
+  control.setState('running');
+
+  assert.match(
+    await sendPersonalityCommand(configurationPath, encodeProtocolText('default'), encodeProtocolText('')),
+    /UNSUPPORTED$/,
+  );
 });

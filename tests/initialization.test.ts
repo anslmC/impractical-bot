@@ -6,6 +6,8 @@ import { test, type TestContext } from 'node:test';
 import {
   getBrowserProfilePath,
   initializeConfiguration,
+  promptBotPersonality,
+  promptMultilinePersonality,
   promptPinRestorationSettings,
 } from '../src/browser/initialization.js';
 import { loadConfiguration, saveConfiguration, type Configuration } from '../src/config/configuration.js';
@@ -81,6 +83,7 @@ const existingConfiguration: Configuration = {
   startupUrl: 'https://www.facebook.com',
   messageDestination: 'https://www.facebook.com/messages',
   botTemperament: 'balanced',
+  botPersonality: 'default',
 };
 
 test('browser profile paths use stable browser-specific names', () => {
@@ -159,7 +162,7 @@ test('initial setup retries invalid message destination URLs', async context => 
   const errors: string[] = [];
   const options = createOptions(filePath, {
     installedPaths: [bravePath],
-    answers: ['y', 'not-a-url', 'ftp://example.test/messages', ' https://example.test/messages ', 'yes', ''],
+    answers: ['y', 'not-a-url', 'ftp://example.test/messages', ' https://example.test/messages ', 'yes', '', ''],
     errors,
   });
 
@@ -178,7 +181,7 @@ test('a single discovered browser requires confirmation before saving', async co
   const promptCalls: string[] = [];
   const options = createOptions(filePath, {
     installedPaths: [bravePath],
-    answers: ['y', 'https://example.test/messages', '', '123456', ''],
+    answers: ['y', 'https://example.test/messages', '', '123456', '', ''],
     promptCalls,
   });
 
@@ -201,7 +204,7 @@ test('initial setup saves an affirmative PIN-restoration skip preference', async
   const filePath = createConfigurationPath(context);
   const options = createOptions(filePath, {
     installedPaths: [bravePath],
-    answers: ['y', 'https://example.test/messages', 'yes', '3'],
+    answers: ['y', 'https://example.test/messages', 'yes', '3', ''],
   });
 
   assert.equal(await initializeConfiguration(options), 'saved');
@@ -215,22 +218,24 @@ test('initial setup saves an affirmative PIN-restoration skip preference', async
   }
 });
 
-test('initial setup asks for bot temperament last and defaults to Balanced', async context => {
+test('initial setup asks for bot temperament then personality and defaults both', async context => {
   const filePath = createConfigurationPath(context);
   const promptCalls: string[] = [];
   const options = createOptions(filePath, {
     installedPaths: [bravePath],
-    answers: ['y', 'https://example.test/messages', 'yes', ''],
+    answers: ['y', 'https://example.test/messages', 'yes', '', ''],
     promptCalls,
   });
 
   assert.equal(await initializeConfiguration(options), 'saved');
-  assert.equal(promptCalls.length, 4);
+  assert.equal(promptCalls.length, 5);
   assert.match(promptCalls[3], /temperament/i);
+  assert.match(promptCalls[4], /personality/i);
   const loaded = loadConfiguration(filePath);
   assert.equal(loaded.status, 'valid');
   if (loaded.status === 'valid') {
     assert.equal(loaded.configuration.botTemperament, 'balanced');
+    assert.equal(loaded.configuration.botPersonality, 'default');
   }
 });
 
@@ -368,7 +373,7 @@ test('multiple browsers show a menu and persist only the selected browser', asyn
   const output: string[] = [];
   const options = createOptions(filePath, {
     installedPaths: [bravePath, chromePath],
-    answers: ['2', 'https://example.test/messages', 'n', '012345', '1'],
+    answers: ['2', 'https://example.test/messages', 'n', '012345', '1', ''],
     output,
   });
 
@@ -402,7 +407,7 @@ test('manual path input retries invalid values and saves only an existing suppor
   const errors: string[] = [];
   const options = createOptions(filePath, {
     installedPaths: [edgePath],
-    answers: ['4', ` ${edgePath} `, edgePath, 'https://example.test/messages', 'n', '012345', ''],
+    answers: ['4', ` ${edgePath} `, edgePath, 'https://example.test/messages', 'n', '012345', '', ''],
     errors,
   });
 
@@ -518,4 +523,117 @@ test('init backfills a missing PIN as null when legacy restoration is skipped', 
     assert.equal(loaded.configuration.skipPinRestoration, true);
     assert.equal(loaded.configuration.pin, null);
   }
+});
+
+test('initial setup persists a custom multiline personality with behavioral defaults intact', async context => {
+  const filePath = createConfigurationPath(context);
+  const options = createOptions(filePath, {
+    installedPaths: [bravePath],
+    answers: ['y', 'https://example.test/messages', 'yes', '', 'custom', 'Sarcastic and deadpan.', 'Never cheerful.', '.'],
+  });
+
+  assert.equal(await initializeConfiguration(options), 'saved');
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.equal(loaded.configuration.botPersonality, 'custom');
+    assert.equal(
+      loaded.configuration.customPersonalityInstruction,
+      'Sarcastic and deadpan.\nNever cheerful.',
+    );
+  }
+});
+
+test('re-init rediscovery preserves an existing custom personality instruction', async context => {
+  const filePath = createConfigurationPath(context);
+  saveConfiguration(
+    {
+      ...existingConfiguration,
+      botPersonality: 'custom',
+      customPersonalityInstruction: 'Sarcastic and deadpan.',
+    },
+    filePath,
+  );
+
+  assert.equal(await initializeConfiguration(createOptions(filePath, {
+    installedPaths: [chromePath],
+    answers: ['yes', 'y'],
+  })), 'saved');
+
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.equal(loaded.configuration.browser, 'chrome');
+    assert.equal(loaded.configuration.botPersonality, 'custom');
+    assert.equal(loaded.configuration.customPersonalityInstruction, 'Sarcastic and deadpan.');
+  }
+});
+
+test('personality prompt defaults to the current mode and never exposes the stored instruction', async () => {
+  const seen: string[] = [];
+  const output: string[] = [];
+  const keptSelection = await promptBotPersonality(
+    createPrompt([''], seen),
+    message => output.push(message),
+    message => output.push(message),
+    'custom',
+    'stored-secret-instruction',
+  );
+  assert.deepEqual(keptSelection, { mode: 'custom', instruction: 'stored-secret-instruction' });
+  assert.ok(!seen.some(message => message.includes('stored-secret-instruction')));
+  assert.ok(!output.some(message => message.includes('stored-secret-instruction')));
+
+  const defaultSelection = await promptBotPersonality(
+    createPrompt(['']),
+    () => undefined,
+    () => undefined,
+    'default',
+  );
+  assert.deepEqual(defaultSelection, { mode: 'default' });
+});
+
+test('personality prompt collects multiline custom text until a terminating period', async () => {
+  const answers: Array<string | null> = ['custom', 'first line', 'second line', '   ', '.'];
+  const selection = await promptBotPersonality(
+    createPrompt(answers),
+    () => undefined,
+    () => undefined,
+  );
+  assert.deepEqual(selection, { mode: 'custom', instruction: 'first line\nsecond line' });
+});
+
+test('personality prompt retries invalid answers and cancellation returns null', async () => {
+  const errors: string[] = [];
+  const retryAnswers: Array<string | null> = ['loud', 'default'];
+  const retry = await promptBotPersonality(
+    createPrompt(retryAnswers),
+    () => undefined,
+    message => errors.push(message),
+  );
+  assert.deepEqual(retry, { mode: 'default' });
+  assert.match(errors[0], /Choose Default or Custom/);
+
+  const cancelled = await promptBotPersonality(createPrompt([null]), () => undefined, () => undefined);
+  assert.equal(cancelled, null);
+});
+
+test('multiline personality collection rejects an empty block and supports cancellation', async () => {
+  const errors: string[] = [];
+  const empty = await promptMultilinePersonality(
+    createPrompt(['.', '']),
+    () => undefined,
+    message => errors.push(message),
+  );
+  assert.equal(empty, null);
+  assert.match(errors[0], /must not be empty/);
+
+  const cancelled = await promptMultilinePersonality(createPrompt([null]), () => undefined, () => undefined);
+  assert.equal(cancelled, null);
+
+  const trimmed = await promptMultilinePersonality(
+    createPrompt(['  padded  ', '.']),
+    () => undefined,
+    () => undefined,
+  );
+  assert.equal(trimmed, 'padded');
 });
