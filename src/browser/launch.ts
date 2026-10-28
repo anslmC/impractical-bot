@@ -45,6 +45,7 @@ export interface BrowserLaunchOptions {
     options: ConnectOverCDPOptions,
   ) => Promise<Browser>;
   findProfileProcesses?: ProfileProcessFinder;
+  requestProcessClose?: (processIds: number[]) => Promise<void>;
   now?: () => number;
   delay?: (milliseconds: number) => Promise<void>;
 }
@@ -1164,6 +1165,41 @@ export async function assertConfiguredBrowserCanStart(
   });
 }
 
+// A browser spawned by this launch attempt is owned by it even when no Playwright
+// session was created, so a failed attachment must still close it. The process id
+// check keeps cleanup limited to the browser this attempt actually spawned.
+async function closeOwnedBrowserAfterFailedLaunch(
+  configuration: Configuration,
+  options: BrowserLaunchOptions,
+  child: BrowserProcessHandle,
+): Promise<Error | undefined> {
+  if (child.pid === undefined) {
+    return undefined;
+  }
+
+  const getProfileProcesses = options.findProfileProcesses ?? findProfileProcesses;
+  try {
+    const processIds = await getProfileProcesses(
+      configuration.executablePath,
+      configuration.profilePath,
+    );
+    if (!processIds.includes(child.pid)) {
+      return undefined;
+    }
+    await closeConfiguredBrowser(configuration, {
+      platform: options.platform,
+      findProfileProcesses: getProfileProcesses,
+      requestProcessClose: options.requestProcessClose,
+      pollIntervalMs: options.pollIntervalMs,
+      now: options.now,
+      delay: options.delay,
+    });
+    return undefined;
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error));
+  }
+}
+
 export async function launchConfiguredBrowser(
   configuration: Configuration,
   options: BrowserLaunchOptions = {},
@@ -1235,39 +1271,55 @@ export async function launchConfiguredBrowser(
   });
   child.unref();
 
-  const endpoint = await waitForEndpoint(
-    validatedConfiguration.cdpPort,
-    childState,
-    now,
-    delay,
-    startupTimeoutMs,
-    pollIntervalMs,
-  );
-  const ownerProcessIds = await getProfileProcesses(
-    validatedConfiguration.executablePath,
-    validatedConfiguration.profilePath,
-  );
-  if (child.pid === undefined || !ownerProcessIds.includes(child.pid) || childState.exited) {
-    throw new Error('Unable to verify that the launched process owns the configured CDP endpoint; refusing to attach.');
+  try {
+    const endpoint = await waitForEndpoint(
+      validatedConfiguration.cdpPort,
+      childState,
+      now,
+      delay,
+      startupTimeoutMs,
+      pollIntervalMs,
+    );
+    const ownerProcessIds = await getProfileProcesses(
+      validatedConfiguration.executablePath,
+      validatedConfiguration.profilePath,
+    );
+    if (child.pid === undefined || !ownerProcessIds.includes(child.pid) || childState.exited) {
+      throw new Error('Unable to verify that the launched process owns the configured CDP endpoint; refusing to attach.');
+    }
+
+    const connectOverCDP = options.connectOverCDP ?? ((url, connectOptions) =>
+      chromium.connectOverCDP(url, connectOptions));
+    const browser = await connectOverCDP(endpoint, {
+      isLocal: true,
+      timeout: connectionTimeoutMs,
+    });
+
+    return await createBrowserLaunchSession(
+      browser,
+      endpoint,
+      validatedConfiguration,
+      options,
+      false,
+      () => {
+        if (childState.exited) {
+          throw new Error('Playwright CDP connection verification failed.');
+        }
+      },
+    );
+  } catch (error) {
+    const cleanupError = await closeOwnedBrowserAfterFailedLaunch(
+      validatedConfiguration,
+      options,
+      child,
+    );
+    if (cleanupError === undefined) {
+      throw error;
+    }
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)} ` +
+      `The browser spawned by this launch attempt could not be closed: ${cleanupError.message}`,
+      { cause: error },
+    );
   }
-
-  const connectOverCDP = options.connectOverCDP ?? ((url, connectOptions) =>
-    chromium.connectOverCDP(url, connectOptions));
-  const browser = await connectOverCDP(endpoint, {
-    isLocal: true,
-    timeout: connectionTimeoutMs,
-  });
-
-  return createBrowserLaunchSession(
-    browser,
-    endpoint,
-    validatedConfiguration,
-    options,
-    false,
-    () => {
-      if (childState.exited) {
-        throw new Error('Playwright CDP connection verification failed.');
-      }
-    },
-  );
 }

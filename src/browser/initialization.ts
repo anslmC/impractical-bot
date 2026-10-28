@@ -379,6 +379,36 @@ export function getBrowserProfilePath(browser: BrowserId, configurationFilePath:
   return win32.join(win32.dirname(configurationFilePath), profileName);
 }
 
+function reloadConfigurationForSave(
+  configurationFilePath: string,
+  writeError: (message: string) => void,
+): ConfigurationLoadResult | undefined {
+  try {
+    return loadConfiguration(configurationFilePath);
+  } catch (error) {
+    writeError(
+      'Unable to reload configuration before saving: ' +
+      `${error instanceof Error ? error.message : String(error)}`,
+    );
+    return undefined;
+  }
+}
+
+function describeConfigurationChange(result: ConfigurationLoadResult): string {
+  switch (result.status) {
+    case 'missing':
+      return 'the configuration file was removed';
+    case 'malformed':
+      return `the configuration is malformed: ${result.message}`;
+    case 'unsupported-version':
+      return `schema version ${result.version} is not supported`;
+    case 'pin-required':
+      return 'PIN-restoration settings are now required';
+    default:
+      return 'the configuration changed';
+  }
+}
+
 export async function initializeConfiguration(
   options: InitializationOptions,
 ): Promise<InitializationStatus> {
@@ -448,15 +478,29 @@ export async function initializeConfiguration(
         saved.configuration.startupUrl === undefined ||
         saved.configuration.messageDestination === undefined
       ) {
-        saveConfiguration({
-          ...saved.configuration,
-          skipPinRestoration: saved.configuration.skipPinRestoration ?? false,
-          pin: saved.configuration.pin ?? null,
-          cdpPort: saved.configuration.cdpPort ?? randomInt(20_000, 60_000),
-          startupUrl: saved.configuration.startupUrl ?? 'https://www.facebook.com',
-          messageDestination,
-          botTemperament,
-        }, configurationFilePath);
+        const latest = reloadConfigurationForSave(configurationFilePath, writeError);
+        if (latest === undefined) {
+          return 'failed';
+        }
+        if (latest.status !== 'valid') {
+          writeError(
+            'Initialization stopped because the configuration changed while prompts were open: ' +
+            `${describeConfigurationChange(latest)}. No configuration was written.`,
+          );
+          return 'failed';
+        }
+        try {
+          saveConfiguration({
+            ...latest.configuration,
+            cdpPort: latest.configuration.cdpPort ?? randomInt(20_000, 60_000),
+            startupUrl: latest.configuration.startupUrl ?? 'https://www.facebook.com',
+            messageDestination: latest.configuration.messageDestination ?? messageDestination,
+            ...(latest.needsBotTemperamentBackfill === true ? { botTemperament } : {}),
+          }, configurationFilePath);
+        } catch (error) {
+          writeError(`Unable to save configuration: ${error instanceof Error ? error.message : String(error)}`);
+          return 'failed';
+        }
         writeOutput('Existing configuration updated with missing default values.');
         return 'saved';
       }
@@ -503,14 +547,25 @@ export async function initializeConfiguration(
         }
         botTemperament = selectedTemperament;
       }
+      const latest = reloadConfigurationForSave(configurationFilePath, writeError);
+      if (latest === undefined) {
+        return 'failed';
+      }
+      if (latest.status !== 'pin-required') {
+        writeError(
+          'Initialization stopped because the configuration changed while prompts were open: ' +
+          `${describeConfigurationChange(latest)}. No configuration was written.`,
+        );
+        return 'failed';
+      }
       try {
         saveConfiguration({
-          ...saved.configuration,
-          messageDestination,
+          ...latest.configuration,
+          messageDestination: latest.configuration.messageDestination ?? messageDestination,
           ...pinSettings,
-          cdpPort: saved.configuration.cdpPort ?? randomInt(20_000, 60_000),
-          startupUrl: saved.configuration.startupUrl ?? 'https://www.facebook.com',
-          botTemperament,
+          cdpPort: latest.configuration.cdpPort ?? randomInt(20_000, 60_000),
+          startupUrl: latest.configuration.startupUrl ?? 'https://www.facebook.com',
+          ...(latest.needsBotTemperamentBackfill === true ? { botTemperament } : {}),
         }, configurationFilePath);
       } catch (error) {
         writeError(`Unable to save configuration: ${error instanceof Error ? error.message : String(error)}`);
@@ -624,8 +679,52 @@ export async function initializeConfiguration(
     botPersonality,
     customPersonalityInstruction,
   );
+
+  // Prompts and browser discovery can leave the file changed by another process.
+  // Reload before writing, require the same configuration state, and overlay only
+  // the fields this run selected onto the fresh validated values.
+  const latest = reloadConfigurationForSave(configurationFilePath, writeError);
+  if (latest === undefined) {
+    return 'failed';
+  }
+  if (latest.status !== saved.status) {
+    writeError(
+      'Initialization stopped because the configuration changed while prompts were open: ' +
+      `${describeConfigurationChange(latest)}. No configuration was written.`,
+    );
+    return 'failed';
+  }
+
+  let configurationToSave: Configuration;
+  if (latest.status === 'missing') {
+    configurationToSave = configuration;
+  } else if (latest.status === 'pin-required') {
+    configurationToSave = {
+      ...latest.configuration,
+      ...pinSettings,
+      browser: configuration.browser,
+      executablePath: configuration.executablePath,
+      profilePath: configuration.profilePath,
+      messageDestination: latest.configuration.messageDestination ?? messageDestination,
+      cdpPort: latest.configuration.cdpPort ?? configuration.cdpPort,
+      startupUrl: latest.configuration.startupUrl ?? configuration.startupUrl,
+      ...(latest.needsBotTemperamentBackfill === true ? { botTemperament } : {}),
+    };
+  } else {
+    configurationToSave = {
+      ...latest.configuration,
+      browser: configuration.browser,
+      executablePath: configuration.executablePath,
+      profilePath: configuration.profilePath,
+      messageDestination: latest.configuration.messageDestination ?? messageDestination,
+      cdpPort: latest.configuration.cdpPort ?? configuration.cdpPort,
+      startupUrl: latest.configuration.startupUrl ?? configuration.startupUrl,
+      ...(latest.needsBotTemperamentBackfill === true ? { botTemperament } : {}),
+    };
+  }
+
   try {
-    saveConfiguration(configuration, configurationFilePath);
+    saveConfiguration(configurationToSave, configurationFilePath);
   } catch (error) {
     writeError(`Unable to save configuration: ${error instanceof Error ? error.message : String(error)}`);
     return 'failed';

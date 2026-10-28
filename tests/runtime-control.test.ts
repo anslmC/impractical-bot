@@ -13,8 +13,10 @@ import {
   requestRuntimeSetTemperament,
   requestRuntimeSetPersonality,
   requestRuntimeStop,
+  waitForRuntimeShutdown,
   RuntimeAlreadyRunningError,
   RuntimeControlEndpointError,
+  RuntimeControlTimeoutError,
 } from '../src/runtime-control.js';
 
 function readPipeLine(socket: Socket): Promise<string> {
@@ -615,4 +617,99 @@ test('runtime control reports personality as unsupported when no handler is regi
     await sendPersonalityCommand(configurationPath, encodeProtocolText('default'), encodeProtocolText('')),
     /UNSUPPORTED$/,
   );
+});
+
+test('runtime shutdown confirmation waits until the endpoint is no longer owned', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  const control = await createRuntimeControl(configurationPath, () => undefined);
+  context.after(async () => {
+    control.complete(1);
+    await control.close();
+  });
+
+  const whileOwned = await waitForRuntimeShutdown(configurationPath, {
+    timeoutMs: 300,
+    pollIntervalMs: 20,
+  });
+  assert.equal(whileOwned.status, 'unconfirmed');
+  if (whileOwned.status === 'unconfirmed') {
+    assert.match(whileOwned.reason, /still owned/);
+  }
+
+  control.complete(0);
+  await control.close();
+  const afterRelease = await waitForRuntimeShutdown(configurationPath, {
+    timeoutMs: 1_000,
+    pollIntervalMs: 20,
+  });
+  assert.equal(afterRelease.status, 'stopped');
+});
+
+test('runtime stop accepts a response that arrives before its deadline', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  const control = await createRuntimeControl(configurationPath, () => undefined);
+  context.after(async () => {
+    control.complete(1);
+    await control.close();
+  });
+
+  const stop = requestRuntimeStop(configurationPath, { responseTimeoutMs: 5_000 });
+  await new Promise<void>(resolve => setTimeout(resolve, 100));
+  control.complete(0);
+  const result = await stop;
+  assert.equal(result.status, 'stopped');
+});
+
+test('runtime stop times out with a bounded wait and cleans up a nonresponsive endpoint', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  const endpoint = getRuntimeControlEndpoint(configurationPath);
+  let serverSocket: Socket | undefined;
+  const server = createServer(socket => {
+    serverSocket = socket;
+    socket.on('error', () => undefined);
+    socket.write('IMPBOT_RUNTIME/1 11111111-1111-1111-1111-111111111111\n');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(endpoint, resolve);
+  });
+  context.after(async () => {
+    serverSocket?.destroy();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  });
+
+  const startedAt = Date.now();
+  await assert.rejects(
+    requestRuntimeStop(configurationPath, { responseTimeoutMs: 150 }),
+    (error: unknown) => {
+      assert.ok(error instanceof RuntimeControlTimeoutError);
+      assert.match(error.message, /may have stopped/);
+      assert.match(error.message, /not confirmed/);
+      return true;
+    },
+  );
+  assert.ok(Date.now() - startedAt < 5_000);
+
+  // A write on the server side fails with EPIPE only if the client destroyed its
+  // socket, so this proves the timed-out handle was cleaned up rather than left open.
+  assert.ok(serverSocket);
+  const serverSideClosed = new Promise<void>((resolve, reject) => {
+    serverSocket!.write('PROBE\n', error => {
+      if (error) {
+        resolve();
+      } else {
+        reject(new Error('the timed-out stop socket remained open'));
+      }
+    });
+  });
+  await Promise.race([
+    serverSideClosed,
+    new Promise<void>((_, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error('the timed-out stop socket was not cleaned up')),
+        2_000,
+      );
+      timer.unref();
+    }),
+  ]);
 });

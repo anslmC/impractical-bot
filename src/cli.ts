@@ -67,9 +67,15 @@ import {
   requestRuntimeResume,
   requestRuntimeSetTemperament,
   requestRuntimeSetPersonality,
+  requestRuntimeStatus,
   requestRuntimeStop,
   RuntimeAlreadyRunningError,
+  RuntimeControlTimeoutError,
+  waitForRuntimeShutdown,
   type RuntimeControl,
+  type RuntimeShutdownWaitResult,
+  type RuntimeStatusResult,
+  type RuntimeStopResult,
 } from './runtime-control.js';
 
 type Output = (message: string) => void;
@@ -89,6 +95,9 @@ export interface CliRuntimeOptions {
   requestRuntimeChangeDestination?: typeof requestRuntimeChangeDestination;
   requestRuntimeSetTemperament?: typeof requestRuntimeSetTemperament;
   requestRuntimeSetPersonality?: typeof requestRuntimeSetPersonality;
+  requestRuntimeStatus?: typeof requestRuntimeStatus;
+  requestRuntimeStop?: typeof requestRuntimeStop;
+  waitForRuntimeShutdown?: typeof waitForRuntimeShutdown;
   discoverBrowsers?: (options?: BrowserDiscoveryOptions) => Promise<BrowserCandidate[]>;
   browserExecutableExists?: (path: string) => boolean;
 }
@@ -243,6 +252,24 @@ async function handleInit(
   initialize: (options: InitializationOptions) => Promise<InitializationStatus>,
   runtime: CliRuntimeOptions,
 ): Promise<number> {
+  let runtimeStatus: RuntimeStatusResult;
+  try {
+    runtimeStatus = await (runtime.requestRuntimeStatus ?? requestRuntimeStatus)(configurationFilePath);
+  } catch (error) {
+    writeError(
+      'Unable to check whether impractical-bot is running: ' +
+      `${error instanceof Error ? error.message : String(error)}`,
+    );
+    return 1;
+  }
+  if (runtimeStatus.status === 'running') {
+    writeError(
+      'An impractical-bot engine is running for this configuration. Run `impbot stop` before ' +
+      'running `impbot init`; no configuration was changed.',
+    );
+    return 1;
+  }
+
   const status = await initialize({
     configurationFilePath,
     prompt,
@@ -376,6 +403,71 @@ async function updatePuppetName(
   }
 }
 
+// Re-reads the configuration immediately before a write so that values persisted
+// while a prompt or runtime call was in flight are not replaced by a stale snapshot.
+function loadLatestConfiguration(
+  configurationFilePath: string | undefined,
+  writeError: Output,
+  failurePrefix: string,
+): Configuration | undefined {
+  let result;
+  try {
+    result = loadConfiguration(configurationFilePath);
+  } catch (error) {
+    writeError(`${failurePrefix}: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
+
+  if (result.status === 'missing') {
+    writeError(`${failurePrefix}: the configuration file no longer exists.`);
+    return undefined;
+  }
+  if (result.status === 'malformed') {
+    writeError(`${failurePrefix}: ${result.message}`);
+    return undefined;
+  }
+  if (result.status === 'unsupported-version') {
+    writeError(`${failurePrefix}: schema version ${result.version} is not supported.`);
+    return undefined;
+  }
+  if (result.status === 'pin-required') {
+    writeError(`${failurePrefix}: Messenger PIN configuration is required.`);
+    return undefined;
+  }
+  return result.configuration;
+}
+
+function loadChangeBrowserConfiguration(
+  configurationFilePath: string | undefined,
+  writeError: Output,
+): Configuration | undefined {
+  let result;
+  try {
+    result = loadConfiguration(configurationFilePath);
+  } catch (error) {
+    writeError(`Unable to load configuration: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
+
+  if (result.status === 'missing') {
+    writeError('Configuration has not been initialized. Run `impbot init` first.');
+    return undefined;
+  }
+  if (result.status === 'malformed') {
+    writeError(`Configuration is malformed: ${result.message}`);
+    return undefined;
+  }
+  if (result.status === 'unsupported-version') {
+    writeError(`Configuration schema version ${result.version} is not supported.`);
+    return undefined;
+  }
+  if (result.status === 'pin-required') {
+    writeError('Messenger PIN configuration is required. Run `impbot init` to reconfigure it.');
+    return undefined;
+  }
+  return result.configuration;
+}
+
 async function handleChangeBrowser(
   writeOutput: Output,
   writeError: Output,
@@ -383,29 +475,78 @@ async function handleChangeBrowser(
   prompt: TerminalPrompt,
   runtime: CliRuntimeOptions,
 ): Promise<number> {
-  let configurationResult;
-  try {
-    configurationResult = loadConfiguration(configurationFilePath);
-  } catch (error) {
-    writeError(`Unable to load configuration: ${error instanceof Error ? error.message : String(error)}`);
+  let currentConfiguration = loadChangeBrowserConfiguration(configurationFilePath, writeError);
+  if (!currentConfiguration) {
     return 1;
   }
 
-  if (configurationResult.status === 'missing') {
-    writeError('Configuration has not been initialized. Run `impbot init` first.');
+  let runtimeStatus: RuntimeStatusResult;
+  try {
+    runtimeStatus = await (runtime.requestRuntimeStatus ?? requestRuntimeStatus)(configurationFilePath);
+  } catch (error) {
+    writeError(
+      'Unable to check whether impractical-bot is running: ' +
+      `${error instanceof Error ? error.message : String(error)}`,
+    );
     return 1;
   }
-  if (configurationResult.status === 'malformed') {
-    writeError(`Configuration is malformed: ${configurationResult.message}`);
-    return 1;
-  }
-  if (configurationResult.status === 'unsupported-version') {
-    writeError(`Configuration schema version ${configurationResult.version} is not supported.`);
-    return 1;
-  }
-  if (configurationResult.status === 'pin-required') {
-    writeError('Messenger PIN configuration is required. Run `impbot init` to reconfigure it.');
-    return 1;
+
+  // The graceful engine shutdown closes the configured browser, so the browser must
+  // not be closed a second time after shutdown has been confirmed.
+  let browserClosedByEngineShutdown = false;
+  if (runtimeStatus.status === 'running') {
+    let stopResult: RuntimeStopResult;
+    try {
+      stopResult = await (runtime.requestRuntimeStop ?? requestRuntimeStop)(configurationFilePath);
+    } catch (error) {
+      writeError(
+        'Unable to stop the running impractical-bot engine: ' +
+        `${error instanceof Error ? error.message : String(error)}`,
+      );
+      writeError('The browser was not changed. Run `impbot stop` and retry once the engine has exited.');
+      return 1;
+    }
+
+    if (stopResult.status === 'stopped') {
+      let shutdownResult: RuntimeShutdownWaitResult;
+      try {
+        shutdownResult = await (runtime.waitForRuntimeShutdown ?? waitForRuntimeShutdown)(
+          configurationFilePath,
+        );
+      } catch (error) {
+        writeError(
+          'Unable to verify that the impractical-bot engine shut down: ' +
+          `${error instanceof Error ? error.message : String(error)}`,
+        );
+        writeError('The browser was not changed.');
+        return 1;
+      }
+      if (shutdownResult.status !== 'stopped') {
+        writeError(
+          `The impractical-bot engine did not confirm shutdown: ${shutdownResult.reason} ` +
+          'The browser was not changed.',
+        );
+        return 1;
+      }
+
+      writeOutput(`Engine ${stopResult.instanceId} stopped gracefully before the browser change.`);
+
+      const reloadedConfiguration = loadChangeBrowserConfiguration(
+        configurationFilePath,
+        writeError,
+      );
+      if (!reloadedConfiguration) {
+        writeError(
+          'The impractical-bot engine was stopped, but the browser was not changed because the ' +
+          'configuration could not be reloaded.',
+        );
+        return 1;
+      }
+      // Configuration may have been persisted while the engine shut down, so the
+      // reloaded values replace the stale in-memory snapshot for every later step.
+      currentConfiguration = reloadedConfiguration;
+      browserClosedByEngineShutdown = true;
+    }
   }
 
   let candidates: BrowserCandidate[];
@@ -444,7 +585,6 @@ async function handleChangeBrowser(
     return 1;
   }
 
-  const currentConfiguration = configurationResult.configuration;
   let profilePath = currentConfiguration.profilePath;
   if (candidate.browser !== currentConfiguration.browser) {
     try {
@@ -469,11 +609,13 @@ async function handleChangeBrowser(
     ...pinSettings,
   };
 
-  try {
-    await (runtime.closeBrowser ?? closeConfiguredBrowser)(currentConfiguration);
-  } catch (error) {
-    writeError(`Unable to close the current browser: ${error instanceof Error ? error.message : String(error)}`);
-    return 1;
+  if (!browserClosedByEngineShutdown) {
+    try {
+      await (runtime.closeBrowser ?? closeConfiguredBrowser)(currentConfiguration);
+    } catch (error) {
+      writeError(`Unable to close the current browser: ${error instanceof Error ? error.message : String(error)}`);
+      return 1;
+    }
   }
 
   try {
@@ -550,8 +692,19 @@ async function handleChangeGcUrl(
   }
 
   if (result.status === 'not-running') {
+    const latestConfiguration = loadLatestConfiguration(
+      configurationFilePath,
+      writeError,
+      'Unable to save message destination',
+    );
+    if (!latestConfiguration) {
+      return 1;
+    }
     try {
-      saveConfiguration({ ...configuration, messageDestination }, configurationFilePath);
+      saveConfiguration(
+        { ...latestConfiguration, messageDestination },
+        configurationFilePath,
+      );
     } catch (error) {
       writeError(`Unable to save message destination: ${error instanceof Error ? error.message : String(error)}`);
       return 1;
@@ -647,8 +800,19 @@ async function handleSetBotTemperament(
   }
 
   if (result.status === 'not-running') {
+    const latestConfiguration = loadLatestConfiguration(
+      configurationFilePath,
+      writeError,
+      'Unable to save bot temperament',
+    );
+    if (!latestConfiguration) {
+      return 1;
+    }
     try {
-      saveConfiguration({ ...configuration, botTemperament: temperament }, configurationFilePath);
+      saveConfiguration(
+        { ...latestConfiguration, botTemperament: temperament },
+        configurationFilePath,
+      );
     } catch (error) {
       writeError(`Unable to save bot temperament: ${error instanceof Error ? error.message : String(error)}`);
       return 1;
@@ -727,10 +891,18 @@ async function handleSetPersonality(
   }
 
   if (result.status === 'not-running') {
+    const latestConfiguration = loadLatestConfiguration(
+      configurationFilePath,
+      writeError,
+      'Unable to save personality',
+    );
+    if (!latestConfiguration) {
+      return 1;
+    }
     try {
       saveConfiguration(
         {
-          ...configuration,
+          ...latestConfiguration,
           botPersonality: selection.mode,
           customPersonalityInstruction:
             selection.mode === 'custom' ? selection.instruction : undefined,
@@ -1219,6 +1391,25 @@ async function handleUpdateKey(
   configurationFilePath: string | undefined,
   runtime: CliRuntimeOptions,
 ): Promise<number> {
+  let runtimeStatus: RuntimeStatusResult;
+  try {
+    runtimeStatus = await (runtime.requestRuntimeStatus ?? requestRuntimeStatus)(configurationFilePath);
+  } catch (error) {
+    writeError(
+      'Unable to check whether impractical-bot is running: ' +
+      `${error instanceof Error ? error.message : String(error)}`,
+    );
+    return 1;
+  }
+  if (runtimeStatus.status === 'running') {
+    writeError(
+      'An impractical-bot engine is running for this configuration and would keep using the ' +
+      'current NVIDIA API key. Run `impbot stop`, then run `impbot updatekey`, then restart ' +
+      'impractical-bot. The NVIDIA API key was not changed.',
+    );
+    return 1;
+  }
+
   let apiKey: string | null;
   try {
     apiKey = await (runtime.promptSecret ?? promptSecretTerminal)('Enter the replacement NVIDIA API key: ');
@@ -1291,9 +1482,10 @@ async function handleStop(
   writeOutput: Output,
   writeError: Output,
   configurationFilePath: string | undefined,
+  runtime: CliRuntimeOptions,
 ): Promise<number> {
   try {
-    const result = await requestRuntimeStop(configurationFilePath);
+    const result = await (runtime.requestRuntimeStop ?? requestRuntimeStop)(configurationFilePath);
     if (result.status === 'not-running') {
       writeOutput('No impractical-bot engine is running for this configuration.');
       return 0;
@@ -1302,6 +1494,12 @@ async function handleStop(
     return 0;
   } catch (error) {
     writeError(`Unable to stop impractical-bot: ${error instanceof Error ? error.message : String(error)}`);
+    if (error instanceof RuntimeControlTimeoutError) {
+      writeOutput(
+        'The engine may have stopped even though it did not respond. Check that its window has ' +
+        'exited before running `impbot stop` again.',
+      );
+    }
     return 1;
   }
 }
@@ -1375,7 +1573,7 @@ export async function runCli(
     start: () => handleStart(writeOutput, writeError, configurationFilePath, prompt, runtime),
     pause: () => handlePause(writeOutput, writeError, configurationFilePath),
     resume: () => handleResume(writeOutput, writeError, configurationFilePath),
-    stop: () => handleStop(writeOutput, writeError, configurationFilePath),
+    stop: () => handleStop(writeOutput, writeError, configurationFilePath, runtime),
   };
   const handler = command ? handlers[command] : undefined;
 

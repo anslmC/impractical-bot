@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createServer } from 'node:net';
 import { test, type TestContext } from 'node:test';
 import type { Page } from 'playwright';
 import type { InitializationOptions, InitializationStatus, TerminalPrompt } from '../src/browser/initialization.js';
@@ -20,8 +21,11 @@ import type { BackreadResult } from '../src/components/backread.js';
 import type { CombustionController } from '../src/components/combustion.js';
 import { createContextStore } from '../src/components/context-store.js';
 import {
+  getRuntimeControlEndpoint,
   requestRuntimePause,
   requestRuntimeResume,
+  RuntimeControlEndpointError,
+  RuntimeControlTimeoutError,
 } from '../src/runtime-control.js';
 
 async function captureCli(
@@ -860,6 +864,79 @@ test('start does not launch a browser after NVIDIA authentication, network, or s
   }
 });
 
+test('init refuses to run while an engine is running without prompting or initializing', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  let initializeCalls = 0;
+  let promptCalls = 0;
+
+  const result = await captureCli(
+    ['init'],
+    configurationFilePath,
+    async () => {
+      promptCalls += 1;
+      return null;
+    },
+    async () => {
+      initializeCalls += 1;
+      return 'saved';
+    },
+    {
+      requestRuntimeStatus: async path => {
+        assert.equal(path, configurationFilePath);
+        return { status: 'running', instanceId: 'engine-instance' };
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(initializeCalls, 0);
+  assert.equal(promptCalls, 0);
+  assert.match(result.errors[0], /impbot stop/);
+  assert.match(result.errors[0], /no configuration was changed/);
+  assert.deepEqual(loadConfiguration(configurationFilePath), {
+    status: 'valid',
+    configuration: validConfiguration,
+  });
+});
+
+test('init fails closed when runtime status cannot be determined', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  let initializeCalls = 0;
+  let promptCalls = 0;
+
+  const result = await captureCli(
+    ['init'],
+    configurationFilePath,
+    async () => {
+      promptCalls += 1;
+      return null;
+    },
+    async () => {
+      initializeCalls += 1;
+      return 'saved';
+    },
+    {
+      requestRuntimeStatus: async () => {
+        throw new Error('The runtime-control endpoint could not be queried.');
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(initializeCalls, 0);
+  assert.equal(promptCalls, 0);
+  assert.deepEqual(result.errors, [
+    'Unable to check whether impractical-bot is running: ' +
+    'The runtime-control endpoint could not be queried.',
+  ]);
+  assert.deepEqual(loadConfiguration(configurationFilePath), {
+    status: 'valid',
+    configuration: validConfiguration,
+  });
+});
+
 test('init prompts for and saves a missing key after existing setup succeeds', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
@@ -946,7 +1023,7 @@ test('init does not save a key when validation fails', async context => {
   assert.ok(!result.errors.join('\n').includes(submittedKey));
 });
 
-test('updatekey validates a hidden replacement before saving it', async context => {
+test('updatekey validates and saves a replacement key while no engine is running', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
   const environmentFilePath = saveApplicationApiKey(configurationFilePath, 'nvapi-old-key');
@@ -954,6 +1031,7 @@ test('updatekey validates a hidden replacement before saving it', async context 
   let prompted = false;
 
   const result = await captureCli(['updatekey'], configurationFilePath, undefined, undefined, {
+    requestRuntimeStatus: async () => ({ status: 'not-running' }),
     promptSecret: async question => {
       prompted = true;
       assert.match(question, /replacement NVIDIA API key/);
@@ -979,6 +1057,7 @@ test('updatekey preserves the existing key when replacement validation fails', a
   const submittedKey = 'nvapi-rejected-key';
 
   const result = await captureCli(['updatekey'], configurationFilePath, undefined, undefined, {
+    requestRuntimeStatus: async () => ({ status: 'not-running' }),
     promptSecret: async () => submittedKey,
     validateNvidiaApiKey: async () => {
       throw new NvidiaApiKeyError('authentication', 'NVIDIA rejected the API key.');
@@ -1250,6 +1329,488 @@ test('changebrowser leaves configuration untouched when graceful browser closure
     status: 'valid',
     configuration: validConfiguration,
   });
+});
+
+test('changebrowser gracefully stops a running engine before switching browsers', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  const configuration: Configuration = { ...validConfiguration, puppetName: 'Test Puppet' };
+  saveConfiguration(configuration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  context.after(async () => {
+    await captureCli(['stop'], configurationFilePath);
+  });
+  const ready = deferred<void>();
+  const events: string[] = [];
+  let engineCloses = 0;
+  const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
+    launchBrowser: async () => ({
+      endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+      browserVersion: 'Brave Chromium test',
+      disconnected: new Promise<void>(() => undefined),
+      async prepare() {
+        return stubPage;
+      },
+      async disconnect() {
+        events.push('playwright-disconnected');
+      },
+    }),
+    closeBrowser: async () => {
+      engineCloses += 1;
+      events.push('engine-closed-browser');
+    },
+    readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+  }, message => {
+    if (message.startsWith('Engine ready')) ready.resolve();
+  });
+  await ready.promise;
+
+  let changeBrowserCloses = 0;
+  const answers = ['y', 'n', '000042'];
+  const changed = await captureCli(
+    ['changebrowser'],
+    configurationFilePath,
+    async () => answers.shift() ?? null,
+    undefined,
+    {
+      discoverBrowsers: async () => {
+        events.push('discovery');
+        return [{
+          browser: 'chrome',
+          displayName: 'Google Chrome',
+          executablePath: 'C:\\Portable\\chrome.exe',
+        }];
+      },
+      browserExecutableExists: () => true,
+      closeBrowser: async () => {
+        changeBrowserCloses += 1;
+        events.push('changebrowser-closed-browser');
+      },
+    },
+    message => {
+      if (message.startsWith('Engine ')) events.push('stop-confirmed');
+    },
+  );
+
+  assert.equal(changed.exitCode, 0);
+  assert.equal((await start).exitCode, 0);
+  assert.match(changed.output[0], /stopped gracefully before the browser change/);
+  assert.deepEqual(events, [
+    'playwright-disconnected',
+    'engine-closed-browser',
+    'stop-confirmed',
+    'discovery',
+  ]);
+  // The engine shutdown already closed the browser, so it must not be closed again.
+  assert.equal(engineCloses, 1);
+  assert.equal(changeBrowserCloses, 0);
+  const afterChange = loadConfiguration(configurationFilePath);
+  assert.equal(afterChange.status, 'valid');
+  if (afterChange.status === 'valid') {
+    assert.equal(afterChange.configuration.browser, 'chrome');
+    assert.equal(afterChange.configuration.executablePath, 'C:\\Portable\\chrome.exe');
+  }
+});
+
+test('changebrowser reloads configuration persisted during engine shutdown', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  const reloadedProfilePath = join(dirname(configurationFilePath), 'reloaded-brave-profile');
+  let stopRequests = 0;
+  let closes = 0;
+  const answers = ['y', 'n', '000042'];
+
+  const result = await captureCli(
+    ['changebrowser'],
+    configurationFilePath,
+    async () => answers.shift() ?? null,
+    undefined,
+    {
+      requestRuntimeStatus: async () => ({ status: 'running', instanceId: 'engine-instance' }),
+      requestRuntimeStop: async () => {
+        stopRequests += 1;
+        // Another process persists newer configuration while the engine shuts down.
+        saveConfiguration({
+          ...validConfiguration,
+          puppetName: 'Persisted During Shutdown',
+          profilePath: reloadedProfilePath,
+          botTemperament: 'talkative',
+        }, configurationFilePath);
+        return { status: 'stopped', instanceId: 'engine-instance' };
+      },
+      waitForRuntimeShutdown: async () => ({ status: 'stopped' }),
+      discoverBrowsers: async () => [{
+        browser: 'brave',
+        displayName: 'Brave Browser',
+        executablePath: validConfiguration.executablePath,
+      }],
+      browserExecutableExists: () => true,
+      closeBrowser: async () => {
+        closes += 1;
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(stopRequests, 1);
+  // The engine shutdown already closed the browser, so it must not be closed again.
+  assert.equal(closes, 0);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.puppetName, 'Persisted During Shutdown');
+    assert.equal(saved.configuration.botTemperament, 'talkative');
+    // The reloaded profile path is the source of truth for the unchanged browser.
+    assert.equal(saved.configuration.profilePath, reloadedProfilePath);
+    assert.equal(saved.configuration.skipPinRestoration, false);
+    assert.equal(saved.configuration.pin, '000042');
+  }
+});
+
+test('changebrowser aborts when configuration cannot be reloaded after shutdown', async context => {
+  const scenarios = ['malformed', 'missing'] as const;
+
+  for (const scenario of scenarios) {
+    const configurationFilePath = createTemporaryConfigPath(context);
+    saveConfiguration(validConfiguration, configurationFilePath);
+    let discoveryCalls = 0;
+    let closes = 0;
+
+    const result = await captureCli(
+      ['changebrowser'],
+      configurationFilePath,
+      undefined,
+      undefined,
+      {
+        requestRuntimeStatus: async () => ({ status: 'running', instanceId: 'engine-instance' }),
+        requestRuntimeStop: async () => {
+          if (scenario === 'malformed') {
+            writeFileSync(configurationFilePath, '{not json', 'utf8');
+          } else {
+            rmSync(configurationFilePath, { force: true });
+          }
+          return { status: 'stopped', instanceId: 'engine-instance' };
+        },
+        waitForRuntimeShutdown: async () => ({ status: 'stopped' }),
+        discoverBrowsers: async () => {
+          discoveryCalls += 1;
+          return [];
+        },
+        browserExecutableExists: () => true,
+        closeBrowser: async () => {
+          closes += 1;
+        },
+      },
+    );
+
+    assert.equal(result.exitCode, 1, scenario);
+    assert.equal(discoveryCalls, 0, scenario);
+    assert.equal(closes, 0, scenario);
+    assert.match(
+      result.errors[result.errors.length - 1],
+      /browser was not changed because the configuration could not be reloaded/,
+    );
+    if (scenario === 'malformed') {
+      assert.equal(readFileSync(configurationFilePath, 'utf8'), '{not json');
+    } else {
+      assert.equal(existsSync(configurationFilePath), false);
+    }
+  }
+});
+
+test('changebrowser reports a runtime-control failure without closing the browser or changing configuration', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  const endpoint = getRuntimeControlEndpoint(configurationFilePath);
+  const unrelatedServer = createServer(socket => {
+    socket.on('error', () => undefined);
+    socket.write('UNRELATED/1\n');
+  });
+  await new Promise<void>((resolve, reject) => {
+    unrelatedServer.once('error', reject);
+    unrelatedServer.listen(endpoint, resolve);
+  });
+  context.after(async () => {
+    await new Promise<void>(resolve => unrelatedServer.close(() => resolve()));
+  });
+
+  let closes = 0;
+  const result = await captureCli(
+    ['changebrowser'],
+    configurationFilePath,
+    async () => {
+      throw new Error('changebrowser must not prompt when the runtime check fails');
+    },
+    undefined,
+    {
+      discoverBrowsers: async () => [],
+      browserExecutableExists: () => true,
+      closeBrowser: async () => {
+        closes += 1;
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.errors[0], /Unable to check whether impractical-bot is running/);
+  assert.match(result.errors[0], /not owned by an impractical-bot engine/);
+  assert.equal(closes, 0);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.deepEqual(saved.configuration, validConfiguration);
+  }
+});
+
+test('updatekey refuses while an engine is running without prompting or changing the stored key', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  const environmentFilePath = saveApplicationApiKey(configurationFilePath, 'nvapi-active-key');
+  const originalContent = readFileSync(environmentFilePath, 'utf8');
+  let promptCalls = 0;
+  let validationCalls = 0;
+
+  const result = await captureCli(['updatekey'], configurationFilePath, undefined, undefined, {
+    requestRuntimeStatus: async path => {
+      assert.equal(path, configurationFilePath);
+      return { status: 'running', instanceId: 'engine-instance' };
+    },
+    promptSecret: async () => {
+      promptCalls += 1;
+      return 'nvapi-replacement-key';
+    },
+    validateNvidiaApiKey: async () => {
+      validationCalls += 1;
+    },
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(promptCalls, 0);
+  assert.equal(validationCalls, 0);
+  assert.equal(readFileSync(environmentFilePath, 'utf8'), originalContent);
+  assert.match(result.errors[0], /impbot stop/);
+  assert.match(result.errors[0], /impbot updatekey/);
+  assert.match(result.errors[0], /restart/);
+  assert.deepEqual(result.output, []);
+  assert.ok(!result.errors.join('\n').includes('nvapi-active-key'));
+});
+
+test('updatekey leaves the stored key untouched when runtime status cannot be established', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  const environmentFilePath = saveApplicationApiKey(configurationFilePath, 'nvapi-active-key');
+  const originalContent = readFileSync(environmentFilePath, 'utf8');
+  let promptCalls = 0;
+
+  const result = await captureCli(['updatekey'], configurationFilePath, undefined, undefined, {
+    requestRuntimeStatus: async () => {
+      throw new Error('The runtime-control endpoint could not be queried.');
+    },
+    promptSecret: async () => {
+      promptCalls += 1;
+      return 'nvapi-replacement-key';
+    },
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(promptCalls, 0);
+  assert.equal(readFileSync(environmentFilePath, 'utf8'), originalContent);
+  assert.deepEqual(result.errors, [
+    'Unable to check whether impractical-bot is running: ' +
+    'The runtime-control endpoint could not be queried.',
+  ]);
+});
+
+test('changebrowser skips the stop request when no engine is running', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  let stopRequests = 0;
+  let shutdownWaits = 0;
+  let closes = 0;
+  const answers = ['y', 'n', '000042'];
+
+  const result = await captureCli(
+    ['changebrowser'],
+    configurationFilePath,
+    async () => answers.shift() ?? null,
+    undefined,
+    {
+      requestRuntimeStatus: async path => {
+        assert.equal(path, configurationFilePath);
+        return { status: 'not-running' };
+      },
+      requestRuntimeStop: async () => {
+        stopRequests += 1;
+        return { status: 'not-running' };
+      },
+      waitForRuntimeShutdown: async () => {
+        shutdownWaits += 1;
+        return { status: 'stopped' };
+      },
+      discoverBrowsers: async () => [{
+        browser: 'edge',
+        displayName: 'Microsoft Edge',
+        executablePath: 'C:\\Portable\\msedge.exe',
+      }],
+      browserExecutableExists: () => true,
+      closeBrowser: async () => {
+        closes += 1;
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(stopRequests, 0);
+  assert.equal(shutdownWaits, 0);
+  assert.equal(closes, 1);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.browser, 'edge');
+    assert.equal(saved.configuration.executablePath, 'C:\\Portable\\msedge.exe');
+  }
+});
+
+test('changebrowser aborts without switching browsers when the engine cannot be stopped', async context => {
+  const failures = [
+    new RuntimeControlEndpointError(
+      'The engine received the stop request but shutdown failed (exit code 1).',
+    ),
+    new RuntimeControlEndpointError('Timed out waiting for the runtime-control response.'),
+    new RuntimeControlTimeoutError(
+      'Timed out waiting for the runtime-control stop response; the engine may have ' +
+      'stopped, so shutdown is not confirmed.',
+    ),
+  ];
+
+  for (const failure of failures) {
+    const label = failure.message;
+    const configurationFilePath = createTemporaryConfigPath(context);
+    saveConfiguration(validConfiguration, configurationFilePath);
+    let stopRequests = 0;
+    let shutdownWaits = 0;
+    let discoveryCalls = 0;
+    let closes = 0;
+    let promptCalls = 0;
+
+    const result = await captureCli(
+      ['changebrowser'],
+      configurationFilePath,
+      async () => {
+        promptCalls += 1;
+        return null;
+      },
+      undefined,
+      {
+        requestRuntimeStatus: async () => ({ status: 'running', instanceId: 'engine-instance' }),
+        requestRuntimeStop: async () => {
+          stopRequests += 1;
+          throw failure;
+        },
+        waitForRuntimeShutdown: async () => {
+          shutdownWaits += 1;
+          return { status: 'stopped' };
+        },
+        discoverBrowsers: async () => {
+          discoveryCalls += 1;
+          return [];
+        },
+        browserExecutableExists: () => true,
+        closeBrowser: async () => {
+          closes += 1;
+        },
+      },
+    );
+
+    assert.equal(result.exitCode, 1, label);
+    assert.equal(stopRequests, 1, label);
+    assert.equal(shutdownWaits, 0, label);
+    assert.equal(discoveryCalls, 0, label);
+    assert.equal(closes, 0, label);
+    assert.equal(promptCalls, 0, label);
+    assert.match(result.errors[0], /Unable to stop the running impractical-bot engine/);
+    assert.ok(result.errors[0].includes(label));
+    assert.deepEqual(loadConfiguration(configurationFilePath), {
+      status: 'valid',
+      configuration: validConfiguration,
+    });
+  }
+});
+
+test('changebrowser aborts when engine shutdown cannot be verified without retrying the stop request', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  let stopRequests = 0;
+  let shutdownWaits = 0;
+  let discoveryCalls = 0;
+  let closes = 0;
+  let promptCalls = 0;
+
+  const result = await captureCli(
+    ['changebrowser'],
+    configurationFilePath,
+    async () => {
+      promptCalls += 1;
+      return null;
+    },
+    undefined,
+    {
+      requestRuntimeStatus: async () => ({ status: 'running', instanceId: 'engine-instance' }),
+      requestRuntimeStop: async () => {
+        stopRequests += 1;
+        return { status: 'stopped', instanceId: 'engine-instance' };
+      },
+      waitForRuntimeShutdown: async () => {
+        shutdownWaits += 1;
+        return {
+          status: 'unconfirmed',
+          reason: 'The runtime endpoint is still owned by a running engine.',
+        };
+      },
+      discoverBrowsers: async () => {
+        discoveryCalls += 1;
+        return [];
+      },
+      browserExecutableExists: () => true,
+      closeBrowser: async () => {
+        closes += 1;
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(stopRequests, 1);
+  assert.equal(shutdownWaits, 1);
+  assert.equal(discoveryCalls, 0);
+  assert.equal(closes, 0);
+  assert.equal(promptCalls, 0);
+  assert.match(result.errors[0], /did not confirm shutdown/);
+  assert.match(result.errors[0], /still owned/);
+  assert.deepEqual(loadConfiguration(configurationFilePath), {
+    status: 'valid',
+    configuration: validConfiguration,
+  });
+});
+
+test('stop reports a bounded stop-response timeout without claiming shutdown', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  const timeoutMessage =
+    'Timed out waiting for the runtime-control stop response; the engine may have ' +
+    'stopped, so shutdown is not confirmed.';
+
+  const result = await captureCli(['stop'], configurationFilePath, undefined, undefined, {
+    requestRuntimeStop: async () => {
+      throw new RuntimeControlTimeoutError(timeoutMessage);
+    },
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(result.output, [
+    'The engine may have stopped even though it did not respond. Check that its window has ' +
+    'exited before running `impbot stop` again.',
+  ]);
+  assert.deepEqual(result.errors, [`Unable to stop impractical-bot: ${timeoutMessage}`]);
 });
 
 test('stop reports clearly when no engine is running', async context => {
@@ -1831,6 +2392,170 @@ test('changegcUrl cancellation and invalid input retain the configured destinati
     status: 'valid',
     configuration: validConfiguration,
   });
+});
+
+test('changegcUrl preserves configuration persisted while the destination prompt is open', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, filePath);
+  const destination = 'https://www.facebook.com/messages/t/987654321';
+  const concurrent = {
+    ...validConfiguration,
+    puppetName: 'Concurrent Puppet',
+    botTemperament: 'talkative' as const,
+  };
+  let promptCalls = 0;
+
+  const result = await captureCli(
+    ['changegcUrl'],
+    filePath,
+    async () => {
+      promptCalls += 1;
+      saveConfiguration(concurrent, filePath);
+      return destination;
+    },
+    undefined,
+    {
+      requestRuntimeChangeDestination: async () => ({ status: 'not-running' }),
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(promptCalls, 1);
+  const saved = loadConfiguration(filePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.messageDestination, destination);
+    assert.equal(saved.configuration.puppetName, 'Concurrent Puppet');
+    assert.equal(saved.configuration.botTemperament, 'talkative');
+  }
+});
+
+test('setbottemp preserves configuration persisted while the temperament prompt is open', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  const concurrentDestination = 'https://www.facebook.com/messages/t/555555555';
+  const concurrent = {
+    ...validConfiguration,
+    puppetName: 'Concurrent Puppet',
+    messageDestination: concurrentDestination,
+  };
+  let promptCalls = 0;
+
+  const result = await captureCli(
+    ['setbottemp'],
+    configurationFilePath,
+    async () => {
+      promptCalls += 1;
+      saveConfiguration(concurrent, configurationFilePath);
+      return '3';
+    },
+    undefined,
+    {
+      requestRuntimeSetTemperament: async () => ({ status: 'not-running' }),
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(promptCalls, 1);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.botTemperament, 'talkative');
+    assert.equal(saved.configuration.puppetName, 'Concurrent Puppet');
+    assert.equal(saved.configuration.messageDestination, concurrentDestination);
+  }
+});
+
+test('setpersonality preserves configuration persisted while the personality prompts are open', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  const concurrent = {
+    ...validConfiguration,
+    puppetName: 'Concurrent Puppet',
+    botTemperament: 'talkative' as const,
+  };
+  const answers = ['custom', 'Sarcastic.', '.'];
+  let promptCalls = 0;
+
+  const result = await captureCli(
+    ['setpersonality'],
+    configurationFilePath,
+    async question => {
+      promptCalls += 1;
+      if (promptCalls === 1) {
+        assert.match(question, /personality/i);
+        saveConfiguration(concurrent, configurationFilePath);
+      }
+      return answers.shift() ?? null;
+    },
+    undefined,
+    {
+      requestRuntimeSetPersonality: async () => ({ status: 'not-running' }),
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.botPersonality, 'custom');
+    assert.equal(saved.configuration.customPersonalityInstruction, 'Sarcastic.');
+    assert.equal(saved.configuration.puppetName, 'Concurrent Puppet');
+    assert.equal(saved.configuration.botTemperament, 'talkative');
+  }
+});
+
+test('stale-write commands abort without writing when the configuration cannot be reloaded', async context => {
+  const cases: { command: string; answer: string; runtime: CliRuntimeOptions }[] = [
+    {
+      command: 'changegcUrl',
+      answer: 'https://www.facebook.com/messages/t/987654321',
+      runtime: {
+        requestRuntimeChangeDestination: async () => ({ status: 'not-running' }),
+      },
+    },
+    {
+      command: 'setbottemp',
+      answer: '3',
+      runtime: {
+        requestRuntimeSetTemperament: async () => ({ status: 'not-running' }),
+      },
+    },
+    {
+      command: 'setpersonality',
+      answer: 'default',
+      runtime: {
+        requestRuntimeSetPersonality: async () => ({ status: 'not-running' }),
+      },
+    },
+  ];
+
+  for (const { command, answer, runtime } of cases) {
+    const filePath = createTemporaryConfigPath(context);
+    saveConfiguration(validConfiguration, filePath);
+    let promptCalls = 0;
+
+    const result = await captureCli(
+      [command],
+      filePath,
+      async () => {
+        promptCalls += 1;
+        writeFileSync(filePath, '{not json', 'utf8');
+        return answer;
+      },
+      undefined,
+      runtime,
+    );
+
+    assert.equal(result.exitCode, 1, command);
+    assert.equal(promptCalls, 1, command);
+    assert.match(
+      result.errors[0],
+      /Unable to save (message destination|bot temperament|personality)/,
+      command,
+    );
+    assert.equal(readFileSync(filePath, 'utf8'), '{not json', command);
+  }
 });
 
 test('setbottemp while stopped persists the selection without launching a browser or engine', async context => {

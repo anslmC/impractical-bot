@@ -637,3 +637,113 @@ test('multiline personality collection rejects an empty block and supports cance
   );
   assert.equal(trimmed, 'padded');
 });
+
+test('init backfill preserves configuration persisted while prompts are open', async context => {
+  const filePath = createConfigurationPath(context);
+  const legacyConfiguration: Record<string, unknown> = { ...existingConfiguration };
+  delete legacyConfiguration.botTemperament;
+  writeFileSync(filePath, JSON.stringify(legacyConfiguration));
+
+  const concurrent = {
+    ...existingConfiguration,
+    puppetName: 'Concurrent Puppet',
+    botTemperament: 'talkative' as const,
+    messageDestination: 'https://www.facebook.com/messages/t/777777777',
+  };
+  const options = createOptions(filePath, { installedPaths: [bravePath] });
+  let prompts = 0;
+  options.prompt = async question => {
+    prompts += 1;
+    assert.match(question, /temperament/i);
+    saveConfiguration(concurrent, filePath);
+    return '1';
+  };
+
+  assert.equal(await initializeConfiguration(options), 'saved');
+  assert.equal(prompts, 1);
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    // The concurrently persisted values win over the stale backfill snapshot.
+    assert.equal(loaded.configuration.botTemperament, 'talkative');
+    assert.equal(loaded.configuration.puppetName, 'Concurrent Puppet');
+    assert.equal(
+      loaded.configuration.messageDestination,
+      'https://www.facebook.com/messages/t/777777777',
+    );
+  }
+});
+
+test('init PIN-restoration backfill preserves unrelated concurrent updates', async context => {
+  const filePath = createConfigurationPath(context);
+  const pinRequiredConfiguration: Record<string, unknown> = {
+    ...existingConfiguration,
+    skipPinRestoration: false,
+  };
+  delete pinRequiredConfiguration.pin;
+  writeFileSync(filePath, JSON.stringify(pinRequiredConfiguration));
+
+  const concurrent = {
+    ...pinRequiredConfiguration,
+    puppetName: 'Concurrent Puppet',
+    messageDestination: 'https://www.facebook.com/messages/t/888888888',
+  };
+  const options = createOptions(filePath, { installedPaths: [bravePath], answers: ['n', '000042'] });
+  const basePrompt = options.prompt;
+  let prompts = 0;
+  options.prompt = async question => {
+    prompts += 1;
+    if (prompts === 1) {
+      // A concurrent writer changes unrelated fields but leaves the PIN unset.
+      writeFileSync(filePath, JSON.stringify(concurrent));
+    }
+    return basePrompt(question);
+  };
+
+  assert.equal(await initializeConfiguration(options), 'saved');
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.equal(loaded.configuration.pin, '000042');
+    assert.equal(loaded.configuration.skipPinRestoration, false);
+    assert.equal(loaded.configuration.puppetName, 'Concurrent Puppet');
+    assert.equal(
+      loaded.configuration.messageDestination,
+      'https://www.facebook.com/messages/t/888888888',
+    );
+  }
+});
+
+test('fresh init aborts rather than overwriting a configuration created while prompts are open', async context => {
+  const filePath = createConfigurationPath(context);
+  const concurrent = { ...existingConfiguration, puppetName: 'Concurrent Puppet' };
+  const answers = [
+    'y',
+    'https://example.test/messages',
+    'n',
+    '000042',
+    '1',
+    'default',
+  ];
+  const errors: string[] = [];
+  const options = createOptions(filePath, {
+    installedPaths: [bravePath],
+    answers,
+    errors,
+  });
+  let wroteConcurrent = false;
+  options.prompt = async question => {
+    if (/Select this browser/.test(question) && !wroteConcurrent) {
+      wroteConcurrent = true;
+      saveConfiguration(concurrent, filePath);
+    }
+    return answers.shift() ?? null;
+  };
+
+  assert.equal(await initializeConfiguration(options), 'failed');
+  assert.match(
+    errors.join('\n'),
+    /configuration changed while prompts were open/,
+  );
+  assert.deepEqual(loadConfiguration(filePath), { status: 'valid', configuration: concurrent });
+});

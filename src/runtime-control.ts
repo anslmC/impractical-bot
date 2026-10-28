@@ -6,6 +6,9 @@ import { resolveConfigurationPaths, isBotTemperament, isBotPersonalityMode, type
 const PROTOCOL = 'IMPBOT_RUNTIME/1';
 const HANDSHAKE_TIMEOUT_MS = 5_000;
 const MAX_LINE_LENGTH = 65_536;
+const SHUTDOWN_CONFIRMATION_TIMEOUT_MS = 30_000;
+const SHUTDOWN_CONFIRMATION_POLL_INTERVAL_MS = 100;
+const STOP_RESPONSE_TIMEOUT_MS = 30_000;
 
 export class RuntimeAlreadyRunningError extends Error {
   constructor() {
@@ -18,6 +21,13 @@ export class RuntimeControlEndpointError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'RuntimeControlEndpointError';
+  }
+}
+
+export class RuntimeControlTimeoutError extends RuntimeControlEndpointError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RuntimeControlTimeoutError';
   }
 }
 
@@ -161,7 +171,7 @@ function readLine(socket: Socket, timeoutMs = HANDSHAKE_TIMEOUT_MS): Promise<str
     };
     const onError = (error: Error): void => finish(error);
     const onClose = (): void => finish(new RuntimeControlEndpointError('Runtime-control connection closed unexpectedly.'));
-    const onTimeout = (): void => finish(new RuntimeControlEndpointError('Timed out waiting for the runtime-control response.'));
+    const onTimeout = (): void => finish(new RuntimeControlTimeoutError('Timed out waiting for the runtime-control response.'));
 
     socket.on('data', onData);
     socket.once('error', onError);
@@ -755,6 +765,40 @@ export async function requestRuntimeSetPersonality(
   }
 }
 
+export type RuntimeStatusResult =
+  | { status: 'running'; instanceId: string }
+  | { status: 'not-running' };
+
+// Reads the owner greeting without sending a command, so a running engine can be
+// detected without pausing, stopping, or otherwise changing its state.
+export async function requestRuntimeStatus(
+  configurationFilePath?: string,
+): Promise<RuntimeStatusResult> {
+  if (process.platform !== 'win32') {
+    throw new RuntimeControlEndpointError('Runtime control is only supported on Windows.');
+  }
+
+  const endpoint = getRuntimeControlEndpoint(configurationFilePath);
+  const socket = createConnection(endpoint);
+  try {
+    const greeting = await readLine(socket);
+    const match = greeting.match(new RegExp(`^${PROTOCOL} ([0-9a-f-]{36})$`, 'i'));
+    if (!match) {
+      throw new RuntimeControlEndpointError(
+        'The runtime-control endpoint is not owned by an impractical-bot engine.',
+      );
+    }
+    return { status: 'running', instanceId: match[1] };
+  } catch (error) {
+    if (isPipeMissing(error)) {
+      return { status: 'not-running' };
+    }
+    throw error;
+  } finally {
+    socket.destroy();
+  }
+}
+
 export async function requestRuntimePause(
   configurationFilePath?: string,
 ): Promise<RuntimePauseResult> {
@@ -773,11 +817,21 @@ export async function requestRuntimeResume(
     : { status: 'resumed', instanceId: result.instanceId };
 }
 
+export interface RuntimeStopOptions {
+  responseTimeoutMs?: number;
+}
+
 export async function requestRuntimeStop(
   configurationFilePath?: string,
+  options: RuntimeStopOptions = {},
 ): Promise<RuntimeStopResult> {
   if (process.platform !== 'win32') {
     throw new RuntimeControlEndpointError('Runtime control is only supported on Windows.');
+  }
+
+  const responseTimeoutMs = options.responseTimeoutMs ?? STOP_RESPONSE_TIMEOUT_MS;
+  if (responseTimeoutMs <= 0) {
+    throw new RuntimeControlEndpointError('Runtime stop response timeout must be positive.');
   }
 
   const endpoint = getRuntimeControlEndpoint(configurationFilePath);
@@ -802,7 +856,18 @@ export async function requestRuntimeStop(
 
     socket.setTimeout(0);
     socket.write(`STOP ${instanceId}\n`);
-    const response = await readLine(socket, 0);
+    let response: string;
+    try {
+      response = await readLine(socket, responseTimeoutMs);
+    } catch (error) {
+      if (error instanceof RuntimeControlTimeoutError) {
+        throw new RuntimeControlTimeoutError(
+          'Timed out waiting for the runtime-control stop response; the engine may have ' +
+          'stopped, so shutdown is not confirmed.',
+        );
+      }
+      throw error;
+    }
     if (response === `STOPPED ${instanceId} 0` || response === `STOPPED ${instanceId} 130`) {
       return { status: 'stopped', instanceId };
     }
@@ -819,5 +884,61 @@ export async function requestRuntimeStop(
     throw error;
   } finally {
     socket.destroy();
+  }
+}
+
+export type RuntimeShutdownWaitResult =
+  | { status: 'stopped' }
+  | { status: 'unconfirmed'; reason: string };
+
+export interface RuntimeShutdownWaitOptions {
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+  now?: () => number;
+  delay?: (milliseconds: number) => Promise<void>;
+}
+
+// A successful stop response is written before the owner releases its endpoint, so
+// shutdown is confirmed by observing that the endpoint is no longer owned rather
+// than assuming it from the stop request alone.
+export async function waitForRuntimeShutdown(
+  configurationFilePath?: string,
+  options: RuntimeShutdownWaitOptions = {},
+): Promise<RuntimeShutdownWaitResult> {
+  const timeoutMs = options.timeoutMs ?? SHUTDOWN_CONFIRMATION_TIMEOUT_MS;
+  const pollIntervalMs = options.pollIntervalMs ?? SHUTDOWN_CONFIRMATION_POLL_INTERVAL_MS;
+  if (timeoutMs <= 0 || pollIntervalMs <= 0) {
+    throw new RuntimeControlEndpointError(
+      'Runtime shutdown confirmation timeout and polling interval must be positive.',
+    );
+  }
+
+  const now = options.now ?? Date.now;
+  const delay = options.delay ?? ((milliseconds: number) => new Promise<void>(resolve => {
+    setTimeout(resolve, milliseconds);
+  }));
+  const deadline = now() + timeoutMs;
+  let lastError: string | undefined;
+
+  while (true) {
+    try {
+      const status = await requestRuntimeStatus(configurationFilePath);
+      if (status.status === 'not-running') {
+        return { status: 'stopped' };
+      }
+      lastError = undefined;
+    } catch (error) {
+      // Endpoint teardown can interrupt an individual probe; keep waiting to the deadline.
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+
+    const remaining = deadline - now();
+    if (remaining <= 0) {
+      return {
+        status: 'unconfirmed',
+        reason: lastError ?? 'The runtime endpoint is still owned by a running engine.',
+      };
+    }
+    await delay(Math.min(pollIntervalMs, remaining));
   }
 }

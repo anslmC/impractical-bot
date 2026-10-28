@@ -1072,6 +1072,123 @@ test('attaches to an existing profile browser with a usable CDP endpoint', async
   assert.equal(server.listening, true);
 });
 
+test('closes the browser spawned by a failed attachment attempt and preserves the attachment error', async t => {
+  const port = await getAvailablePort();
+  const config = { ...baseConfiguration, cdpPort: port };
+  const { server, start } = createCdpServer();
+  t.after(async () => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
+  const child = new FakeProcess();
+  const attachError = new Error('CDP attachment failed');
+  const closedProcessIds: number[][] = [];
+  let processScans = 0;
+
+  const failure = await launchConfiguredBrowser(config, {
+    platform: 'win32',
+    fileSystem: new FakeFileSystem(),
+    findProfileProcesses: async () => {
+      processScans += 1;
+      // 1: nothing owns the profile yet; 2-4: the launched process is verified
+      // as owned and closed; 5+: the close request ended the browser process.
+      return processScans >= 2 && processScans <= 4 ? [child.pid] : [];
+    },
+    spawnProcess: () => {
+      void start(port);
+      return child;
+    },
+    connectOverCDP: async () => {
+      throw attachError;
+    },
+    requestProcessClose: async processIds => {
+      closedProcessIds.push([...processIds]);
+    },
+  }).then(
+    () => assert.fail('expected the attachment to fail'),
+    (error: unknown) => error,
+  );
+
+  assert.equal(failure, attachError);
+  assert.deepEqual(closedProcessIds, [[child.pid]]);
+  assert.equal(child.exited, false);
+});
+
+test('does not close a browser that the failed launch attempt does not own', async t => {
+  const port = await getAvailablePort();
+  const config = { ...baseConfiguration, cdpPort: port };
+  const { server, start } = createCdpServer();
+  t.after(async () => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
+  const child = new FakeProcess();
+  let processScans = 0;
+  let processCloseRequests = 0;
+
+  await assert.rejects(
+    launchConfiguredBrowser(config, {
+      platform: 'win32',
+      fileSystem: new FakeFileSystem(),
+      findProfileProcesses: async () => {
+        processScans += 1;
+        // The profile is free before the launch, then held by a process that is
+        // not the one this attempt spawned, so cleanup must leave it alone.
+        return processScans === 1 ? [] : [9876];
+      },
+      spawnProcess: () => {
+        void start(port);
+        return child;
+      },
+      connectOverCDP: async () => {
+        throw new Error('must not attach');
+      },
+      requestProcessClose: async () => {
+        processCloseRequests += 1;
+      },
+    }),
+    /Unable to verify that the launched process owns the configured CDP endpoint/,
+  );
+
+  assert.equal(processCloseRequests, 0);
+  assert.equal(child.exited, false);
+});
+
+test('reports a failed cleanup without replacing the attachment error', async t => {
+  const port = await getAvailablePort();
+  const config = { ...baseConfiguration, cdpPort: port };
+  const { server, start } = createCdpServer();
+  t.after(async () => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
+  const child = new FakeProcess();
+  const attachError = new Error('CDP attachment failed');
+  const cleanupError = new Error('graceful close failed');
+  let processScans = 0;
+
+  const failure = await launchConfiguredBrowser(config, {
+    platform: 'win32',
+    fileSystem: new FakeFileSystem(),
+    findProfileProcesses: async () => {
+      processScans += 1;
+      return processScans >= 2 && processScans <= 4 ? [child.pid] : [];
+    },
+    spawnProcess: () => {
+      void start(port);
+      return child;
+    },
+    connectOverCDP: async () => {
+      throw attachError;
+    },
+    requestProcessClose: async () => {
+      throw cleanupError;
+    },
+  }).then(
+    () => assert.fail('expected the attachment to fail'),
+    (error: unknown) => error,
+  );
+
+  assert.ok(failure instanceof Error);
+  if (failure instanceof Error) {
+    assert.match(failure.message, /CDP attachment failed/);
+    assert.match(failure.message, /could not be closed: graceful close failed/);
+    assert.equal(failure.cause, attachError);
+  }
+  assert.equal(child.exited, false);
+});
+
 test('graceful close targets only the configured executable and profile, then verifies process exit', async () => {
   let processScans = 0;
   let closeTargets: number[] = [];
