@@ -348,6 +348,7 @@ async function main() {
   let idleDeadline;
   let wakePending = false;
   let wakeSignal = createWakeSignal();
+  let wakerTransition = Promise.resolve();
   const contextStore = createContextStore({ maxMessages: CONTEXT_STORE_CAPACITY });
   let packetScheduler;
   let packetBuilderState;
@@ -402,26 +403,29 @@ async function main() {
   };
   process.on('SIGINT', onInterrupt);
 
-  const setWakerActive = async active => {
-    if (!observerAttached || wakerActive === active) {
-      return;
-    }
-    wakerActive = active;
-    console.log(active
-      ? '[waker] Active; listening for potential message activity.'
-      : '[waker] Standby; poller is responsible for checking messages.');
-    try {
-      await page.evaluate(isActive => {
-        const observer = window.__impracticalBotWakerObserver;
-        if (observer) {
-          observer.active = isActive;
-        }
-      }, active);
-    } catch (error) {
-      if (!stopRequested) {
-        console.error(`[waker] Could not update observer state: ${error.message}`);
+  const setWakerActive = active => {
+    wakerTransition = wakerTransition.then(async () => {
+      if (!observerAttached || stopRequested || wakerActive === active) {
+        return;
       }
-    }
+      try {
+        await page.evaluate(isActive => {
+          const observer = window.__impracticalBotWakerObserver;
+          if (observer) {
+            observer.active = isActive;
+          }
+        }, active);
+        wakerActive = active;
+        console.log(active
+          ? '[waker] Active; listening for potential message activity.'
+          : '[waker] Standby; poller is responsible for checking messages.');
+      } catch (error) {
+        if (!stopRequested) {
+          console.error(`[waker] Could not update observer state: ${error.message}`);
+        }
+      }
+    });
+    return wakerTransition;
   };
 
   const enterIdle = async () => {
@@ -566,6 +570,7 @@ async function main() {
         if (!observer.active) {
           return;
         }
+        const logs = Array.from(log.ownerDocument.querySelectorAll(options.logSelector));
         for (const mutation of mutations) {
           const addedNodes = [];
           for (const node of mutation.addedNodes) {
@@ -578,7 +583,10 @@ async function main() {
             if (isElement) {
               messageElements.push(...node.querySelectorAll(options.messageSelector));
             }
-            if (messageElements.length === 0) {
+            const messageElementsInLogs = messageElements.filter(message =>
+              logs.some(candidate => candidate.contains(message))
+            );
+            if (messageElementsInLogs.length === 0) {
               continue;
             }
 
@@ -586,8 +594,8 @@ async function main() {
               tagName: isElement ? node.tagName.toLowerCase() : node.nodeName.toLowerCase(),
               role: isElement ? node.getAttribute('role') : null,
               nodeMatchesMessage: Boolean(nodeMatchesMessage),
-              subtreeContainsMessageElements: messageElements.length > 0,
-              messages: messageElements.map(message => ({
+              subtreeContainsMessageElements: messageElementsInLogs.length > 0,
+              messages: messageElementsInLogs.map(message => ({
                 id: message.getAttribute('data-message-id'),
                 ariaRoleDescription: message.getAttribute('aria-roledescription'),
               })),
@@ -603,10 +611,11 @@ async function main() {
         }
       });
       observer.active = false;
-      observer.observe(log, { childList: true, subtree: true });
+      observer.observe(log.ownerDocument.body, { childList: true, subtree: true });
       window.__impracticalBotWakerObserver = observer;
     }, {
       messageSelector: WAKER_MESSAGE_SELECTOR,
+      logSelector: LOG_SELECTOR,
       logPrefix: LOG_PREFIX,
       debug: DEBUG_ENGINE,
     });
@@ -846,6 +855,7 @@ async function main() {
     if (packetScheduler) {
       await packetScheduler.waitForIdle();
     }
+    await wakerTransition;
     console.log('[engine] Shutting down.');
     if (observerAttached && page) {
       try {

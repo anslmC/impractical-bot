@@ -464,29 +464,33 @@ export async function startCombustion({
     pollDelayResolve?.();
     wakeSignal.resolve();
   };
-  const setWakerActive = async (active: boolean): Promise<void> => {
-    if (!observerAttached || wakerActive === active) {
-      return;
-    }
-    wakerActive = active;
-    console.log(active
-      ? '[waker] Active; listening for potential message activity.'
-      : '[waker] Standby; poller is responsible for checking messages.');
-    try {
-      await page.evaluate((isActive: boolean) => {
-        const pageWindow = window as Window & {
-          __impracticalBotWakerObserver?: MutationObserver & { active: boolean };
-        };
-        const observer = pageWindow.__impracticalBotWakerObserver;
-        if (observer) {
-          observer.active = isActive;
-        }
-      }, active);
-    } catch (error) {
-      if (!stopRequested) {
-        console.error(`[waker] Could not update observer state: ${error instanceof Error ? error.message : String(error)}`);
+  let wakerTransition: Promise<void> = Promise.resolve();
+  const setWakerActive = (active: boolean): Promise<void> => {
+    wakerTransition = wakerTransition.then(async () => {
+      if (!observerAttached || stopRequested || wakerActive === active) {
+        return;
       }
-    }
+      try {
+        await page.evaluate((isActive: boolean) => {
+          const pageWindow = window as Window & {
+            __impracticalBotWakerObserver?: MutationObserver & { active: boolean };
+          };
+          const observer = pageWindow.__impracticalBotWakerObserver;
+          if (observer) {
+            observer.active = isActive;
+          }
+        }, active);
+        wakerActive = active;
+        console.log(active
+          ? '[waker] Active; listening for potential message activity.'
+          : '[waker] Standby; poller is responsible for checking messages.');
+      } catch (error) {
+        if (!stopRequested) {
+          console.error(`[waker] Could not update observer state: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    });
+    return wakerTransition;
   };
   const enterIdle = async (): Promise<void> => {
     if (stopRequested || pauseGate.isPaused() || mode === 'idle') {
@@ -601,6 +605,7 @@ export async function startCombustion({
       if (packetScheduler) {
         await packetScheduler.waitForIdle();
       }
+      await wakerTransition;
       if (listenerAttached) {
         page.off('console', onConsole);
         listenerAttached = false;
@@ -951,6 +956,7 @@ export async function startCombustion({
         if (!observer.active) {
           return;
         }
+        const logs = Array.from(log.ownerDocument.querySelectorAll(options.logSelector));
         for (const mutation of mutations) {
           const addedNodes = [];
           for (const node of mutation.addedNodes) {
@@ -963,15 +969,18 @@ export async function startCombustion({
             if (isElement) {
               messageElements.push(...(node as Element).querySelectorAll(options.messageSelector));
             }
-            if (messageElements.length === 0) {
+            const messageElementsInLogs = messageElements.filter(message =>
+              logs.some(candidate => candidate.contains(message))
+            );
+            if (messageElementsInLogs.length === 0) {
               continue;
             }
             addedNodes.push({
               tagName: isElement ? (node as Element).tagName.toLowerCase() : node.nodeName.toLowerCase(),
               role: isElement ? (node as Element).getAttribute('role') : null,
               nodeMatchesMessage: Boolean(nodeMatchesMessage),
-              subtreeContainsMessageElements: messageElements.length > 0,
-              messages: messageElements.map(message => ({
+              subtreeContainsMessageElements: messageElementsInLogs.length > 0,
+              messages: messageElementsInLogs.map(message => ({
                 id: message.getAttribute('data-message-id'),
                 ariaRoleDescription: message.getAttribute('aria-roledescription'),
               })),
@@ -986,12 +995,13 @@ export async function startCombustion({
         }
       }) as MutationObserver & { active: boolean };
       observer.active = false;
-      observer.observe(log, { childList: true, subtree: true });
+      observer.observe(log.ownerDocument.body, { childList: true, subtree: true });
       (window as Window & {
         __impracticalBotWakerObserver?: MutationObserver & { active: boolean };
       }).__impracticalBotWakerObserver = observer;
     }, {
       messageSelector: WAKER_MESSAGE_SELECTOR,
+      logSelector: LOG_SELECTOR,
       logPrefix: LOG_PREFIX,
       debug: DEBUG_ENGINE,
     });
