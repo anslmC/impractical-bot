@@ -47,6 +47,11 @@ import {
 } from './components/composer.js';
 import { generateAliases } from './components/alias-engine.js';
 import {
+  startCombustion,
+  type CombustionController,
+} from './components/combustion.js';
+import { createContextStore } from './components/context-store.js';
+import {
   readMessengerMessages,
   type BackreadResult,
 } from './components/backread.js';
@@ -58,6 +63,8 @@ export interface CliRuntimeOptions {
   promptSecret?: TerminalPrompt;
   validateNvidiaApiKey?: (apiKey: string) => Promise<void>;
   readMessengerMessages?: typeof readMessengerMessages;
+  createContextStore?: typeof createContextStore;
+  startCombustion?: typeof startCombustion;
   generateNvidiaReply?: typeof generateNvidiaReply;
   composeMessengerReply?: typeof composeMessengerReply;
   waitForShutdown?: () => Promise<void>;
@@ -565,18 +572,18 @@ async function handleStart(
   const DEBUG_MODE = process.env.IMPRACTICAL_BOT_DEBUG === '1';
   const ENABLE_DEBUG_AUTO_RESPONSE = false;
   let apiKey = '';
+  try {
+    const environmentFilePath = resolveNvidiaEnvironmentPath(configurationFilePath);
+    apiKey = loadNvidiaApiKey(environmentFilePath) ?? '';
+  } catch {
+    writeError('Unable to load the application NVIDIA API key file.');
+    return 1;
+  }
+  if (!apiKey) {
+    writeError('NVIDIA API key is missing. Run `impbot init` or `impbot updatekey` first.');
+    return 1;
+  }
   if (!DEBUG_MODE || ENABLE_DEBUG_AUTO_RESPONSE) {
-    try {
-      const environmentFilePath = resolveNvidiaEnvironmentPath(configurationFilePath);
-      apiKey = loadNvidiaApiKey(environmentFilePath) ?? '';
-    } catch {
-      writeError('Unable to load the application NVIDIA API key file.');
-      return 1;
-    }
-    if (!apiKey) {
-      writeError('NVIDIA API key is missing. Run `impbot init` or `impbot updatekey` first.');
-      return 1;
-    }
     try {
       await (runtime.validateNvidiaApiKey ?? validateNvidiaApiKey)(apiKey);
     } catch (error) {
@@ -598,9 +605,10 @@ async function handleStart(
     ? Promise.race([sigintPromise, Promise.resolve().then(() => runtime.waitForShutdown!())])
     : sigintPromise;
   let session: BrowserLaunchSession | undefined;
+  let combustionController: CombustionController | undefined;
   let aliasData: ReturnType<typeof generateAliases> | undefined;
   let exitCode = 0;
-  let startupStage: 'launch' | 'prepare' = 'launch';
+  let startupStage: 'launch' | 'prepare' | 'cranking' | 'combustion' = 'launch';
 
   try {
     const launchPromise = (runtime.launchBrowser ?? launchConfiguredBrowser)(configurationResult.configuration);
@@ -648,7 +656,6 @@ async function handleStart(
           `DEBUG: Alias engine initialized for puppet name ${JSON.stringify(puppetName)} ` +
           `(${aliasData.valids.length} aliases).`,
         );
-        writeOutput(`Engine ready at ${configurationResult.configuration.messageDestination}.`);
         try {
           if (await session.isWindowMinimized?.(preparationResult.page)) {
             writeOutput('WARNING: Browser is minimized. Backread may collect fewer messages than expected.');
@@ -656,16 +663,32 @@ async function handleStart(
         } catch {
           writeError('Unable to detect browser window state.');
         }
-        let backread: BackreadResult | undefined;
+        startupStage = 'cranking';
+        let backread: BackreadResult;
         try {
           backread = await (runtime.readMessengerMessages ?? readMessengerMessages)(
             preparationResult.page,
           );
-          writeBackreadResult(backread, writeOutput);
         } catch {
-          writeError('Unable to read Messenger messages.');
+          throw new Error('Unable to read Messenger messages.');
         }
-        if (backread && ENABLE_DEBUG_AUTO_RESPONSE) {
+        const contextStore = (runtime.createContextStore ?? createContextStore)();
+        try {
+          contextStore.add(backread.messages.map(({ id, ...message }) => ({
+            ...message,
+            messageId: id,
+          })));
+          const seededMessageIds = new Set(contextStore.getState().messageIds);
+          if (backread.messages.some(message => !seededMessageIds.has(message.id))) {
+            throw new Error('One or more Backread messages were not retained.');
+          }
+        } catch {
+          throw new Error('Unable to seed historical message context.');
+        }
+        writeBackreadResult(backread, writeOutput);
+        writeOutput(`Historical context seeded: ${contextStore.getState().size} messages.`);
+
+        if (ENABLE_DEBUG_AUTO_RESPONSE) {
           let reply: string | undefined;
           try {
             reply = await (runtime.generateNvidiaReply ?? generateNvidiaReply)(apiKey, backread.messages);
@@ -696,24 +719,52 @@ async function handleStart(
             }
           }
         }
+
+        startupStage = 'combustion';
+        combustionController = await (runtime.startCombustion ?? startCombustion)({
+          page: preparationResult.page,
+          contextStore,
+          configuration: configurationResult.configuration,
+          aliases: aliasData.valids,
+          apiKey,
+          debugMode: DEBUG_MODE,
+        });
+        writeOutput(`Engine ready at ${configurationResult.configuration.messageDestination}.`);
         const runtimeResult = await Promise.race([
           shutdownPromise.then(() => 'shutdown' as const),
           session.disconnected.then(() => 'disconnected' as const),
+          combustionController.stopped.then(() => 'combustion-stopped' as const),
         ]);
         if (runtimeResult === 'shutdown') {
           writeOutput('Shutdown requested; disconnecting Playwright.');
           exitCode = 130;
+        } else if (runtimeResult === 'combustion-stopped') {
+          throw new Error('Combustion stopped unexpectedly.');
         } else {
           throw new Error('The browser disconnected unexpectedly while the engine was running.');
         }
       }
     }
   } catch (error) {
-    const action = startupStage === 'launch' ? 'start browser' : 'prepare browser';
+    const action = startupStage === 'launch'
+      ? 'start browser'
+      : startupStage === 'prepare'
+        ? 'prepare browser'
+        : startupStage === 'cranking'
+          ? 'crank engine'
+          : 'start Combustion';
     writeError(`Unable to ${action}: ${error instanceof Error ? error.message : String(error)}`);
     exitCode = 1;
   } finally {
     process.removeListener('SIGINT', onSigint);
+    if (combustionController) {
+      try {
+        await combustionController.stop();
+      } catch (error) {
+        writeError(`Unable to stop Combustion: ${error instanceof Error ? error.message : String(error)}`);
+        exitCode = 1;
+      }
+    }
     if (session) {
       try {
         await session.disconnect();

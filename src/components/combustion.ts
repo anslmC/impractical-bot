@@ -1,0 +1,879 @@
+import type { ConsoleMessage, Page } from 'playwright';
+import {
+  generateNvidiaReply,
+} from '../ai/nvidia.js';
+import type { BackreadMessage } from './backread.js';
+import {
+  composeMessengerReply,
+  type ReplyCompositionResult,
+} from './composer.js';
+import type { Configuration } from '../config/configuration.js';
+import type { ContextMessage, ContextStore } from './context-store.js';
+import {
+  extractMessageDetails,
+  type MessageDetails,
+} from './message-extraction.js';
+import {
+  buildPacketTurn,
+  createPacketBuilderState,
+  type PacketBuilderMessage,
+  type PacketBuilderPacket,
+  type PacketBuilderState,
+} from './mention-packet-builder.js';
+import { createPacketProcessor } from './packet-processor.js';
+import { createPacketScheduler } from './packet-scheduler.js';
+import { getDefaultPersonalityInstruction } from './personality.js';
+import { buildRngPacket, type RngPacket } from './rng-packet-builder.js';
+
+const MESSAGE_SELECTOR =
+  '[data-scope="messages_table"][aria-roledescription="message"][data-message-id]';
+const LOG_SELECTOR = '[role="log"][aria-live="polite"]';
+const WAKER_MESSAGE_SELECTOR = '[data-message-id]';
+const MESSAGE_LIMIT = 8;
+const CONTEXT_STORE_CAPACITY = 60;
+const POLL_INTERVAL_MS = 3000;
+const RNG_POLL_INTERVAL_MS = 15000;
+const RNG_CONTEXT_MESSAGE_LIMIT = 10;
+const RNG_YES_PROBABILITY = 0.75;
+const RNG_COOLDOWN_MS = 50000;
+const IDLE_THRESHOLD_MS = 30000;
+const LOG_PREFIX = '__MESSENGER_WAKER__:';
+const DEBUG_ENGINE = true;
+
+type EngineMessage = MessageDetails & { mention?: boolean };
+type ScheduledPacket = (PacketBuilderPacket | RngPacket) & {
+  mentionMessages?: PacketBuilderMessage[];
+};
+type PacketScheduler = ReturnType<typeof createPacketScheduler<ScheduledPacket>>;
+type ContextStoreState = ReturnType<ContextStore['getState']>;
+type MessageText = Pick<ContextMessage, 'messageId' | 'message' | 'mention'>;
+
+export interface CombustionOptions {
+  page: Page;
+  contextStore: ContextStore;
+  configuration: Configuration;
+  aliases: readonly string[];
+  apiKey: string;
+  debugMode?: boolean;
+}
+
+export interface CombustionController {
+  stopped: Promise<void>;
+  stop(): Promise<void>;
+}
+
+function createWakeSignal(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>(resolvePromise => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+function containsMention(message: string, aliases: readonly string[]): boolean {
+  for (const alias of aliases) {
+    const escapedAlias = alias.trim().split(/\s+/)
+      .map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+      .join('\\s+');
+    if (message.match(new RegExp(escapedAlias, 'iu'))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function formatPacketMessages(messages: PacketBuilderMessage[]): string {
+  if (messages.length === 0) {
+    return '  (none)';
+  }
+  return messages.map(message =>
+    `  - id=${message.messageId}; mention=${message.mention}; ` +
+    `text=${JSON.stringify(message.message.replace(/\s+/g, ' ') || '(no text content)')}`
+  ).join('\n');
+}
+
+function formatMessages(messages: MessageText[]): string {
+  if (messages.length === 0) {
+    return '  (none)';
+  }
+  return messages.map(message =>
+    `  - id=${message.messageId}; ` +
+    `text=${JSON.stringify(message.message.replace(/\s+/g, ' ') || '(no text content)')}`
+  ).join('\n');
+}
+
+function displayContextStore({
+  appendedMessages,
+  evictedMessages = [],
+  maxMessages,
+  retainedMessages,
+  state,
+}: {
+  appendedMessages: MessageText[];
+  evictedMessages?: MessageText[];
+  maxMessages: number;
+  retainedMessages: MessageText[] | null;
+  state: ContextStoreState | null;
+}): void {
+  if (appendedMessages.length === 0) {
+    return;
+  }
+
+  const deferred = state === null || retainedMessages === null;
+  const border = '='.repeat(80);
+  console.log(
+    `\n${border}\nCONTEXT STORE UPDATE\n${border}\n` +
+    `Newly appended: ${appendedMessages.length}\n` +
+    `Currently retained: ${deferred ? '(deferred)' : state.size}\n` +
+    `Maximum capacity: ${maxMessages}\n` +
+    `New messages:\n${formatMessages(appendedMessages)}\n` +
+    (deferred
+      ? 'Eviction details and aggregate contents skipped; packet work prevents safe reads.\n'
+      : `Evicted this update (${evictedMessages.length}):\n` +
+        `${formatMessages(evictedMessages)}\n` +
+        `Full retained store, in observation order:\n` +
+        `${formatMessages(retainedMessages)}\n`) +
+    border
+  );
+}
+
+function canReadContextStore(
+  packetScheduler: PacketScheduler | undefined,
+  packetBuilderState: PacketBuilderState | undefined,
+  packetAwaitingSubmission: boolean,
+): boolean {
+  if (!packetScheduler || !packetBuilderState) {
+    return false;
+  }
+  const schedulerState = packetScheduler.getState();
+  return !packetAwaitingSubmission &&
+    !schedulerState.activePacket &&
+    schedulerState.pendingPackets.length === 0 &&
+    !packetBuilderState.pendingPacket;
+}
+
+function getRngSkipReason({
+  mainPollInProgress,
+  packetScheduler,
+  packetBuilderState,
+  rngOperationActive,
+  rngCooldownActive,
+}: {
+  mainPollInProgress: boolean;
+  packetScheduler: PacketScheduler;
+  packetBuilderState: PacketBuilderState;
+  rngOperationActive: boolean;
+  rngCooldownActive: boolean;
+}): string | null {
+  if (mainPollInProgress) {
+    return 'main poll in progress';
+  }
+  if (packetBuilderState.pendingPacket) {
+    return 'mention packet open or awaiting submission';
+  }
+  const { activePacket, pendingPackets } = packetScheduler.getState();
+  if ((activePacket?.mentionMessages?.length ?? 0) > 0) {
+    return 'mention packet active';
+  }
+  if (pendingPackets.some(packet => (packet.mentionMessages?.length ?? 0) > 0)) {
+    return 'mention packet queued';
+  }
+  if (rngOperationActive) {
+    return 'RNG operation already active';
+  }
+  if (rngCooldownActive) {
+    return 'RNG cooldown active';
+  }
+  return null;
+}
+
+function readContextStore(
+  contextStore: ContextStore,
+  packetScheduler: PacketScheduler | undefined,
+  packetBuilderState: PacketBuilderState | undefined,
+  packetAwaitingSubmission: boolean,
+  method: 'getRecent',
+  limit: number,
+): ContextMessage[] | null;
+function readContextStore(
+  contextStore: ContextStore,
+  packetScheduler: PacketScheduler | undefined,
+  packetBuilderState: PacketBuilderState | undefined,
+  packetAwaitingSubmission: boolean,
+  method: 'getState',
+): ContextStoreState | null;
+function readContextStore(
+  contextStore: ContextStore,
+  packetScheduler: PacketScheduler | undefined,
+  packetBuilderState: PacketBuilderState | undefined,
+  packetAwaitingSubmission: boolean,
+  method: 'getRecent' | 'getState',
+  ...args: number[]
+): ContextMessage[] | ContextStoreState | null {
+  if (!canReadContextStore(packetScheduler, packetBuilderState, packetAwaitingSubmission)) {
+    return null;
+  }
+  return method === 'getRecent'
+    ? contextStore.getRecent(args[0])
+    : contextStore.getState();
+}
+
+function appendContextMessages(
+  contextStore: ContextStore,
+  incomingMessages: EngineMessage[],
+  packetScheduler: PacketScheduler | undefined,
+  packetBuilderState: PacketBuilderState | undefined,
+  packetAwaitingSubmission = false,
+): void {
+  const validMessages = incomingMessages.filter(message => message.messageId);
+  if (validMessages.length === 0) {
+    return;
+  }
+
+  const previousMessages = readContextStore(
+    contextStore,
+    packetScheduler,
+    packetBuilderState,
+    packetAwaitingSubmission,
+    'getRecent',
+    CONTEXT_STORE_CAPACITY,
+  );
+  contextStore.add(validMessages.map(message => ({
+    ...message,
+    messageId: message.messageId,
+  })));
+  if (previousMessages === null) {
+    displayContextStore({
+      appendedMessages: validMessages,
+      maxMessages: CONTEXT_STORE_CAPACITY,
+      retainedMessages: null,
+      state: null,
+    });
+    return;
+  }
+
+  const previousIds = new Set(previousMessages.map(message => message.messageId));
+  const seenNewIds = new Set<string>();
+  const newlyAppended = validMessages.filter(message => {
+    if (previousIds.has(message.messageId) || seenNewIds.has(message.messageId)) {
+      return false;
+    }
+    seenNewIds.add(message.messageId);
+    return true;
+  });
+  if (newlyAppended.length === 0) {
+    return;
+  }
+
+  const state = readContextStore(
+    contextStore,
+    packetScheduler,
+    packetBuilderState,
+    packetAwaitingSubmission,
+    'getState',
+  );
+  if (state === null) {
+    displayContextStore({
+      appendedMessages: newlyAppended,
+      maxMessages: CONTEXT_STORE_CAPACITY,
+      retainedMessages: null,
+      state: null,
+    });
+    return;
+  }
+  const retainedMessages = readContextStore(
+    contextStore,
+    packetScheduler,
+    packetBuilderState,
+    packetAwaitingSubmission,
+    'getRecent',
+    state.maxMessages,
+  );
+  if (retainedMessages === null) {
+    displayContextStore({
+      appendedMessages: newlyAppended,
+      maxMessages: state.maxMessages,
+      retainedMessages: null,
+      state: null,
+    });
+    return;
+  }
+  const retainedIds = new Set(retainedMessages.map(message => message.messageId));
+  const evictedMessages = [...previousMessages, ...newlyAppended]
+    .filter(message => !retainedIds.has(message.messageId));
+  displayContextStore({
+    appendedMessages: newlyAppended,
+    evictedMessages,
+    maxMessages: state.maxMessages,
+    retainedMessages,
+    state,
+  });
+}
+
+function printPacketBoundary(label: string, packetId: string): void {
+  const border = '='.repeat(80);
+  console.log(`\n${border}\n${label}: ${packetId}\n${border}`);
+}
+
+function describePacketClosureReason(newMessageCount: number): string {
+  if (newMessageCount === 0) {
+    return 'Next poll completed (no new messages)';
+  }
+  return 'Poll included new work before packet finalization';
+}
+
+function logPacket(label: string, packet: PacketBuilderPacket): void {
+  console.log(
+    `${label}: ${packet.packetId}\n` +
+    ` New work (${packet.newMessages.length}):\n${formatPacketMessages(packet.newMessages)}\n` +
+    ` Mention messages (${packet.mentionMessages.length}):\n` +
+    `${formatPacketMessages(packet.mentionMessages)}\n` +
+    ` Context only (${packet.contextMessages.length}):\n` +
+    `${formatPacketMessages(packet.contextMessages)}`
+  );
+}
+
+function printQueueSnapshot(scheduler: PacketScheduler): void {
+  const { activePacket, pendingPackets } = scheduler.getState();
+  const packetIds = [
+    ...(activePacket ? [activePacket.packetId] : []),
+    ...pendingPackets.map(packet => packet.packetId),
+  ];
+  const border = '='.repeat(80);
+  console.log(
+    `\n${border}\nIN QUEUE\n${border}\n` +
+    `[queue] active packet (held): ${activePacket?.packetId ?? '(none)'}\n` +
+    `[queue] packets waiting: ${pendingPackets.length}\n` +
+    `[queue] waiting packet IDs (FIFO): ` +
+    `${pendingPackets.map(packet => packet.packetId).join(' -> ') || '(none)'}\n` +
+    `[queue] packets retained: ${packetIds.length}\n` +
+    `[queue] packet IDs (active, then waiting): ${packetIds.join(' -> ') || '(none)'}\n` +
+    border
+  );
+}
+
+export async function startCombustion({
+  page,
+  contextStore,
+  configuration,
+  aliases,
+  apiKey,
+  debugMode = false,
+}: CombustionOptions): Promise<CombustionController> {
+  let observerAttached = false;
+  let stopRequested = false;
+  let mode: 'polling' | 'idle' = 'polling';
+  let wakerActive = false;
+  let mainPollInProgress = false;
+  let rngOperationActive = false;
+  let rngCooldownActive = false;
+  let rngPacketInFlightId: string | null = null;
+  let lastRngSkipReason: string | null = null;
+  let rngPollTimer: ReturnType<typeof setInterval> | undefined;
+  let rngCooldownTimer: ReturnType<typeof setTimeout> | undefined;
+  let pollDelayResolve: (() => void) | undefined;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  let idleDeadline = 0;
+  let wakePending = false;
+  let wakeSignal = createWakeSignal();
+  let packetScheduler: PacketScheduler | undefined;
+  let packetBuilderState: PacketBuilderState | undefined;
+  let pollRng: (() => void) | undefined;
+  let listenerAttached = false;
+
+  const stopRngPolling = (message?: string): void => {
+    if (rngPollTimer === undefined) {
+      return;
+    }
+    clearInterval(rngPollTimer);
+    rngPollTimer = undefined;
+    if (message) {
+      console.log(message);
+    }
+  };
+  const startRngPolling = (message = '[rng] Polling resumed: main poller active'): void => {
+    if (rngPollTimer !== undefined || !pollRng) {
+      return;
+    }
+    rngPollTimer = setInterval(pollRng, RNG_POLL_INTERVAL_MS);
+    console.log(message);
+  };
+  const completeRngPacket = (packetId: string, succeeded: boolean, error?: unknown): void => {
+    if (packetId !== rngPacketInFlightId) {
+      return;
+    }
+    rngPacketInFlightId = null;
+    rngOperationActive = false;
+    const outcome = succeeded
+      ? 'success'
+      : `failure: ${error instanceof Error ? error.message : String(error)}`;
+    console.log(`[rng] Processing completed: ${packetId} (${outcome})`);
+    if (stopRequested) {
+      return;
+    }
+    rngCooldownActive = true;
+    console.log(`[rng] Cooldown started: ${RNG_COOLDOWN_MS / 1000}s`);
+    rngCooldownTimer = setTimeout(() => {
+      rngCooldownTimer = undefined;
+      rngCooldownActive = false;
+      console.log('[rng] Cooldown ended');
+    }, RNG_COOLDOWN_MS);
+  };
+  const requestStop = (): void => {
+    if (stopRequested) {
+      return;
+    }
+    stopRequested = true;
+    clearTimeout(idleTimer);
+    pollDelayResolve?.();
+    wakeSignal.resolve();
+  };
+  const setWakerActive = async (active: boolean): Promise<void> => {
+    if (!observerAttached || wakerActive === active) {
+      return;
+    }
+    wakerActive = active;
+    console.log(active
+      ? '[waker] Active; listening for potential message activity.'
+      : '[waker] Standby; poller is responsible for checking messages.');
+    try {
+      await page.evaluate((isActive: boolean) => {
+        const pageWindow = window as Window & {
+          __impracticalBotWakerObserver?: MutationObserver & { active: boolean };
+        };
+        const observer = pageWindow.__impracticalBotWakerObserver;
+        if (observer) {
+          observer.active = isActive;
+        }
+      }, active);
+    } catch (error) {
+      if (!stopRequested) {
+        console.error(`[waker] Could not update observer state: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  };
+  const enterIdle = async (): Promise<void> => {
+    if (stopRequested || mode === 'idle') {
+      return;
+    }
+    mode = 'idle';
+    stopRngPolling('[rng] Polling paused: main poller idle');
+    console.log('[poller] Idle; no genuinely new message was detected before the threshold.');
+    await setWakerActive(true);
+    pollDelayResolve?.();
+  };
+  const resetIdleTimer = async (): Promise<void> => {
+    if (mode === 'idle') {
+      mode = 'polling';
+      console.log('[poller] Confirmed new message while idle; resuming periodic polling.');
+      await setWakerActive(false);
+    }
+    clearTimeout(idleTimer);
+    idleDeadline = Date.now() + IDLE_THRESHOLD_MS;
+    if (DEBUG_ENGINE) {
+      console.log(`[idle] Timer reset (${IDLE_THRESHOLD_MS / 1000}s).`);
+    }
+    idleTimer = setTimeout(() => {
+      idleTimer = undefined;
+      void enterIdle();
+    }, IDLE_THRESHOLD_MS);
+  };
+  const signalPollerWake = (): void => {
+    if (mode !== 'idle') {
+      return;
+    }
+    mode = 'polling';
+    startRngPolling();
+    wakePending = true;
+    console.log('[poller] Wake-up signal received; verifying rendered messages now.');
+    void setWakerActive(false);
+    wakeSignal.resolve();
+  };
+  const isIdle = (): boolean => mode === 'idle';
+  const consumeWakeSignal = (): boolean => {
+    if (!wakePending) {
+      return false;
+    }
+    wakePending = false;
+    wakeSignal = createWakeSignal();
+    return true;
+  };
+  const waitForPollInterval = (): Promise<void> => new Promise(resolve => {
+    const timeout = setTimeout(() => {
+      pollDelayResolve = undefined;
+      resolve();
+    }, POLL_INTERVAL_MS);
+    pollDelayResolve = () => {
+      clearTimeout(timeout);
+      pollDelayResolve = undefined;
+      resolve();
+    };
+  });
+
+  let cleanupPromise: Promise<void> | undefined;
+  const cleanup = (): Promise<void> => {
+    cleanupPromise ??= (async () => {
+      stopRngPolling();
+      clearTimeout(rngCooldownTimer);
+      clearTimeout(idleTimer);
+      if (packetScheduler) {
+        await packetScheduler.waitForIdle();
+      }
+      if (listenerAttached) {
+        page.off('console', onConsole);
+        listenerAttached = false;
+      }
+      if (observerAttached) {
+        try {
+          await page.evaluate(() => {
+            const pageWindow = window as Window & {
+              __impracticalBotWakerObserver?: MutationObserver & { active: boolean };
+            };
+            const observer = pageWindow.__impracticalBotWakerObserver;
+            if (observer) {
+              observer.disconnect();
+              delete pageWindow.__impracticalBotWakerObserver;
+            }
+          });
+        } catch {
+          // The page may have closed before observer cleanup.
+        }
+        observerAttached = false;
+      }
+      console.log('[engine] Combustion stopped.');
+    })();
+    return cleanupPromise;
+  };
+
+  const onConsole = (message: ConsoleMessage): void => {
+    const text = message.text();
+    if (!text.startsWith(LOG_PREFIX) || mode !== 'idle') {
+      return;
+    }
+    const diagnostic = text.slice(LOG_PREFIX.length);
+    console.log(DEBUG_ENGINE
+      ? `[waker] Potential DOM activity; ${diagnostic}`
+      : '[waker] Potential DOM activity detected.');
+    signalPollerWake();
+  };
+
+  const runPollLoop = async (): Promise<void> => {
+    await resetIdleTimer();
+    while (!stopRequested) {
+      if (mode === 'idle' && !wakePending) {
+        await wakeSignal.promise;
+      }
+      if (stopRequested) {
+        break;
+      }
+
+      let wokePoller = consumeWakeSignal();
+      if (mode === 'idle') {
+        continue;
+      }
+      if (!wokePoller) {
+        await waitForPollInterval();
+        if (stopRequested) {
+          break;
+        }
+        if (isIdle()) {
+          continue;
+        }
+        wokePoller = consumeWakeSignal();
+      }
+      if (mode !== 'polling') {
+        continue;
+      }
+
+      mainPollInProgress = true;
+      try {
+        const messages = await readLatestMessages();
+        if (stopRequested) {
+          break;
+        }
+
+        const newMessages: MessageDetails[] = [];
+        for (const message of messages) {
+          if (message.messageId && !seenMessageIds.has(message.messageId)) {
+            seenMessageIds.add(message.messageId);
+            newMessages.push(message);
+          }
+        }
+
+        const newMessagesWithMentions = newMessages.map(message => ({
+          ...message,
+          mention: containsMention(message.message, aliases),
+        }));
+        const mentionCount = newMessagesWithMentions.filter(message => message.mention).length;
+        console.log(
+          `Poll: ${newMessages.length} new messages checked; ${mentionCount} mention detected.`
+        );
+        for (const message of newMessagesWithMentions) {
+          console.log(
+            ` New message: id=${message.messageId}; mention=${message.mention}; ` +
+            `text=${JSON.stringify(message.message.replace(/\s+/g, ' ') || '(no text content)')}`
+          );
+        }
+
+        const newMessageIds = new Set(newMessagesWithMentions.map(message => message.messageId));
+        const recentContext = messages
+          .filter(message => message.messageId && !newMessageIds.has(message.messageId))
+          .map(message => ({
+            ...message,
+            mention: containsMention(message.message, aliases),
+          }));
+        const hadPendingPacket = packetBuilderState!.pendingPacket !== null;
+        const result = buildPacketTurn({
+          newMessages: newMessagesWithMentions,
+          recentContext,
+          state: packetBuilderState,
+        });
+        packetBuilderState = result.state;
+        appendContextMessages(
+          contextStore,
+          newMessages,
+          packetScheduler,
+          packetBuilderState,
+          result.packet !== null,
+        );
+
+        if (result.pendingPacket && !hadPendingPacket) {
+          printPacketBoundary('PACKET OPENED', result.pendingPacket.packetId);
+          console.log(`Packet opened this poll: ${result.pendingPacket.packetId}`);
+          logPacket('Initial packet contents', result.pendingPacket);
+        } else if (result.pendingPacket) {
+          console.log(`Packet ${result.pendingPacket.packetId} is pending (still pending).`);
+        }
+        if (result.packet) {
+          printPacketBoundary('PACKET FINALIZED', result.packet.packetId);
+          console.log(`Closure reason: ${describePacketClosureReason(newMessagesWithMentions.length)}`);
+          logPacket('Final packet contents', result.packet);
+          if (packetScheduler!.submit(result.packet)) {
+            printQueueSnapshot(packetScheduler!);
+          }
+        }
+
+        if (newMessagesWithMentions.length > 0) {
+          consumeWakeSignal();
+          await resetIdleTimer();
+        } else if (idleDeadline <= Date.now() && !wakePending) {
+          await enterIdle();
+        }
+      } finally {
+        mainPollInProgress = false;
+      }
+    }
+  };
+
+  const messageLocator = page.locator(MESSAGE_SELECTOR);
+  const readLatestMessages = async (): Promise<MessageDetails[]> => {
+    const elements = await messageLocator.evaluateAll((items, limit) =>
+      items.slice(-limit).map(element => {
+        const message = element as HTMLElement;
+        const clone = message.cloneNode(true) as HTMLElement;
+        clone.querySelectorAll('h4').forEach(heading => heading.remove());
+        return {
+          messageId: message.getAttribute('data-message-id') ?? '',
+          ariaLabel: message.getAttribute('aria-label'),
+          textWithoutSenderHeading: (clone.innerText || '').trim(),
+        };
+      }),
+    MESSAGE_LIMIT,
+    );
+    return elements.map(extractMessageDetails);
+  };
+  let seenMessageIds = new Set<string>();
+
+  try {
+    console.log(`[engine] Starting Combustion for ${configuration.messageDestination}.`);
+    const systemInstruction = getDefaultPersonalityInstruction();
+    const processPacket = createPacketProcessor<
+      PacketBuilderMessage,
+      string,
+      Page,
+      string,
+      ReplyCompositionResult
+    >({
+      page,
+      apiKey,
+      generateReply: (requestApiKey, messages) => generateNvidiaReply(
+        requestApiKey,
+        messages as unknown as readonly BackreadMessage[],
+        { systemInstruction },
+      ),
+      composeReply: composeMessengerReply,
+      debugMode,
+    });
+    packetScheduler = createPacketScheduler<ScheduledPacket>(async packet => {
+      if (packet.packetId === rngPacketInFlightId) {
+        console.log(`[rng] Processing started: ${packet.packetId}`);
+      }
+      let succeeded = false;
+      let processingError: unknown;
+      try {
+        const result = await processPacket(packet);
+        succeeded = true;
+        return result;
+      } catch (error) {
+        processingError = error;
+        throw error;
+      } finally {
+        completeRngPacket(packet.packetId, succeeded, processingError);
+      }
+    });
+
+    page.on('console', onConsole);
+    listenerAttached = true;
+    await page.locator(LOG_SELECTOR).evaluate((log, options) => {
+      const observer = new MutationObserver(mutations => {
+        if (!observer.active) {
+          return;
+        }
+        for (const mutation of mutations) {
+          const addedNodes = [];
+          for (const node of mutation.addedNodes) {
+            const isElement = node.nodeType === Node.ELEMENT_NODE;
+            const nodeMatchesMessage = isElement && (node as Element).matches(options.messageSelector);
+            const messageElements: Element[] = [];
+            if (nodeMatchesMessage) {
+              messageElements.push(node as Element);
+            }
+            if (isElement) {
+              messageElements.push(...(node as Element).querySelectorAll(options.messageSelector));
+            }
+            if (messageElements.length === 0) {
+              continue;
+            }
+            addedNodes.push({
+              tagName: isElement ? (node as Element).tagName.toLowerCase() : node.nodeName.toLowerCase(),
+              role: isElement ? (node as Element).getAttribute('role') : null,
+              nodeMatchesMessage: Boolean(nodeMatchesMessage),
+              subtreeContainsMessageElements: messageElements.length > 0,
+              messages: messageElements.map(message => ({
+                id: message.getAttribute('data-message-id'),
+                ariaRoleDescription: message.getAttribute('aria-roledescription'),
+              })),
+            });
+          }
+          if (addedNodes.length > 0) {
+            const diagnostic = options.debug
+              ? JSON.stringify({ mutationType: mutation.type, addedNodes })
+              : 'Potential DOM activity detected; waking poller.';
+            console.log(`${options.logPrefix}${diagnostic}`);
+          }
+        }
+      }) as MutationObserver & { active: boolean };
+      observer.active = false;
+      observer.observe(log, { childList: true, subtree: true });
+      (window as Window & {
+        __impracticalBotWakerObserver?: MutationObserver & { active: boolean };
+      }).__impracticalBotWakerObserver = observer;
+    }, {
+      messageSelector: WAKER_MESSAGE_SELECTOR,
+      logPrefix: LOG_PREFIX,
+      debug: DEBUG_ENGINE,
+    });
+    observerAttached = true;
+
+    const baseline = await readLatestMessages();
+    seenMessageIds = new Set(baseline.map(message => message.messageId).filter(Boolean));
+    console.log(`Baseline recorded: ${seenMessageIds.size} unique message IDs.`);
+    packetBuilderState = createPacketBuilderState();
+    appendContextMessages(contextStore, baseline, packetScheduler, packetBuilderState);
+    packetBuilderState = buildPacketTurn({
+      newMessages: [],
+      recentContext: baseline
+        .filter(message => message.messageId)
+        .map(message => ({
+          ...message,
+          mention: containsMention(message.message, aliases),
+        })),
+      state: packetBuilderState,
+    }).state;
+
+    pollRng = () => {
+      console.log('[rng] Evaluating cycle');
+      const skipReason = getRngSkipReason({
+        mainPollInProgress,
+        packetScheduler: packetScheduler!,
+        packetBuilderState: packetBuilderState!,
+        rngOperationActive,
+        rngCooldownActive,
+      });
+      if (skipReason) {
+        if (skipReason !== lastRngSkipReason) {
+          console.log(`[rng] Skipped: ${skipReason}`);
+        }
+        lastRngSkipReason = skipReason;
+        return;
+      }
+      lastRngSkipReason = null;
+      const latestMessage = contextStore.getRecent(1)[0];
+      if (latestMessage?.sender === 'You' && latestMessage.direction === 'OUTGOING') {
+        console.log('[rng] Skipping dice roll: latest Context Store message is OUTGOING.');
+        return;
+      }
+      if (Math.random() >= RNG_YES_PROBABILITY) {
+        console.log('[rng] Roll: NO (25% chance)');
+        return;
+      }
+      console.log('[rng] Roll: YES (75% chance)');
+
+      rngOperationActive = true;
+      try {
+        const recentMessages = contextStore.getRecent(RNG_CONTEXT_MESSAGE_LIMIT);
+        console.log(`[rng] Context snapshot: ${recentMessages.length} messages`);
+        const hasUsableIncomingMessage = recentMessages.some(message =>
+          message.direction === 'INCOMING' && message.message.trim().length > 0
+        );
+        if (!hasUsableIncomingMessage) {
+          rngOperationActive = false;
+          console.log('[rng] Skipped: no usable incoming Messenger message');
+          console.log('[rng] No cooldown; normal polling resumes');
+          return;
+        }
+
+        const packet = buildRngPacket(recentMessages);
+        rngPacketInFlightId = packet.packetId;
+        console.log(`[rng] Packet created: ${packet.packetId} (${packet.contextMessages.length} context messages)`);
+        if (!packetScheduler!.submit(packet)) {
+          rngPacketInFlightId = null;
+          rngOperationActive = false;
+          console.log(`[rng] Scheduler rejected packet: ${packet.packetId}`);
+          return;
+        }
+        console.log('[rng] Submitted to scheduler');
+      } catch (error) {
+        rngPacketInFlightId = null;
+        rngOperationActive = false;
+        const details = error instanceof Error ? error.message : String(error);
+        console.error(`[rng] Could not submit an RNG packet: ${details}`);
+      }
+    };
+    startRngPolling('[rng] Polling started');
+    console.log(DEBUG_ENGINE
+      ? `[poller] Active; sampling every ${POLL_INTERVAL_MS} ms.`
+      : '[poller] Active.');
+
+    const stopped = runPollLoop().then(
+      async () => {
+        await cleanup();
+      },
+      async error => {
+        await cleanup();
+        throw error;
+      },
+    );
+    return {
+      stopped,
+      async stop() {
+        requestStop();
+        await stopped.catch(() => undefined);
+      },
+    };
+  } catch (error) {
+    requestStop();
+    await cleanup();
+    throw error;
+  }
+}

@@ -11,6 +11,8 @@ import type { BrowserLaunchSession } from '../src/browser/launch.js';
 import { loadConfiguration, saveConfiguration, type Configuration } from '../src/config/configuration.js';
 import { generateAliases } from '../src/components/alias-engine.js';
 import type { BackreadResult } from '../src/components/backread.js';
+import type { CombustionController } from '../src/components/combustion.js';
+import { createContextStore } from '../src/components/context-store.js';
 
 async function captureCli(
   args: string[],
@@ -22,6 +24,10 @@ async function captureCli(
 ) {
   const output: string[] = [];
   const errors: string[] = [];
+  const testRuntime: CliRuntimeOptions = {
+    ...runtime,
+    startCombustion: runtime?.startCombustion ?? (async () => createTestCombustionController()),
+  };
   const exitCode = await runCli(
     args,
     message => {
@@ -32,9 +38,23 @@ async function captureCli(
     configurationFilePath,
     prompt,
     initialize,
-    runtime,
+    testRuntime,
   );
   return { exitCode, output, errors };
+}
+
+function createTestCombustionController(onStop?: () => void): CombustionController {
+  let resolveStopped!: () => void;
+  const stopped = new Promise<void>(resolve => {
+    resolveStopped = resolve;
+  });
+  return {
+    stopped,
+    async stop() {
+      onStop?.();
+      resolveStopped();
+    },
+  };
 }
 
 function createTemporaryConfigPath(context: TestContext): string {
@@ -129,6 +149,12 @@ test('start prepares the destination, remains alive after readiness, and disconn
   const prepareStarted = deferred<void>();
   const preparation = deferred<void>();
   const shutdown = deferred<void>();
+  const seededStore = createContextStore();
+  const addSeededMessages = seededStore.add.bind(seededStore);
+  seededStore.add = messages => {
+    events.push('store-seeded');
+    addSeededMessages(messages);
+  };
   const session: BrowserLaunchSession = {
     endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
     browserVersion: 'Brave Chromium test',
@@ -145,6 +171,7 @@ test('start prepares the destination, remains alive after readiness, and disconn
     },
     async disconnect() {
       disconnects += 1;
+      events.push('disconnected');
     },
   };
   const runtime: CliRuntimeOptions = {
@@ -163,6 +190,10 @@ test('start prepares the destination, remains alive after readiness, and disconn
       events.push('read-messages');
       return backreadResult;
     },
+    createContextStore: () => {
+      events.push('store-created');
+      return seededStore;
+    },
     generateNvidiaReply: async (apiKey, messages) => {
       assert.equal(apiKey, 'nvapi-test-key');
       assert.deepEqual(messages, backreadResult.messages);
@@ -174,6 +205,35 @@ test('start prepares the destination, remains alive after readiness, and disconn
       assert.equal(reply, 'Generated reply');
       events.push('compose-reply');
       return { status: 'sent' };
+    },
+    startCombustion: async options => {
+      assert.equal(options.page, stubPage);
+      assert.equal(options.contextStore, seededStore);
+      assert.deepEqual(options.contextStore.getRecent(2), [
+        {
+          messageId: 'message-1',
+          message: 'hello',
+          sender: 'You',
+          direction: 'OUTGOING',
+          timestamp: {
+            original: 'October 18, 2026, 1:15 PM',
+            normalized: '2026-10-18T13:15:00',
+            resolved: true,
+          },
+          ariaLabel: 'At October 18, 2026, 1:15 PM, You: hello',
+        },
+        {
+          messageId: 'message-2',
+          message: '',
+          sender: 'UNKNOWN',
+          direction: 'UNKNOWN',
+          timestamp: { original: 'Friday 19:35', normalized: null, resolved: false },
+          ariaLabel: null,
+        },
+      ]);
+      events.push('combustion-started');
+      events.push('context-store-verified');
+      return createTestCombustionController(() => events.push('combustion-stopped'));
     },
     waitForShutdown: () => shutdown.promise,
   };
@@ -213,18 +273,25 @@ test('start prepares the destination, remains alive after readiness, and disconn
     'prepared',
     'puppet-name-saved',
     'aliases-initialized',
-    'engine-ready-logged',
     'window-state-checked',
     'read-messages',
+    'store-created',
+    'store-seeded',
+    'combustion-started',
+    'context-store-verified',
+    'engine-ready-logged',
+    'combustion-stopped',
+    'disconnected',
   ]);
   assert.deepEqual(result.output, [
     'NVIDIA API key validated successfully.',
     'Browser launched and connected (Brave Chromium test).',
     'Puppet account name updated: "Test Puppet".',
     `DEBUG: Alias engine initialized for puppet name "Test Puppet" (${generateAliases('Test Puppet').valids.length} aliases).`,
-    `Engine ready at ${validConfiguration.messageDestination}.`,
     'WARNING: Browser is minimized. Backread may collect fewer messages than expected.',
     'Retrieved 2 messages; expected 30.',
+    'Historical context seeded: 2 messages.',
+    `Engine ready at ${validConfiguration.messageDestination}.`,
     'Shutdown requested; disconnecting Playwright.',
   ]);
   assert.deepEqual(result.errors, []);
@@ -291,6 +358,7 @@ test('start preserves the saved puppet name and continues when profile retrieval
 test('start debug mode skips NVIDIA validation and keeps backread read-only', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
   const originalDebugMode = process.env.IMPRACTICAL_BOT_DEBUG;
   process.env.IMPRACTICAL_BOT_DEBUG = '1';
   let validationCalls = 0;
@@ -353,15 +421,14 @@ test('start debug mode skips NVIDIA validation and keeps backread read-only', as
   }
 });
 
-test('start keeps the ready session alive when backreading fails', async context => {
+test('start aborts and disconnects when backreading fails', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
   saveApplicationApiKey(configurationFilePath);
-  const shutdown = deferred<void>();
   const backreadStarted = deferred<void>();
-  let settled = false;
+  let combustionStarted = false;
   let disconnects = 0;
-  const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+  const result = await captureCli(['start'], configurationFilePath, undefined, undefined, {
     validateNvidiaApiKey: async () => undefined,
     launchBrowser: async () => ({
       endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
@@ -378,22 +445,171 @@ test('start keeps the ready session alive when backreading fails', async context
       backreadStarted.resolve();
       throw new Error('private page details');
     },
-    waitForShutdown: () => shutdown.promise,
+    startCombustion: async () => {
+      combustionStarted = true;
+      return createTestCombustionController();
+    },
   });
-  void start.then(() => { settled = true; });
 
-  await backreadStarted.promise;
-  await new Promise<void>(resolve => setImmediate(resolve));
-
-  assert.equal(settled, false);
-  assert.equal(disconnects, 0);
-  shutdown.resolve();
-  const result = await start;
-
-  assert.equal(result.exitCode, 130);
-  assert.deepEqual(result.errors, ['Unable to read Messenger messages.']);
-  assert.ok(!result.errors.join('\n').includes('private page details'));
+  assert.equal(result.exitCode, 1);
+  assert.equal(combustionStarted, false);
   assert.equal(disconnects, 1);
+  assert.ok(result.errors.some(message => message.includes('Unable to read Messenger messages.')));
+  assert.deepEqual(result.errors, [
+    'Unable to crank engine: Unable to read Messenger messages.',
+  ]);
+  await backreadStarted.promise;
+  assert.ok(!result.errors.join('\n').includes('private page details'));
+});
+
+test('start accepts empty and partial Backread results after seeding', async context => {
+  const scenarios: { name: string; messages: BackreadResult['messages'] }[] = [
+    { name: 'empty', messages: [] },
+    {
+      name: 'partial',
+      messages: [{
+        id: 'partial-1',
+        timestamp: { original: '10:15 AM', normalized: null, resolved: false },
+        ariaLabel: null,
+        message: 'A partial history is still usable.',
+        sender: 'Alex',
+        direction: 'INCOMING',
+      }],
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const configurationFilePath = createTemporaryConfigPath(context);
+    saveConfiguration(validConfiguration, configurationFilePath);
+    saveApplicationApiKey(configurationFilePath);
+    const shutdown = deferred<void>();
+    const combustionStarted = deferred<void>();
+    const contextStore = createContextStore();
+    let disconnects = 0;
+    const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+      validateNvidiaApiKey: async () => undefined,
+      launchBrowser: async () => ({
+        endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+        browserVersion: 'Brave Chromium test',
+        disconnected: new Promise<void>(() => undefined),
+        async prepare() {
+          return stubPage;
+        },
+        async disconnect() {
+          disconnects += 1;
+        },
+      }),
+      readMessengerMessages: async () => ({ diagnostics: [], messages: scenario.messages }),
+      createContextStore: () => contextStore,
+      startCombustion: async options => {
+        assert.equal(options.contextStore, contextStore);
+        assert.equal(options.contextStore.getState().size, scenario.messages.length);
+        assert.deepEqual(
+          options.contextStore.getRecent(30).map(message => message.messageId),
+          scenario.messages.map(message => message.id),
+        );
+        combustionStarted.resolve();
+        return createTestCombustionController();
+      },
+      waitForShutdown: () => shutdown.promise,
+    });
+
+    await combustionStarted.promise;
+    shutdown.resolve();
+    const result = await start;
+
+    assert.equal(result.exitCode, 130, scenario.name);
+    assert.equal(disconnects, 1, scenario.name);
+    assert.deepEqual(result.errors, [], scenario.name);
+  }
+});
+
+test('start does not pass a partially seeded store to Combustion', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const contextStore = createContextStore();
+  let combustionStarted = false;
+  let disconnects = 0;
+  const result = await captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
+    launchBrowser: async () => ({
+      endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+      browserVersion: 'Brave Chromium test',
+      disconnected: new Promise<void>(() => undefined),
+      async prepare() {
+        return stubPage;
+      },
+      async disconnect() {
+        disconnects += 1;
+      },
+    }),
+    readMessengerMessages: async () => ({
+      diagnostics: [],
+      messages: [
+        {
+          id: 'valid-first',
+          timestamp: { original: null, normalized: null, resolved: false },
+          ariaLabel: null,
+          message: 'Seeded before the invalid record.',
+          sender: 'Alex',
+          direction: 'INCOMING',
+        },
+        {
+          id: '',
+          timestamp: { original: null, normalized: null, resolved: false },
+          ariaLabel: null,
+          message: 'Invalid message ID.',
+          sender: 'Alex',
+          direction: 'INCOMING',
+        },
+      ],
+    }),
+    createContextStore: () => contextStore,
+    startCombustion: async () => {
+      combustionStarted = true;
+      return createTestCombustionController();
+    },
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(combustionStarted, false);
+  assert.equal(disconnects, 1);
+  assert.equal(contextStore.getState().size, 1);
+  assert.deepEqual(result.errors, [
+    'Unable to crank engine: Unable to seed historical message context.',
+  ]);
+});
+
+test('start disconnects the session when Combustion initialization fails', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  let disconnects = 0;
+  const result = await captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
+    launchBrowser: async () => ({
+      endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+      browserVersion: 'Brave Chromium test',
+      disconnected: new Promise<void>(() => undefined),
+      async prepare() {
+        return stubPage;
+      },
+      async disconnect() {
+        disconnects += 1;
+      },
+    }),
+    readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+    startCombustion: async () => {
+      throw new Error('observer could not initialize');
+    },
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(disconnects, 1);
+  assert.deepEqual(result.errors, [
+    'Unable to start Combustion: observer could not initialize',
+  ]);
 });
 
 test('start disconnects the session when shutdown is requested during launch', async context => {
