@@ -47,6 +47,40 @@ const IDLE_THRESHOLD_MS = 120000;
 const LOG_PREFIX = '__MESSENGER_WAKER__:';
 const DEBUG_ENGINE = true;
 
+const ANSI_RESET = '\u001b[0m';
+
+// Colors are decorative only: when stdout is not an interactive terminal,
+// NO_COLOR is set, or TERM=dumb, every helper below returns plain text.
+const DEBUG_COLORS_ENABLED =
+  process.stdout.isTTY === true &&
+  process.env.NO_COLOR === undefined &&
+  process.env.TERM !== 'dumb';
+
+type DebugStyle = 'bold' | 'dim' | 'cyan' | 'green' | 'yellow';
+
+const DEBUG_STYLE_CODES: Record<DebugStyle, string> = {
+  bold: '\u001b[1m',
+  dim: '\u001b[2m',
+  cyan: '\u001b[36m',
+  green: '\u001b[32m',
+  yellow: '\u001b[33m',
+};
+
+function styled(text: string, style: DebugStyle): string {
+  if (!DEBUG_COLORS_ENABLED) {
+    return text;
+  }
+  return `${DEBUG_STYLE_CODES[style]}${text}${ANSI_RESET}`;
+}
+
+function styledLabel(text: string): string {
+  return styled(text.padEnd(20), 'dim');
+}
+
+function debugBorder(): string {
+  return styled('='.repeat(80), 'dim');
+}
+
 type EngineMessage = MessageDetails & { mention?: boolean };
 type ScheduledPacket = (PacketBuilderPacket | RngPacket) & {
   mentionMessages?: PacketBuilderMessage[];
@@ -121,21 +155,26 @@ function containsMention(message: string, aliases: readonly string[]): boolean {
 
 function formatPacketMessages(messages: PacketBuilderMessage[]): string {
   if (messages.length === 0) {
-    return '  (none)';
+    return `  ${styled('(none)', 'dim')}`;
   }
-  return messages.map(message =>
-    `  - id=${message.messageId}; mention=${message.mention}; ` +
-    `text=${JSON.stringify(message.message.replace(/\s+/g, ' ') || '(no text content)')}`
-  ).join('\n');
+  return messages.map(message => {
+    const mentionValue = String(message.mention);
+    return `  ${styled('-', 'dim')} ${styled(`id=${message.messageId}`, 'dim')}; ` +
+      `${styled('mention=', 'dim')}` +
+      `${message.mention ? styled(mentionValue, 'yellow') : mentionValue}; ` +
+      `${styled('text=', 'dim')}` +
+      `${JSON.stringify(message.message.replace(/\s+/g, ' ') || '(no text content)')}`;
+  }).join('\n');
 }
 
 function formatMessages(messages: MessageText[]): string {
   if (messages.length === 0) {
-    return '  (none)';
+    return `  ${styled('(none)', 'dim')}`;
   }
   return messages.map(message =>
-    `  - id=${message.messageId}; ` +
-    `text=${JSON.stringify(message.message.replace(/\s+/g, ' ') || '(no text content)')}`
+    `  ${styled('-', 'dim')} ${styled(`id=${message.messageId}`, 'dim')}; ` +
+    `${styled('text=', 'dim')}` +
+    `${JSON.stringify(message.message.replace(/\s+/g, ' ') || '(no text content)')}`
   ).join('\n');
 }
 
@@ -157,18 +196,24 @@ function displayContextStore({
   }
 
   const deferred = state === null || retainedMessages === null;
-  const border = '='.repeat(80);
+  const border = debugBorder();
   console.log(
-    `\n${border}\nCONTEXT STORE UPDATE\n${border}\n` +
-    `Newly appended: ${appendedMessages.length}\n` +
-    `Currently retained: ${deferred ? '(deferred)' : state.size}\n` +
-    `Maximum capacity: ${maxMessages}\n` +
-    `New messages:\n${formatMessages(appendedMessages)}\n` +
+    `\n${border}\n${styled('CONTEXT STORE UPDATE', 'bold')}\n${border}\n` +
+    `${styledLabel('Newly appended:')}` +
+    `${styled(String(appendedMessages.length), 'green')}\n` +
+    `${styledLabel('Currently retained:')}` +
+    `${deferred ? styled('(deferred)', 'yellow') : state.size}\n` +
+    `${styledLabel('Maximum capacity:')}${maxMessages}\n` +
+    `${styled('New messages:', 'cyan')}\n${formatMessages(appendedMessages)}\n` +
     (deferred
-      ? 'Eviction details and aggregate contents skipped; packet work prevents safe reads.\n'
-      : `Evicted this update (${evictedMessages.length}):\n` +
+      ? `${styled(
+          'Eviction details and aggregate contents skipped; ' +
+            'packet work prevents safe reads.',
+          'yellow',
+        )}\n`
+      : `${styledLabel(`Evicted this update (${evictedMessages.length}):`)}\n` +
         `${formatMessages(evictedMessages)}\n` +
-        `Full retained store, in observation order:\n` +
+        `${styled('Full retained store, in observation order:', 'cyan')}\n` +
         `${formatMessages(retainedMessages)}\n`) +
     border
   );
@@ -348,8 +393,10 @@ function appendContextMessages(
 }
 
 function printPacketBoundary(label: string, packetId: string): void {
-  const border = '='.repeat(80);
-  console.log(`\n${border}\n${label}: ${packetId}\n${border}`);
+  const border = debugBorder();
+  console.log(
+    `\n${border}\n${styled(`${label}:`, 'bold')} ${styled(packetId, 'cyan')}\n${border}`,
+  );
 }
 
 function describePacketClosureReason(newMessageCount: number): string {
@@ -361,11 +408,12 @@ function describePacketClosureReason(newMessageCount: number): string {
 
 function logPacket(label: string, packet: PacketBuilderPacket): void {
   console.log(
-    `${label}: ${packet.packetId}\n` +
-    ` New work (${packet.newMessages.length}):\n${formatPacketMessages(packet.newMessages)}\n` +
-    ` Mention messages (${packet.mentionMessages.length}):\n` +
+    `${styled(`${label}:`, 'cyan')} ${styled(packet.packetId, 'bold')}\n` +
+    ` ${styled(`New work (${packet.newMessages.length}):`, 'dim')}\n` +
+    `${formatPacketMessages(packet.newMessages)}\n` +
+    ` ${styled(`Mention messages (${packet.mentionMessages.length}):`, 'dim')}\n` +
     `${formatPacketMessages(packet.mentionMessages)}\n` +
-    ` Context only (${packet.contextMessages.length}):\n` +
+    ` ${styled(`Context only (${packet.contextMessages.length}):`, 'dim')}\n` +
     `${formatPacketMessages(packet.contextMessages)}`
   );
 }
@@ -376,15 +424,17 @@ function printQueueSnapshot(scheduler: PacketScheduler): void {
     ...(activePacket ? [activePacket.packetId] : []),
     ...pendingPackets.map(packet => packet.packetId),
   ];
-  const border = '='.repeat(80);
+  const border = debugBorder();
   console.log(
-    `\n${border}\nIN QUEUE\n${border}\n` +
-    `[queue] active packet (held): ${activePacket?.packetId ?? '(none)'}\n` +
-    `[queue] packets waiting: ${pendingPackets.length}\n` +
-    `[queue] waiting packet IDs (FIFO): ` +
+    `\n${border}\n${styled('IN QUEUE', 'bold')}\n${border}\n` +
+    `${styled('[queue] active packet (held):', 'dim')} ` +
+    `${activePacket ? styled(activePacket.packetId, 'bold') : '(none)'}\n` +
+    `${styled('[queue] packets waiting:', 'dim')} ${pendingPackets.length}\n` +
+    `${styled('[queue] waiting packet IDs (FIFO):', 'dim')} ` +
     `${pendingPackets.map(packet => packet.packetId).join(' -> ') || '(none)'}\n` +
-    `[queue] packets retained: ${packetIds.length}\n` +
-    `[queue] packet IDs (active, then waiting): ${packetIds.join(' -> ') || '(none)'}\n` +
+    `${styled('[queue] packets retained:', 'dim')} ${packetIds.length}\n` +
+    `${styled('[queue] packet IDs (active, then waiting):', 'dim')} ` +
+    `${packetIds.join(' -> ') || '(none)'}\n` +
     border
   );
 }
