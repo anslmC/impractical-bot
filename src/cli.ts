@@ -23,6 +23,7 @@ import {
   type TerminalPrompt,
 } from './browser/initialization.js';
 import {
+  assertConfiguredBrowserCanStart,
   closeConfiguredBrowser,
   launchConfiguredBrowser,
   navigateConfiguredBrowserToMessageDestination,
@@ -55,10 +56,17 @@ import {
   readMessengerMessages,
   type BackreadResult,
 } from './components/backread.js';
+import {
+  createRuntimeControl,
+  requestRuntimeStop,
+  RuntimeAlreadyRunningError,
+  type RuntimeControl,
+} from './runtime-control.js';
 
 type Output = (message: string) => void;
 
 export interface CliRuntimeOptions {
+  checkBrowserStartup?: (configuration: Configuration) => Promise<void>;
   launchBrowser?: (configuration: Configuration) => Promise<BrowserLaunchSession>;
   promptSecret?: TerminalPrompt;
   validateNvidiaApiKey?: (apiKey: string) => Promise<void>;
@@ -583,6 +591,14 @@ async function handleStart(
     writeError('NVIDIA API key is missing. Run `impbot init` or `impbot updatekey` first.');
     return 1;
   }
+  try {
+    await (runtime.checkBrowserStartup ?? assertConfiguredBrowserCanStart)(
+      configurationResult.configuration,
+    );
+  } catch (error) {
+    writeError(`Unable to start browser: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
   if (!DEBUG_MODE || ENABLE_DEBUG_AUTO_RESPONSE) {
     try {
       await (runtime.validateNvidiaApiKey ?? validateNvidiaApiKey)(apiKey);
@@ -595,17 +611,40 @@ async function handleStart(
     writeOutput('Debug mode enabled; skipping NVIDIA API key validation.');
   }
 
-  let resolveSigint!: () => void;
-  const sigintPromise = new Promise<void>(resolve => {
-    resolveSigint = resolve;
+  type ShutdownSource = 'sigint' | 'runtime-control' | 'injected';
+  let resolveShutdown!: (source: ShutdownSource) => void;
+  const shutdownRequest = new Promise<ShutdownSource>(resolve => {
+    resolveShutdown = resolve;
   });
-  const onSigint = (): void => resolveSigint();
-  process.once('SIGINT', onSigint);
-  const shutdownPromise = runtime.waitForShutdown
-    ? Promise.race([sigintPromise, Promise.resolve().then(() => runtime.waitForShutdown!())])
-    : sigintPromise;
-  let session: BrowserLaunchSession | undefined;
   let combustionController: CombustionController | undefined;
+  let runtimeControl: RuntimeControl | undefined;
+  const onSigint = (): void => {
+    runtimeControl?.setState('stopping');
+    resolveShutdown('sigint');
+  };
+  process.once('SIGINT', onSigint);
+  try {
+    runtimeControl = await createRuntimeControl(
+      configurationFilePath,
+      () => resolveShutdown('runtime-control'),
+    );
+  } catch (error) {
+    process.removeListener('SIGINT', onSigint);
+    writeError(error instanceof RuntimeAlreadyRunningError
+      ? error.message
+      : `Unable to claim runtime ownership: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+  const shutdownPromise: Promise<ShutdownSource> = runtime.waitForShutdown
+    ? Promise.race([
+        shutdownRequest,
+        Promise.resolve().then(() => runtime.waitForShutdown!()).then(() => {
+          runtimeControl?.setState('stopping');
+          return 'injected' as const;
+        }),
+      ])
+    : shutdownRequest;
+  let session: BrowserLaunchSession | undefined;
   let aliasData: ReturnType<typeof generateAliases> | undefined;
   let exitCode = 0;
   let startupStage: 'launch' | 'prepare' | 'cranking' | 'combustion' = 'launch';
@@ -617,7 +656,7 @@ async function handleStart(
         launchedSession => ({ type: 'launched' as const, session: launchedSession }),
         error => ({ type: 'failed' as const, error }),
       ),
-      shutdownPromise.then(() => ({ type: 'shutdown' as const })),
+      shutdownPromise.then(source => ({ type: 'shutdown' as const, source })),
     ]);
     if (launchResult.type === 'failed') {
       writeError(`Unable to start browser: ${launchResult.error instanceof Error ? launchResult.error.message : String(launchResult.error)}`);
@@ -625,19 +664,22 @@ async function handleStart(
     } else if (launchResult.type === 'shutdown') {
       session = await launchPromise.catch(() => undefined);
       writeOutput('Shutdown requested; disconnecting Playwright.');
-      exitCode = 130;
+      exitCode = launchResult.source === 'runtime-control' ? 0 : 130;
     } else {
       session = launchResult.session;
       startupStage = 'prepare';
-      writeOutput(`Browser launched and connected (${session.browserVersion}).`);
+      writeOutput(
+        `${session.reusedExistingBrowser ? 'Attached to existing browser' : 'Browser launched and connected'} ` +
+        `(${session.browserVersion}).`,
+      );
       const preparationResult = await Promise.race([
         session.prepare().then(page => ({ type: 'ready' as const, page })),
-        shutdownPromise.then(() => ({ type: 'shutdown' as const })),
+        shutdownPromise.then(source => ({ type: 'shutdown' as const, source })),
         session.disconnected.then(() => ({ type: 'disconnected' as const })),
       ]);
       if (preparationResult.type === 'shutdown') {
         writeOutput('Shutdown requested; disconnecting Playwright.');
-        exitCode = 130;
+        exitCode = preparationResult.source === 'runtime-control' ? 0 : 130;
       } else if (preparationResult.type === 'disconnected') {
         throw new Error('The browser disconnected during startup preparation.');
       } else {
@@ -729,15 +771,16 @@ async function handleStart(
           apiKey,
           debugMode: DEBUG_MODE,
         });
+        runtimeControl.setState('running');
         writeOutput(`Engine ready at ${configurationResult.configuration.messageDestination}.`);
         const runtimeResult = await Promise.race([
-          shutdownPromise.then(() => 'shutdown' as const),
+          shutdownPromise.then(source => ({ type: 'shutdown' as const, source })),
           session.disconnected.then(() => 'disconnected' as const),
           combustionController.stopped.then(() => 'combustion-stopped' as const),
         ]);
-        if (runtimeResult === 'shutdown') {
+        if (typeof runtimeResult === 'object' && runtimeResult.type === 'shutdown') {
           writeOutput('Shutdown requested; disconnecting Playwright.');
-          exitCode = 130;
+          exitCode = runtimeResult.source === 'runtime-control' ? 0 : 130;
         } else if (runtimeResult === 'combustion-stopped') {
           throw new Error('Combustion stopped unexpectedly.');
         } else {
@@ -757,6 +800,7 @@ async function handleStart(
     exitCode = 1;
   } finally {
     process.removeListener('SIGINT', onSigint);
+    runtimeControl.setState('stopping');
     if (combustionController) {
       try {
         await combustionController.stop();
@@ -772,6 +816,13 @@ async function handleStart(
         writeError(`Unable to disconnect Playwright: ${error instanceof Error ? error.message : String(error)}`);
         exitCode = 1;
       }
+    }
+    runtimeControl.complete(exitCode);
+    try {
+      await runtimeControl.close();
+    } catch (error) {
+      writeError(`Unable to release runtime ownership: ${error instanceof Error ? error.message : String(error)}`);
+      exitCode = 1;
     }
   }
   return exitCode;
@@ -813,10 +864,23 @@ async function handleUpdateKey(
   return 0;
 }
 
-async function handleStop(writeOutput: Output, writeError: Output): Promise<number> {
-  writeError('No browser session is managed by this process; `start` leaves the browser running.');
-  void writeOutput;
-  return 1;
+async function handleStop(
+  writeOutput: Output,
+  writeError: Output,
+  configurationFilePath: string | undefined,
+): Promise<number> {
+  try {
+    const result = await requestRuntimeStop(configurationFilePath);
+    if (result.status === 'not-running') {
+      writeOutput('No impractical-bot engine is running for this configuration.');
+      return 0;
+    }
+    writeOutput(`Engine ${result.instanceId} stopped gracefully.`);
+    return 0;
+  } catch (error) {
+    writeError(`Unable to stop impractical-bot: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
 }
 
 function getVersion(): string {
@@ -872,7 +936,7 @@ export async function runCli(
     ),
     updatekey: () => handleUpdateKey(writeOutput, writeError, configurationFilePath, runtime),
     start: () => handleStart(writeOutput, writeError, configurationFilePath, prompt, runtime),
-    stop: () => handleStop(writeOutput, writeError),
+    stop: () => handleStop(writeOutput, writeError, configurationFilePath),
   };
   const handler = command ? handlers[command] : undefined;
 

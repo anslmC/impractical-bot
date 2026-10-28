@@ -26,6 +26,7 @@ async function captureCli(
   const errors: string[] = [];
   const testRuntime: CliRuntimeOptions = {
     ...runtime,
+    checkBrowserStartup: runtime?.checkBrowserStartup ?? (async () => undefined),
     startCombustion: runtime?.startCombustion ?? (async () => createTestCombustionController()),
   };
   const exitCode = await runCli(
@@ -300,6 +301,41 @@ test('start prepares the destination, remains alive after readiness, and disconn
   if (savedConfiguration.status === 'valid') {
     assert.equal(savedConfiguration.configuration.puppetName, 'Test Puppet');
   }
+});
+
+test('start rejects a conflicting browser profile before NVIDIA validation', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  let checkCalls = 0;
+  let validationCalls = 0;
+  let launchCalls = 0;
+  const conflictMessage =
+    'The configured browser profile is already in use by process(es) 23884, 24716. ' +
+    'The existing browser cannot be safely attached through CDP port 9222; ' +
+    'close the configured browser completely before starting impractical-bot.';
+
+  const result = await captureCli(['start'], configurationFilePath, undefined, undefined, {
+    checkBrowserStartup: async configuration => {
+      checkCalls += 1;
+      assert.deepEqual(configuration, validConfiguration);
+      throw new Error(conflictMessage);
+    },
+    validateNvidiaApiKey: async () => {
+      validationCalls += 1;
+    },
+    launchBrowser: async () => {
+      launchCalls += 1;
+      throw new Error('must not launch');
+    },
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(checkCalls, 1);
+  assert.equal(validationCalls, 0);
+  assert.equal(launchCalls, 0);
+  assert.deepEqual(result.errors, [`Unable to start browser: ${conflictMessage}`]);
+  assert.deepEqual(result.output, []);
 });
 
 test('start preserves the saved puppet name and continues when profile retrieval fails', async context => {
@@ -1170,18 +1206,169 @@ test('changebrowser leaves configuration untouched when graceful browser closure
   });
 });
 
-test('stop remains separate and does not attach to or close a browser', async () => {
+test('stop reports clearly when no engine is running', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
   let launchAttempted = false;
-  const result = await captureCli(['stop'], undefined, undefined, undefined, {
+  const result = await captureCli(['stop'], configurationFilePath, undefined, undefined, {
     launchBrowser: async () => {
       launchAttempted = true;
       throw new Error('stop must not launch');
     },
   });
 
-  assert.equal(result.exitCode, 1);
+  assert.equal(result.exitCode, 0);
   assert.equal(launchAttempted, false);
-  assert.match(result.errors[0], /No browser session is managed/);
+  assert.match(result.output[0], /No impractical-bot engine is running/);
+  assert.deepEqual(result.errors, []);
+});
+
+test('stop waits for Combustion cleanup before disconnecting Playwright', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const stopEntered = deferred<void>();
+  const finishCombustionStop = deferred<void>();
+  const events: string[] = [];
+  let disconnects = 0;
+  const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
+    launchBrowser: async () => ({
+      endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+      browserVersion: 'Brave Chromium test',
+      disconnected: new Promise<void>(() => undefined),
+      async prepare() {
+        return stubPage;
+      },
+      async disconnect() {
+        events.push('playwright-disconnected');
+        disconnects += 1;
+      },
+    }),
+    readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+    startCombustion: async () => ({
+      stopped: new Promise<void>(() => undefined),
+      async stop() {
+        events.push('combustion-stop-started');
+        stopEntered.resolve();
+        await finishCombustionStop.promise;
+        events.push('combustion-stopped');
+      },
+    }),
+  }, message => {
+    if (message.startsWith('Engine ready')) ready.resolve();
+  });
+
+  await ready.promise;
+  let stopSettled = false;
+  const stop = captureCli(['stop'], configurationFilePath).then(result => {
+    stopSettled = true;
+    return result;
+  });
+  await stopEntered.promise;
+  assert.equal(stopSettled, false);
+  assert.equal(disconnects, 0);
+
+  finishCombustionStop.resolve();
+  const stopResult = await stop;
+  const startResult = await start;
+  assert.equal(stopResult.exitCode, 0);
+  assert.match(stopResult.output[0], /stopped gracefully/);
+  assert.equal(startResult.exitCode, 0);
+  assert.deepEqual(events, [
+    'combustion-stop-started',
+    'combustion-stopped',
+    'playwright-disconnected',
+  ]);
+  assert.equal(disconnects, 1);
+
+  const afterShutdown = await captureCli(['stop'], configurationFilePath);
+  assert.match(afterShutdown.output[0], /No impractical-bot engine is running/);
+});
+
+test('duplicate start is rejected before a second browser launch', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  let launchAttempts = 0;
+  const runtime: CliRuntimeOptions = {
+    validateNvidiaApiKey: async () => undefined,
+    launchBrowser: async () => {
+      launchAttempts += 1;
+      return {
+        endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+        browserVersion: 'Brave Chromium test',
+        disconnected: new Promise<void>(() => undefined),
+        async prepare() {
+          return stubPage;
+        },
+        async disconnect() {
+          return undefined;
+        },
+      };
+    },
+    readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+  };
+  const start = captureCli(
+    ['start'],
+    configurationFilePath,
+    undefined,
+    undefined,
+    runtime,
+    message => {
+      if (message.startsWith('Engine ready')) ready.resolve();
+    },
+  );
+  await ready.promise;
+
+  const duplicate = await captureCli(
+    ['start'],
+    configurationFilePath,
+    undefined,
+    undefined,
+    runtime,
+  );
+  assert.equal(duplicate.exitCode, 1);
+  assert.match(duplicate.errors[0], /engine is already running/);
+  assert.equal(launchAttempts, 1);
+
+  const stopped = await captureCli(['stop'], configurationFilePath);
+  assert.equal(stopped.exitCode, 0);
+  assert.equal((await start).exitCode, 0);
+});
+
+test('SIGINT still performs owner cleanup and releases runtime ownership', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  let disconnects = 0;
+  const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
+    launchBrowser: async () => ({
+      endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+      browserVersion: 'Brave Chromium test',
+      disconnected: new Promise<void>(() => undefined),
+      async prepare() {
+        return stubPage;
+      },
+      async disconnect() {
+        disconnects += 1;
+      },
+    }),
+    readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+  }, message => {
+    if (message.startsWith('Engine ready')) ready.resolve();
+  });
+
+  await ready.promise;
+  process.emit('SIGINT');
+  const result = await start;
+  assert.equal(result.exitCode, 130);
+  assert.equal(disconnects, 1);
+  const afterShutdown = await captureCli(['stop'], configurationFilePath);
+  assert.match(afterShutdown.output[0], /No impractical-bot engine is running/);
 });
 
 test('init dispatches to its injected initialization workflow', async () => {

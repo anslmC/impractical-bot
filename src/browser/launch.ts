@@ -19,6 +19,12 @@ export interface BrowserLaunchFileSystem {
   mkdir(path: string, options: { recursive: true }): Promise<unknown>;
 }
 
+export type ProfileProcessFinder = (
+  executablePath: string,
+  profilePath: string,
+  debuggingPort?: number,
+) => Promise<number[]>;
+
 export interface BrowserLaunchOptions {
   platform?: NodeJS.Platform;
   startupTimeoutMs?: number;
@@ -38,16 +44,22 @@ export interface BrowserLaunchOptions {
     endpoint: string,
     options: ConnectOverCDPOptions,
   ) => Promise<Browser>;
-  findProfileProcesses?: (executablePath: string, profilePath: string) => Promise<number[]>;
+  findProfileProcesses?: ProfileProcessFinder;
   now?: () => number;
   delay?: (milliseconds: number) => Promise<void>;
+}
+
+export interface BrowserStartupCheckOptions {
+  platform?: NodeJS.Platform;
+  connectionTimeoutMs?: number;
+  findProfileProcesses?: ProfileProcessFinder;
 }
 
 export interface BrowserCloseOptions {
   platform?: NodeJS.Platform;
   shutdownTimeoutMs?: number;
   pollIntervalMs?: number;
-  findProfileProcesses?: (executablePath: string, profilePath: string) => Promise<number[]>;
+  findProfileProcesses?: ProfileProcessFinder;
   requestProcessClose?: (processIds: number[]) => Promise<void>;
   now?: () => number;
   delay?: (milliseconds: number) => Promise<void>;
@@ -57,7 +69,7 @@ export interface BrowserNavigationOptions {
   platform?: NodeJS.Platform;
   connectionTimeoutMs?: number;
   navigationTimeoutMs?: number;
-  findProfileProcesses?: (executablePath: string, profilePath: string) => Promise<number[]>;
+  findProfileProcesses?: ProfileProcessFinder;
   connectOverCDP?: (
     endpoint: string,
     options: ConnectOverCDPOptions,
@@ -68,6 +80,7 @@ export interface BrowserLaunchSession {
   endpoint: string;
   browserVersion: string;
   disconnected: Promise<void>;
+  reusedExistingBrowser?: boolean;
   prepare(): Promise<Page>;
   isWindowMinimized?(page: Page): Promise<boolean | undefined>;
   disconnect(): Promise<void>;
@@ -81,14 +94,20 @@ interface ChildState {
 const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
 const DEFAULT_POLL_INTERVAL_MS = 100;
 const DEFAULT_CONNECTION_TIMEOUT_MS = 10_000;
+const DEFAULT_EXISTING_BROWSER_TIMEOUT_MS = 2_000;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
 const defaultFileSystem: BrowserLaunchFileSystem = { mkdir };
 
-function findProfileProcesses(executablePath: string, profilePath: string): Promise<number[]> {
+function findProfileProcesses(
+  executablePath: string,
+  profilePath: string,
+  debuggingPort?: number,
+): Promise<number[]> {
   const script = `
 $ErrorActionPreference = 'Stop'
 $profile = $env:IMPBOT_PROFILE_PATH.TrimEnd([char]92)
 $needle = '--user-data-dir=' + $profile
+$portNeedle = if ($env:IMPBOT_CDP_PORT) { '--remote-debugging-port=' + $env:IMPBOT_CDP_PORT } else { $null }
 $comparison = [System.StringComparison]::OrdinalIgnoreCase
 $matchingProcessIds = @(Get-CimInstance Win32_Process -Filter "Name='$env:IMPBOT_BROWSER_NAME'" | Where-Object {
   $commandLine = [string]$_.CommandLine
@@ -97,7 +116,20 @@ $matchingProcessIds = @(Get-CimInstance Win32_Process -Filter "Name='$env:IMPBOT
     return $false
   }
   $end = $index + $needle.Length
-  $end -eq $commandLine.Length -or [char]::IsWhiteSpace($commandLine[$end]) -or $commandLine[$end] -eq '"' -or $commandLine[$end] -eq [char]92
+  if (-not ($end -eq $commandLine.Length -or [char]::IsWhiteSpace($commandLine[$end]) -or $commandLine[$end] -eq '"' -or $commandLine[$end] -eq [char]92)) {
+    return $false
+  }
+  if ($portNeedle) {
+    $portIndex = $commandLine.IndexOf($portNeedle, $comparison)
+    if ($portIndex -lt 0) {
+      return $false
+    }
+    $portEnd = $portIndex + $portNeedle.Length
+    if (-not ($portEnd -eq $commandLine.Length -or [char]::IsWhiteSpace($commandLine[$portEnd]) -or $commandLine[$portEnd] -eq '"')) {
+      return $false
+    }
+  }
+  return $true
 } | ForEach-Object { [int]$_.ProcessId })
 if ($matchingProcessIds.Count -eq 0) { '[]' } else { ConvertTo-Json -InputObject $matchingProcessIds -Compress }
 `;
@@ -114,6 +146,7 @@ if ($matchingProcessIds.Count -eq 0) { '[]' } else { ConvertTo-Json -InputObject
           IMPBOT_BROWSER_NAME: win32.basename(executablePath),
           IMPBOT_BROWSER_PATH: executablePath,
           IMPBOT_PROFILE_PATH: profilePath,
+          IMPBOT_CDP_PORT: debuggingPort === undefined ? '' : String(debuggingPort),
         },
       },
       (error, stdout) => {
@@ -857,6 +890,200 @@ async function waitForEndpoint(
   throw new Error('Timed out waiting for the browser CDP endpoint.');
 }
 
+interface ExistingBrowserInspection {
+  processIds: number[];
+  endpoint: string;
+}
+
+interface ExistingBrowserInspectionOptions {
+  getProfileProcesses: ProfileProcessFinder;
+  now: () => number;
+  delay: (milliseconds: number) => Promise<void>;
+  connectionTimeoutMs: number;
+  pollIntervalMs: number;
+}
+
+function existingBrowserError(
+  processIds: number[],
+  cdpPort: number,
+  cause?: unknown,
+): Error {
+  return new Error(
+    `The configured browser profile is already in use by process(es) ${processIds.join(', ')}. ` +
+    `The existing browser cannot be safely attached through CDP port ${cdpPort}; ` +
+    'close the configured browser completely before starting impractical-bot.',
+    cause === undefined ? undefined : { cause },
+  );
+}
+
+async function inspectExistingBrowser(
+  configuration: Configuration,
+  options: ExistingBrowserInspectionOptions,
+): Promise<ExistingBrowserInspection | null> {
+  const cdpPort = configuration.cdpPort!;
+  const processIds = await options.getProfileProcesses(
+    configuration.executablePath,
+    configuration.profilePath,
+  );
+  if (processIds.length === 0) {
+    return null;
+  }
+
+  const attachableProcessIds = await options.getProfileProcesses(
+    configuration.executablePath,
+    configuration.profilePath,
+    cdpPort,
+  );
+  if (attachableProcessIds.length === 0) {
+    throw existingBrowserError(processIds, cdpPort);
+  }
+
+  let endpoint: string;
+  try {
+    endpoint = await waitForEndpoint(
+      cdpPort,
+      { exited: false },
+      options.now,
+      options.delay,
+      Math.min(options.connectionTimeoutMs, DEFAULT_EXISTING_BROWSER_TIMEOUT_MS),
+      Math.min(options.pollIntervalMs, 100),
+    );
+  } catch (error) {
+    throw existingBrowserError(processIds, cdpPort, error);
+  }
+
+  return { processIds: attachableProcessIds, endpoint };
+}
+
+async function createBrowserLaunchSession(
+  browser: Browser,
+  endpoint: string,
+  configuration: Configuration,
+  options: BrowserLaunchOptions,
+  reusedExistingBrowser: boolean,
+  verifyOwnership?: () => void | Promise<void>,
+): Promise<BrowserLaunchSession> {
+  try {
+    if (!browser.isConnected()) {
+      throw new Error('Playwright completed the CDP connection but reports the browser disconnected.');
+    }
+    let notifyDisconnected!: () => void;
+    const disconnected = new Promise<void>(resolve => {
+      notifyDisconnected = resolve;
+    });
+    browser.once('disconnected', notifyDisconnected);
+    const browserVersion = await browser.version();
+    await verifyOwnership?.();
+    if (!browserVersion.trim() || !browser.isConnected()) {
+      throw new Error('Playwright CDP connection verification failed.');
+    }
+
+    let disconnectPromise: Promise<void> | undefined;
+    return {
+      endpoint,
+      browserVersion,
+      disconnected,
+      reusedExistingBrowser,
+      prepare() {
+        if (!browser.isConnected()) {
+          return Promise.reject(new Error('The configured browser disconnected before startup preparation.'));
+        }
+        return prepareConfiguredBrowser(browser, configuration, options);
+      },
+      async isWindowMinimized(page: Page) {
+        const cdpSession = await page.context().newCDPSession(page);
+        try {
+          const { bounds } = await cdpSession.send('Browser.getWindowForTarget');
+          return bounds.windowState === 'minimized';
+        } finally {
+          await cdpSession.detach().catch(() => undefined);
+        }
+      },
+      disconnect() {
+        disconnectPromise ??= browser.isConnected() ? browser.close() : Promise.resolve();
+        return disconnectPromise;
+      },
+    };
+  } catch (error) {
+    if (browser.isConnected()) {
+      await browser.close().catch(() => undefined);
+    }
+    throw error;
+  }
+}
+
+async function attachToExistingBrowser(
+  configuration: Configuration,
+  inspection: ExistingBrowserInspection,
+  options: BrowserLaunchOptions,
+  connectionTimeoutMs: number,
+): Promise<BrowserLaunchSession> {
+  const cdpPort = configuration.cdpPort!;
+  const connectOverCDP = options.connectOverCDP ?? ((url, connectOptions) =>
+    chromium.connectOverCDP(url, connectOptions));
+  let browser: Browser;
+  try {
+    browser = await connectOverCDP(inspection.endpoint, {
+      isLocal: true,
+      timeout: connectionTimeoutMs,
+    });
+  } catch (error) {
+    throw existingBrowserError(inspection.processIds, cdpPort, error);
+  }
+
+  try {
+    return await createBrowserLaunchSession(
+      browser,
+      inspection.endpoint,
+      configuration,
+      options,
+      true,
+      async () => {
+        const ownerProcessIds = await (options.findProfileProcesses ?? findProfileProcesses)(
+          configuration.executablePath,
+          configuration.profilePath,
+          cdpPort,
+        );
+        if (!ownerProcessIds.some(processId => inspection.processIds.includes(processId))) {
+          throw existingBrowserError(inspection.processIds, cdpPort);
+        }
+      },
+    );
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('The configured browser profile is already in use')) {
+      throw error;
+    }
+    throw existingBrowserError(inspection.processIds, cdpPort, error);
+  }
+}
+
+export async function assertConfiguredBrowserCanStart(
+  configuration: Configuration,
+  options: BrowserStartupCheckOptions = {},
+): Promise<void> {
+  const platform = options.platform ?? process.platform;
+  if (platform !== 'win32') {
+    throw new Error(`Browser launching is not supported on '${platform}'.`);
+  }
+
+  const validatedConfiguration = validateConfiguration(configuration);
+  if (validatedConfiguration.cdpPort === undefined || !validatedConfiguration.startupUrl) {
+    throw new Error('Configuration is missing its CDP port or startup URL. Run `impbot init` to update it.');
+  }
+  const connectionTimeoutMs = options.connectionTimeoutMs ?? DEFAULT_CONNECTION_TIMEOUT_MS;
+  if (connectionTimeoutMs <= 0) {
+    throw new Error('Browser connection timeout must be positive.');
+  }
+
+  await inspectExistingBrowser(validatedConfiguration, {
+    getProfileProcesses: options.findProfileProcesses ?? findProfileProcesses,
+    now: Date.now,
+    delay: defaultDelay,
+    connectionTimeoutMs,
+    pollIntervalMs: DEFAULT_POLL_INTERVAL_MS,
+  });
+}
+
 export async function launchConfiguredBrowser(
   configuration: Configuration,
   options: BrowserLaunchOptions = {},
@@ -879,13 +1106,21 @@ export async function launchConfiguredBrowser(
   }
 
   const getProfileProcesses = options.findProfileProcesses ?? findProfileProcesses;
-  const existingProcesses = await getProfileProcesses(
-    validatedConfiguration.executablePath,
-    validatedConfiguration.profilePath,
-  );
-  if (existingProcesses.length > 0) {
-    throw new Error(
-      `Browser process(es) ${existingProcesses.join(', ')} already use the configured profile; refusing to launch another tab.`,
+  const now = options.now ?? Date.now;
+  const delay = options.delay ?? defaultDelay;
+  const existingBrowser = await inspectExistingBrowser(validatedConfiguration, {
+    getProfileProcesses,
+    now,
+    delay,
+    connectionTimeoutMs,
+    pollIntervalMs,
+  });
+  if (existingBrowser) {
+    return attachToExistingBrowser(
+      validatedConfiguration,
+      existingBrowser,
+      options,
+      connectionTimeoutMs,
     );
   }
   await assertPortAvailable(validatedConfiguration.cdpPort);
@@ -920,8 +1155,6 @@ export async function launchConfiguredBrowser(
   });
   child.unref();
 
-  const now = options.now ?? Date.now;
-  const delay = options.delay ?? defaultDelay;
   const endpoint = await waitForEndpoint(
     validatedConfiguration.cdpPort,
     childState,
@@ -945,49 +1178,16 @@ export async function launchConfiguredBrowser(
     timeout: connectionTimeoutMs,
   });
 
-  try {
-    if (!browser.isConnected()) {
-      throw new Error('Playwright completed the CDP connection but reports the browser disconnected.');
-    }
-    let notifyDisconnected!: () => void;
-    const disconnected = new Promise<void>(resolve => {
-      notifyDisconnected = resolve;
-    });
-    browser.once('disconnected', notifyDisconnected);
-    const browserVersion = await browser.version();
-    if (!browserVersion.trim() || !browser.isConnected() || childState.exited) {
-      throw new Error('Playwright CDP connection verification failed.');
-    }
-
-    let disconnectPromise: Promise<void> | undefined;
-    return {
-      endpoint,
-      browserVersion,
-      disconnected,
-      prepare() {
-        if (!browser.isConnected()) {
-          return Promise.reject(new Error('The configured browser disconnected before startup preparation.'));
-        }
-        return prepareConfiguredBrowser(browser, validatedConfiguration, options);
-      },
-      async isWindowMinimized(page: Page) {
-        const cdpSession = await page.context().newCDPSession(page);
-        try {
-          const { bounds } = await cdpSession.send('Browser.getWindowForTarget');
-          return bounds.windowState === 'minimized';
-        } finally {
-          await cdpSession.detach().catch(() => undefined);
-        }
-      },
-      disconnect() {
-        disconnectPromise ??= browser.isConnected() ? browser.close() : Promise.resolve();
-        return disconnectPromise;
-      },
-    };
-  } catch (error) {
-    if (browser.isConnected()) {
-      await browser.close().catch(() => undefined);
-    }
-    throw error;
-  }
+  return createBrowserLaunchSession(
+    browser,
+    endpoint,
+    validatedConfiguration,
+    options,
+    false,
+    () => {
+      if (childState.exited) {
+        throw new Error('Playwright CDP connection verification failed.');
+      }
+    },
+  );
 }

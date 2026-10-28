@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { test } from 'node:test';
 import {
+  assertConfiguredBrowserCanStart,
   closeConfiguredBrowser,
   launchConfiguredBrowser,
   navigateConfiguredBrowserToMessageDestination,
@@ -912,18 +913,99 @@ test('navigation failure disconnects Playwright without closing the browser', as
   assert.equal(disconnectCount, 1);
 });
 
-test('refuses to launch when the configured profile is already in use', async () => {
+test('startup check accepts an existing profile browser with a usable CDP endpoint', async t => {
+  const port = await getAvailablePort();
+  const config = { ...baseConfiguration, cdpPort: port };
+  const { server, start } = createCdpServer();
+  await start(port);
+  t.after(async () => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
+
+  await assertConfiguredBrowserCanStart(config, {
+    platform: 'win32',
+    findProfileProcesses: async (_executablePath, _profilePath, debuggingPort) => {
+      assert.ok(debuggingPort === undefined || debuggingPort === port);
+      return [9876];
+    },
+  });
+});
+
+test('refuses to launch when the configured profile is in use without a usable CDP endpoint', async () => {
   const child = new FakeProcess();
   let spawned = false;
+  let connectAttempted = false;
   await assert.rejects(launchConfiguredBrowser(baseConfiguration, {
     platform: 'win32',
-    findProfileProcesses: async () => [9876],
+    findProfileProcesses: async (_executablePath, _profilePath, debuggingPort) =>
+      debuggingPort === undefined ? [9876] : [],
     spawnProcess: () => {
       spawned = true;
       return child;
     },
-  }), /already use the configured profile/);
+    connectOverCDP: async () => {
+      connectAttempted = true;
+      throw new Error('must not attach');
+    },
+  }), /already in use by process\(es\) 9876.*close the configured browser completely/s);
   assert.equal(spawned, false);
+  assert.equal(connectAttempted, false);
+});
+
+test('refuses to launch when an existing profile browser does not expose a usable CDP endpoint', async () => {
+  const port = await getAvailablePort();
+  let spawned = false;
+  let connectAttempted = false;
+  await assert.rejects(launchConfiguredBrowser({ ...baseConfiguration, cdpPort: port }, {
+    platform: 'win32',
+    connectionTimeoutMs: 50,
+    pollIntervalMs: 10,
+    findProfileProcesses: async () => [9876],
+    spawnProcess: () => {
+      spawned = true;
+      return new FakeProcess();
+    },
+    connectOverCDP: async () => {
+      connectAttempted = true;
+      throw new Error('must not attach');
+    },
+  }), /already in use by process\(es\) 9876.*close the configured browser completely/s);
+  assert.equal(spawned, false);
+  assert.equal(connectAttempted, false);
+});
+
+test('attaches to an existing profile browser with a usable CDP endpoint', async t => {
+  const port = await getAvailablePort();
+  const config = { ...baseConfiguration, cdpPort: port };
+  const { server, start } = createCdpServer();
+  await start(port);
+  t.after(async () => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
+  const browser = browserMock();
+  let spawned = false;
+  let connectedEndpoint = '';
+  const session = await launchConfiguredBrowser(config, {
+    platform: 'win32',
+    findProfileProcesses: async (_executablePath, _profilePath, debuggingPort) => {
+      assert.ok(debuggingPort === undefined || debuggingPort === port);
+      return [9876];
+    },
+    spawnProcess: () => {
+      spawned = true;
+      return new FakeProcess();
+    },
+    connectOverCDP: async endpoint => {
+      connectedEndpoint = endpoint;
+      return browser.browser as never;
+    },
+  });
+
+  assert.equal(spawned, false);
+  assert.equal(connectedEndpoint, `ws://127.0.0.1:${port}/devtools/browser/test-session`);
+  assert.equal(browser.calls.version, 1);
+  assert.equal(session.reusedExistingBrowser, true);
+
+  await session.disconnect();
+  await session.disconnect();
+  assert.equal(browser.calls.close, 1);
+  assert.equal(server.listening, true);
 });
 
 test('graceful close targets only the configured executable and profile, then verifies process exit', async () => {
