@@ -22,6 +22,7 @@ import {
 } from './mention-packet-builder.js';
 import { createPacketProcessor } from './packet-processor.js';
 import { createPacketScheduler } from './packet-scheduler.js';
+import { createPauseGate } from './pause-gate.js';
 import { getDefaultPersonalityInstruction } from './personality.js';
 import { buildRngPacket, type RngPacket } from './rng-packet-builder.js';
 
@@ -59,6 +60,8 @@ export interface CombustionOptions {
 
 export interface CombustionController {
   stopped: Promise<void>;
+  pause(): Promise<void>;
+  resume(): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -360,11 +363,13 @@ export async function startCombustion({
   apiKey,
   debugMode = false,
 }: CombustionOptions): Promise<CombustionController> {
+  const pauseGate = createPauseGate();
   let observerAttached = false;
   let stopRequested = false;
   let mode: 'polling' | 'idle' = 'polling';
   let wakerActive = false;
   let mainPollInProgress = false;
+  const mainPollIdleWaiters: (() => void)[] = [];
   let rngOperationActive = false;
   let rngCooldownActive = false;
   let rngPacketInFlightId: string | null = null;
@@ -392,7 +397,7 @@ export async function startCombustion({
     }
   };
   const startRngPolling = (message = '[rng] Polling resumed: main poller active'): void => {
-    if (rngPollTimer !== undefined || !pollRng) {
+    if (rngPollTimer !== undefined || !pollRng || stopRequested || pauseGate.isPaused()) {
       return;
     }
     rngPollTimer = setInterval(pollRng, RNG_POLL_INTERVAL_MS);
@@ -424,6 +429,7 @@ export async function startCombustion({
       return;
     }
     stopRequested = true;
+    pauseGate.cancel();
     clearTimeout(idleTimer);
     pollDelayResolve?.();
     wakeSignal.resolve();
@@ -453,7 +459,7 @@ export async function startCombustion({
     }
   };
   const enterIdle = async (): Promise<void> => {
-    if (stopRequested || mode === 'idle') {
+    if (stopRequested || pauseGate.isPaused() || mode === 'idle') {
       return;
     }
     mode = 'idle';
@@ -463,6 +469,9 @@ export async function startCombustion({
     pollDelayResolve?.();
   };
   const resetIdleTimer = async (): Promise<void> => {
+    if (stopRequested || pauseGate.isPaused()) {
+      return;
+    }
     if (mode === 'idle') {
       mode = 'polling';
       console.log('[poller] Confirmed new message while idle; resuming periodic polling.');
@@ -479,7 +488,7 @@ export async function startCombustion({
     }, IDLE_THRESHOLD_MS);
   };
   const signalPollerWake = (): void => {
-    if (mode !== 'idle') {
+    if (stopRequested || pauseGate.isPaused() || mode !== 'idle') {
       return;
     }
     mode = 'polling';
@@ -509,6 +518,49 @@ export async function startCombustion({
       resolve();
     };
   });
+  const notifyMainPollIdle = (): void => {
+    while (mainPollIdleWaiters.length > 0) {
+      mainPollIdleWaiters.shift()!();
+    }
+  };
+  const waitForMainPollIdle = (): Promise<void> => {
+    if (!mainPollInProgress) {
+      return Promise.resolve();
+    }
+    return new Promise<void>(resolve => mainPollIdleWaiters.push(resolve));
+  };
+  const pauseEngine = async (): Promise<void> => {
+    if (stopRequested || pauseGate.isPaused()) {
+      return;
+    }
+    pauseGate.pause();
+    stopRngPolling('[rng] Polling paused: engine paused');
+    clearTimeout(idleTimer);
+    idleTimer = undefined;
+    pollDelayResolve?.();
+    console.log('[engine] Pausing Combustion; waiting for the current poll to finish.');
+    await waitForMainPollIdle();
+    if (stopRequested) {
+      return;
+    }
+    console.log('[engine] Combustion paused.');
+  };
+  const resumeEngine = async (): Promise<void> => {
+    if (stopRequested || !pauseGate.isPaused()) {
+      return;
+    }
+    pauseGate.resume();
+    if (mode === 'idle') {
+      mode = 'polling';
+      wakePending = true;
+      console.log('[poller] Resuming after pause; verifying rendered messages now.');
+      await setWakerActive(false);
+      wakeSignal.resolve();
+    }
+    startRngPolling('[rng] Polling resumed: engine resumed');
+    await resetIdleTimer();
+    console.log('[engine] Combustion resumed.');
+  };
 
   let cleanupPromise: Promise<void> | undefined;
   const cleanup = (): Promise<void> => {
@@ -560,11 +612,21 @@ export async function startCombustion({
   const runPollLoop = async (): Promise<void> => {
     await resetIdleTimer();
     while (!stopRequested) {
+      if (pauseGate.isPaused()) {
+        const result = await pauseGate.waitUntilResumed();
+        if (stopRequested || result === 'cancelled') {
+          break;
+        }
+        continue;
+      }
       if (mode === 'idle' && !wakePending) {
         await wakeSignal.promise;
       }
       if (stopRequested) {
         break;
+      }
+      if (pauseGate.isPaused()) {
+        continue;
       }
 
       let wokePoller = consumeWakeSignal();
@@ -576,12 +638,15 @@ export async function startCombustion({
         if (stopRequested) {
           break;
         }
+        if (pauseGate.isPaused()) {
+          continue;
+        }
         if (isIdle()) {
           continue;
         }
         wokePoller = consumeWakeSignal();
       }
-      if (mode !== 'polling') {
+      if (pauseGate.isPaused() || mode !== 'polling') {
         continue;
       }
 
@@ -661,6 +726,7 @@ export async function startCombustion({
         }
       } finally {
         mainPollInProgress = false;
+        notifyMainPollIdle();
       }
     }
   };
@@ -702,6 +768,7 @@ export async function startCombustion({
         { systemInstruction },
       ),
       composeReply: composeMessengerReply,
+      pauseGate,
       debugMode,
     });
     packetScheduler = createPacketScheduler<ScheduledPacket>(async packet => {
@@ -720,7 +787,7 @@ export async function startCombustion({
       } finally {
         completeRngPacket(packet.packetId, succeeded, processingError);
       }
-    });
+    }, { pauseGate });
 
     page.on('console', onConsole);
     listenerAttached = true;
@@ -866,6 +933,8 @@ export async function startCombustion({
     );
     return {
       stopped,
+      pause: pauseEngine,
+      resume: resumeEngine,
       async stop() {
         requestStop();
         await stopped.catch(() => undefined);

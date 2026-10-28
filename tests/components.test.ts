@@ -5,6 +5,7 @@ import { buildPacketTurn } from '../src/components/mention-packet-builder.js';
 import { extractMessageDetails } from '../src/components/message-extraction.js';
 import { createPacketProcessor } from '../src/components/packet-processor.js';
 import { createPacketScheduler } from '../src/components/packet-scheduler.js';
+import { createPauseGate } from '../src/components/pause-gate.js';
 import { getDefaultPersonalityInstruction } from '../src/components/personality.js';
 import { buildRngPacket } from '../src/components/rng-packet-builder.js';
 
@@ -126,6 +127,143 @@ test('packet scheduler rejects duplicate IDs and processes packets in order', as
 
   assert.deepEqual(processed, ['packet-1', 'packet-2']);
   assert.deepEqual(scheduler.getState().completedPacketIds, ['packet-1', 'packet-2']);
+});
+
+test('packet scheduler holds queued packets while paused and resumes them in FIFO order', async () => {
+  const pauseGate = createPauseGate();
+  const processed: string[] = [];
+  const scheduler = createPacketScheduler(async packet => {
+    processed.push(packet.packetId);
+  }, { pauseGate });
+
+  pauseGate.pause();
+  assert.equal(scheduler.submit({ packetId: 'packet-1' }), true);
+  assert.equal(scheduler.submit({ packetId: 'packet-2' }), true);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.deepEqual(processed, []);
+  assert.deepEqual(
+    scheduler.getState().pendingPackets.map(packet => packet.packetId),
+    ['packet-1', 'packet-2'],
+  );
+
+  pauseGate.resume();
+  await scheduler.waitForIdle();
+  assert.deepEqual(processed, ['packet-1', 'packet-2']);
+});
+
+test('packet scheduler finishes the active packet before holding the next one while paused', async () => {
+  const pauseGate = createPauseGate();
+  const processed: string[] = [];
+  let releaseFirst!: () => void;
+  let firstStarted!: () => void;
+  const firstStart = new Promise<void>(resolve => {
+    firstStarted = resolve;
+  });
+  const firstRelease = new Promise<void>(resolve => {
+    releaseFirst = resolve;
+  });
+  const scheduler = createPacketScheduler(async packet => {
+    if (packet.packetId === 'packet-1') {
+      firstStarted();
+      await firstRelease;
+    }
+    processed.push(packet.packetId);
+  }, { pauseGate });
+
+  assert.equal(scheduler.submit({ packetId: 'packet-1' }), true);
+  await firstStart;
+  pauseGate.pause();
+  assert.equal(scheduler.submit({ packetId: 'packet-2' }), true);
+  releaseFirst();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.deepEqual(processed, ['packet-1']);
+  assert.deepEqual(
+    scheduler.getState().pendingPackets.map(packet => packet.packetId),
+    ['packet-2'],
+  );
+
+  pauseGate.resume();
+  await scheduler.waitForIdle();
+  assert.deepEqual(processed, ['packet-1', 'packet-2']);
+});
+
+test('packet scheduler cancels pending work when stopped while paused', async () => {
+  const pauseGate = createPauseGate();
+  const processed: string[] = [];
+  const scheduler = createPacketScheduler(async packet => {
+    processed.push(packet.packetId);
+  }, { pauseGate });
+
+  pauseGate.pause();
+  assert.equal(scheduler.submit({ packetId: 'packet-1' }), true);
+  assert.equal(scheduler.submit({ packetId: 'packet-2' }), true);
+  await new Promise<void>(resolve => setImmediate(resolve));
+
+  pauseGate.cancel();
+  await scheduler.waitForIdle();
+  assert.deepEqual(processed, []);
+  assert.deepEqual(
+    scheduler.getState().pendingPackets.map(packet => packet.packetId),
+    ['packet-1', 'packet-2'],
+  );
+});
+
+test('packet processor waits for resume before composing a reply', async () => {
+  const pauseGate = createPauseGate();
+  const calls: string[] = [];
+  let generationComplete!: () => void;
+  const generated = new Promise<void>(resolve => {
+    generationComplete = resolve;
+  });
+  const processPacket = createPacketProcessor({
+    page: 'mock-page',
+    apiKey: 'mock-key',
+    pauseGate,
+    generateReply: async () => {
+      calls.push('generate');
+      generationComplete();
+      return 'reply';
+    },
+    composeReply: async () => {
+      calls.push('compose');
+      return { status: 'sent' };
+    },
+  });
+
+  pauseGate.pause();
+  const processing = processPacket({ packetId: 'packet-paused' });
+  await generated;
+  assert.deepEqual(calls, ['generate']);
+
+  pauseGate.resume();
+  assert.deepEqual(await processing, { status: 'sent' });
+  assert.deepEqual(calls, ['generate', 'compose']);
+});
+
+test('packet processor cancels waiting work when the engine stops while paused', async () => {
+  const pauseGate = createPauseGate();
+  let generationComplete!: () => void;
+  const generated = new Promise<void>(resolve => {
+    generationComplete = resolve;
+  });
+  const processPacket = createPacketProcessor({
+    page: 'mock-page',
+    apiKey: 'mock-key',
+    pauseGate,
+    generateReply: async () => {
+      generationComplete();
+      return 'reply';
+    },
+    composeReply: async () => ({ status: 'sent' }),
+    logError: () => undefined,
+  });
+
+  pauseGate.pause();
+  const processing = processPacket({ packetId: 'packet-cancelled' });
+  await generated;
+  pauseGate.cancel();
+
+  await assert.rejects(processing, /cancelled/);
 });
 
 test('default personality keeps the active reply instruction', () => {

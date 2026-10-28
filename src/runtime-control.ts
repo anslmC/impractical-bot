@@ -25,7 +25,21 @@ export type RuntimeStopResult =
   | { status: 'stopped'; instanceId: string }
   | { status: 'not-running' };
 
-type RuntimeState = 'starting' | 'running' | 'stopping';
+export type RuntimePauseResult =
+  | { status: 'paused'; instanceId: string }
+  | { status: 'not-running' };
+
+export type RuntimeResumeResult =
+  | { status: 'resumed'; instanceId: string }
+  | { status: 'not-running' };
+
+type RuntimeState = 'starting' | 'running' | 'paused' | 'stopping';
+
+export interface RuntimeControlHandlers {
+  requestShutdown: () => void;
+  requestPause?: () => void | Promise<void>;
+  requestResume?: () => void | Promise<void>;
+}
 
 export interface RuntimeControl {
   setState(state: 'running' | 'stopping'): void;
@@ -121,12 +135,15 @@ async function hasRuntimeProtocol(endpoint: string): Promise<boolean> {
 
 export async function createRuntimeControl(
   configurationFilePath: string | undefined,
-  requestShutdown: () => void,
+  handlers: RuntimeControlHandlers | (() => void),
 ): Promise<RuntimeControl> {
   if (process.platform !== 'win32') {
     throw new RuntimeControlEndpointError('Runtime control is only supported on Windows.');
   }
 
+  const runtimeHandlers: RuntimeControlHandlers = typeof handlers === 'function'
+    ? { requestShutdown: handlers }
+    : handlers;
   const endpoint = getRuntimeControlEndpoint(configurationFilePath);
   const instanceId = randomUUID();
   const sockets = new Set<Socket>();
@@ -137,18 +154,68 @@ export async function createRuntimeControl(
   });
   let shutdownRequested = false;
   let state: RuntimeState = 'starting';
+  const isStopping = (): boolean => state === 'stopping';
 
   const commandResult = async (command: string): Promise<string> => {
-    if (command !== `STOP ${instanceId}`) {
-      return `ERROR ${instanceId} INVALID_REQUEST\n`;
+    if (command === `STOP ${instanceId}`) {
+      if (!shutdownRequested) {
+        shutdownRequested = true;
+        state = 'stopping';
+        runtimeHandlers.requestShutdown();
+      }
+      const exitCode = await completion;
+      return `${exitCode === 0 || exitCode === 130 ? 'STOPPED' : 'FAILED'} ${instanceId} ${exitCode}\n`;
     }
-    if (!shutdownRequested) {
-      shutdownRequested = true;
-      state = 'stopping';
-      requestShutdown();
+
+    if (command === `PAUSE ${instanceId}`) {
+      if (state === 'stopping') {
+        return `ERROR ${instanceId} INVALID_STATE\n`;
+      }
+      if (!runtimeHandlers.requestPause) {
+        return `ERROR ${instanceId} UNSUPPORTED\n`;
+      }
+      if (state === 'paused') {
+        return `PAUSED ${instanceId}\n`;
+      }
+      if (state !== 'running') {
+        return `ERROR ${instanceId} INVALID_STATE\n`;
+      }
+      try {
+        await runtimeHandlers.requestPause();
+        if (!isStopping()) {
+          state = 'paused';
+        }
+        return `PAUSED ${instanceId}\n`;
+      } catch {
+        return `ERROR ${instanceId} PAUSE_FAILED\n`;
+      }
     }
-    const exitCode = await completion;
-    return `${exitCode === 0 || exitCode === 130 ? 'STOPPED' : 'FAILED'} ${instanceId} ${exitCode}\n`;
+
+    if (command === `RESUME ${instanceId}`) {
+      if (state === 'stopping') {
+        return `ERROR ${instanceId} INVALID_STATE\n`;
+      }
+      if (!runtimeHandlers.requestResume) {
+        return `ERROR ${instanceId} UNSUPPORTED\n`;
+      }
+      if (state === 'running') {
+        return `RESUMED ${instanceId}\n`;
+      }
+      if (state !== 'paused') {
+        return `ERROR ${instanceId} INVALID_STATE\n`;
+      }
+      try {
+        await runtimeHandlers.requestResume();
+        if (!isStopping()) {
+          state = 'running';
+        }
+        return `RESUMED ${instanceId}\n`;
+      } catch {
+        return `ERROR ${instanceId} RESUME_FAILED\n`;
+      }
+    }
+
+    return `ERROR ${instanceId} INVALID_REQUEST\n`;
   };
 
   const server = createServer(socket => {
@@ -232,6 +299,83 @@ export async function createRuntimeControl(
       return closePromise;
     },
   };
+}
+
+type RuntimeTransitionCommand = 'PAUSE' | 'RESUME';
+
+async function requestRuntimeTransition(
+  configurationFilePath: string | undefined,
+  command: RuntimeTransitionCommand,
+): Promise<{ status: 'paused' | 'resumed'; instanceId: string } | { status: 'not-running' }> {
+  if (process.platform !== 'win32') {
+    throw new RuntimeControlEndpointError('Runtime control is only supported on Windows.');
+  }
+
+  const endpoint = getRuntimeControlEndpoint(configurationFilePath);
+  const socket = createConnection(endpoint);
+  try {
+    let instanceId: string;
+    try {
+      const greeting = await readLine(socket);
+      const match = greeting.match(new RegExp(`^${PROTOCOL} ([0-9a-f-]{36})$`, 'i'));
+      if (!match) {
+        throw new RuntimeControlEndpointError(
+          `The runtime-control endpoint is not owned by an impractical-bot engine; no ${command.toLowerCase()} request was sent.`,
+        );
+      }
+      instanceId = match[1];
+    } catch (error) {
+      if (isPipeMissing(error)) {
+        return { status: 'not-running' };
+      }
+      throw error;
+    }
+
+    socket.setTimeout(0);
+    socket.write(`${command} ${instanceId}\n`);
+    const response = await readLine(socket, 0);
+    const expected = command === 'PAUSE' ? `PAUSED ${instanceId}` : `RESUMED ${instanceId}`;
+    if (response === expected) {
+      return {
+        status: command === 'PAUSE' ? 'paused' : 'resumed',
+        instanceId,
+      };
+    }
+    if (response.startsWith(`ERROR ${instanceId} `)) {
+      const reason = response.slice(`ERROR ${instanceId} `.length);
+      throw new RuntimeControlEndpointError(
+        `The engine rejected the ${command.toLowerCase()} request (${reason}).`,
+      );
+    }
+    throw new RuntimeControlEndpointError(
+      `The engine returned an invalid ${command.toLowerCase()} response.`,
+    );
+  } catch (error) {
+    if (isPipeMissing(error)) {
+      return { status: 'not-running' };
+    }
+    throw error;
+  } finally {
+    socket.destroy();
+  }
+}
+
+export async function requestRuntimePause(
+  configurationFilePath?: string,
+): Promise<RuntimePauseResult> {
+  const result = await requestRuntimeTransition(configurationFilePath, 'PAUSE');
+  return result.status === 'not-running'
+    ? result
+    : { status: 'paused', instanceId: result.instanceId };
+}
+
+export async function requestRuntimeResume(
+  configurationFilePath?: string,
+): Promise<RuntimeResumeResult> {
+  const result = await requestRuntimeTransition(configurationFilePath, 'RESUME');
+  return result.status === 'not-running'
+    ? result
+    : { status: 'resumed', instanceId: result.instanceId };
 }
 
 export async function requestRuntimeStop(

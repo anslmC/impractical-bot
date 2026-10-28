@@ -13,6 +13,10 @@ import { generateAliases } from '../src/components/alias-engine.js';
 import type { BackreadResult } from '../src/components/backread.js';
 import type { CombustionController } from '../src/components/combustion.js';
 import { createContextStore } from '../src/components/context-store.js';
+import {
+  requestRuntimePause,
+  requestRuntimeResume,
+} from '../src/runtime-control.js';
 
 async function captureCli(
   args: string[],
@@ -45,13 +49,23 @@ async function captureCli(
   return { exitCode, output, errors };
 }
 
-function createTestCombustionController(onStop?: () => void): CombustionController {
+function createTestCombustionController(
+  onStop?: () => void,
+  onPause?: () => void,
+  onResume?: () => void,
+): CombustionController {
   let resolveStopped!: () => void;
   const stopped = new Promise<void>(resolve => {
     resolveStopped = resolve;
   });
   return {
     stopped,
+    async pause() {
+      onPause?.();
+    },
+    async resume() {
+      onResume?.();
+    },
     async stop() {
       onStop?.();
       resolveStopped();
@@ -1227,6 +1241,61 @@ test('stop reports clearly when no engine is running', async context => {
   assert.deepEqual(result.errors, []);
 });
 
+test('pause and resume report clearly when no engine is running', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  for (const command of ['pause', 'resume']) {
+    const result = await captureCli([command], configurationFilePath);
+    assert.equal(result.exitCode, 0);
+    assert.match(result.output[0], /No impractical-bot engine is running/);
+    assert.deepEqual(result.errors, []);
+  }
+});
+
+test('pause and resume commands control the running Combustion engine', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const events: string[] = [];
+  const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
+    launchBrowser: async () => ({
+      endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+      browserVersion: 'Brave Chromium test',
+      disconnected: new Promise<void>(() => undefined),
+      async prepare() {
+        return stubPage;
+      },
+      async disconnect() {
+        events.push('disconnected');
+      },
+    }),
+    closeBrowser: async () => {
+      events.push('browser-closed');
+    },
+    readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+    startCombustion: async () => createTestCombustionController(
+      () => events.push('stopped'),
+      () => events.push('paused'),
+      () => events.push('resumed'),
+    ),
+  }, message => {
+    if (message.startsWith('Engine ready')) ready.resolve();
+  });
+
+  await ready.promise;
+  const pauseResult = await requestRuntimePause(configurationFilePath);
+  assert.equal(pauseResult.status, 'paused');
+  const resumeResult = await requestRuntimeResume(configurationFilePath);
+  assert.equal(resumeResult.status, 'resumed');
+  const stopResult = await captureCli(['stop'], configurationFilePath);
+  const startResult = await start;
+
+  assert.equal(stopResult.exitCode, 0);
+  assert.equal(startResult.exitCode, 0);
+  assert.deepEqual(events, ['paused', 'resumed', 'stopped', 'disconnected', 'browser-closed']);
+});
+
 test('stop waits for Combustion cleanup before disconnecting Playwright and closing the attached browser', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
@@ -1257,6 +1326,12 @@ test('stop waits for Combustion cleanup before disconnecting Playwright and clos
     readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
     startCombustion: async () => ({
       stopped: new Promise<void>(() => undefined),
+      async pause() {
+        events.push('combustion-paused');
+      },
+      async resume() {
+        events.push('combustion-resumed');
+      },
       async stop() {
         events.push('combustion-stop-started');
         stopEntered.resolve();
@@ -1575,8 +1650,10 @@ test('help options and no command display usage', async () => {
     assert.match(result.output[0], /config\s+Configure impractical-bot/);
     assert.match(result.output[0], /changebrowser\s+Change the configured browser/);
     assert.match(result.output[0], /updatekey\s+Replace the NVIDIA API key/);
-    assert.match(result.output[0], /start\s+Start impractical-bot/);
-    assert.match(result.output[0], /stop\s+Stop impractical-bot/);
+      assert.match(result.output[0], /start\s+Start impractical-bot/);
+      assert.match(result.output[0], /pause\s+Pause impractical-bot/);
+      assert.match(result.output[0], /resume\s+Resume impractical-bot/);
+      assert.match(result.output[0], /stop\s+Stop impractical-bot/);
     assert.deepEqual(result.errors, []);
   }
 });

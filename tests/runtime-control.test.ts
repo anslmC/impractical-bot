@@ -7,6 +7,8 @@ import { test, type TestContext } from 'node:test';
 import {
   createRuntimeControl,
   getRuntimeControlEndpoint,
+  requestRuntimePause,
+  requestRuntimeResume,
   requestRuntimeStop,
   RuntimeAlreadyRunningError,
   RuntimeControlEndpointError,
@@ -32,6 +34,21 @@ function readPipeLine(socket: Socket): Promise<string> {
     socket.on('data', onData);
     socket.once('error', onError);
   });
+}
+
+async function sendRuntimeCommand(
+  configurationPath: string,
+  command: string,
+): Promise<string> {
+  const socket = createConnection(getRuntimeControlEndpoint(configurationPath));
+  try {
+    const greeting = await readPipeLine(socket);
+    const instanceId = greeting.split(' ')[1];
+    socket.write(`${command} ${instanceId}\n`);
+    return await readPipeLine(socket);
+  } finally {
+    socket.destroy();
+  }
 }
 
 function temporaryConfigurationPath(context: TestContext): string {
@@ -114,12 +131,75 @@ test('runtime control refuses to send stop to an unrelated pipe listener', async
   );
 });
 
-test('runtime stop reports not-running when no owner exists', async context => {
+test('runtime stop, pause, and resume report not-running when no owner exists', async context => {
   const configurationPath = temporaryConfigurationPath(context);
   assert.deepEqual(await requestRuntimeStop(configurationPath), { status: 'not-running' });
+  assert.deepEqual(await requestRuntimePause(configurationPath), { status: 'not-running' });
+  assert.deepEqual(await requestRuntimeResume(configurationPath), { status: 'not-running' });
 });
 
-test('runtime control rejects commands other than stop without requesting shutdown', async context => {
+test('runtime control pauses and resumes the engine and treats repeated commands as safe', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  let pauseRequests = 0;
+  let resumeRequests = 0;
+  const control = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => undefined,
+    requestPause: () => {
+      pauseRequests += 1;
+    },
+    requestResume: () => {
+      resumeRequests += 1;
+    },
+  });
+  context.after(async () => {
+    control.complete(1);
+    await control.close();
+  });
+  control.setState('running');
+
+  assert.match(await sendRuntimeCommand(configurationPath, 'PAUSE'), /^PAUSED /);
+  assert.equal(pauseRequests, 1);
+  assert.match(await sendRuntimeCommand(configurationPath, 'PAUSE'), /^PAUSED /);
+  assert.equal(pauseRequests, 1);
+
+  assert.match(await sendRuntimeCommand(configurationPath, 'RESUME'), /^RESUMED /);
+  assert.equal(resumeRequests, 1);
+  assert.match(await sendRuntimeCommand(configurationPath, 'RESUME'), /^RESUMED /);
+  assert.equal(resumeRequests, 1);
+});
+
+test('runtime control reports pause and resume handler failures without changing state', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  const pauseControl = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => undefined,
+    requestPause: async () => {
+      throw new Error('pause failed');
+    },
+  });
+  pauseControl.setState('running');
+  assert.match(await sendRuntimeCommand(configurationPath, 'PAUSE'), /PAUSE_FAILED$/);
+  assert.match(await sendRuntimeCommand(configurationPath, 'PAUSE'), /PAUSE_FAILED$/);
+  pauseControl.complete(0);
+  await pauseControl.close();
+
+  const resumeControl = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => undefined,
+    requestPause: () => undefined,
+    requestResume: async () => {
+      throw new Error('resume failed');
+    },
+  });
+  context.after(async () => {
+    resumeControl.complete(1);
+    await resumeControl.close();
+  });
+  resumeControl.setState('running');
+  assert.match(await sendRuntimeCommand(configurationPath, 'PAUSE'), /^PAUSED /);
+  assert.match(await sendRuntimeCommand(configurationPath, 'RESUME'), /RESUME_FAILED$/);
+  assert.match(await sendRuntimeCommand(configurationPath, 'RESUME'), /RESUME_FAILED$/);
+});
+
+test('runtime control rejects unsupported and unknown commands without requesting shutdown', async context => {
   const configurationPath = temporaryConfigurationPath(context);
   let shutdownRequests = 0;
   const control = await createRuntimeControl(configurationPath, () => {
@@ -129,14 +209,9 @@ test('runtime control rejects commands other than stop without requesting shutdo
     control.complete(1);
     await control.close();
   });
+  control.setState('running');
 
-  const socket = createConnection(getRuntimeControlEndpoint(configurationPath));
-  context.after(() => socket.destroy());
-  const greeting = await readPipeLine(socket);
-  const instanceId = greeting.split(' ')[1];
-  socket.write(`PAUSE ${instanceId}\n`);
-  const response = await readPipeLine(socket);
-
-  assert.equal(response, `ERROR ${instanceId} INVALID_REQUEST`);
+  assert.match(await sendRuntimeCommand(configurationPath, 'PAUSE'), /UNSUPPORTED$/);
+  assert.match(await sendRuntimeCommand(configurationPath, 'BOGUS'), /INVALID_REQUEST$/);
   assert.equal(shutdownRequests, 0);
 });

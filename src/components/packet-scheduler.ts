@@ -1,9 +1,12 @@
+import type { PauseGate } from './pause-gate.js';
+
 export interface ScheduledPacket {
   packetId: string;
 }
 
 export function createPacketScheduler<Packet extends ScheduledPacket>(
   processPacket: (packet: Packet) => unknown,
+  { pauseGate }: { pauseGate?: PauseGate } = {},
 ) {
   if (typeof processPacket !== 'function') {
     throw new TypeError('processPacket must be a function.');
@@ -31,6 +34,15 @@ export function createPacketScheduler<Packet extends ScheduledPacket>(
 
     try {
       while (pendingPackets.length > 0) {
+        if (pauseGate) {
+          const result = await pauseGate.waitUntilResumed();
+          if (result === 'cancelled') {
+            break;
+          }
+          if (pauseGate.isPaused()) {
+            continue;
+          }
+        }
         activePacket = pendingPackets.shift()!;
         try {
           await processPacket(activePacket);
@@ -70,7 +82,7 @@ export function createPacketScheduler<Packet extends ScheduledPacket>(
       };
     },
     waitForIdle() {
-      if (!processing && pendingPackets.length === 0) {
+      if (!processing && (pendingPackets.length === 0 || pauseGate?.isCancelled())) {
         return Promise.resolve();
       }
       return new Promise<void>(resolve => idleWaiters.push(() => resolve()));

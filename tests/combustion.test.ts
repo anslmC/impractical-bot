@@ -149,6 +149,40 @@ test('Combustion uses the supplied seeded store and cleans up before stop resolv
   assert.equal(mockPage.observerCleanupCalls, 1);
 });
 
+test('Combustion pauses polling and resumes it without duplicating reads', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const mockPage = createMockPage();
+  const contextStore = createContextStore();
+  const flush = (): Promise<void> => new Promise(resolve => setImmediate(resolve));
+  const controller = await startCombustion({
+    page: mockPage.page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    assert.equal(mockPage.baselineReadCalls, 1);
+    await controller.pause();
+    await flush();
+    context.mock.timers.tick(60_000);
+    await flush();
+    assert.equal(mockPage.baselineReadCalls, 1);
+
+    await controller.resume();
+    await flush();
+    context.mock.timers.tick(3_000);
+    await flush();
+    await flush();
+    assert.equal(mockPage.baselineReadCalls, 2);
+  } finally {
+    await controller.stop();
+    context.mock.timers.reset();
+  }
+});
+
 test('Combustion initialization failure removes its listener without owning the page', async () => {
   const mockPage = createMockPage({ failObserverSetup: true });
   const contextStore = createContextStore();

@@ -58,6 +58,8 @@ import {
 } from './components/backread.js';
 import {
   createRuntimeControl,
+  requestRuntimePause,
+  requestRuntimeResume,
   requestRuntimeStop,
   RuntimeAlreadyRunningError,
   type RuntimeControl,
@@ -94,6 +96,8 @@ Commands:
   changemessagedestination  Change the message destination
   updatekey  Replace the NVIDIA API key
   start    Start impractical-bot
+  pause    Pause impractical-bot
+  resume   Resume impractical-bot
   stop     Stop impractical-bot
 
 Options:
@@ -626,7 +630,15 @@ async function handleStart(
   try {
     runtimeControl = await createRuntimeControl(
       configurationFilePath,
-      () => resolveShutdown('runtime-control'),
+      {
+        requestShutdown: () => resolveShutdown('runtime-control'),
+        requestPause: async () => {
+          await combustionController?.pause();
+        },
+        requestResume: async () => {
+          await combustionController?.resume();
+        },
+      },
     );
   } catch (error) {
     process.removeListener('SIGINT', onSigint);
@@ -870,6 +882,44 @@ async function handleUpdateKey(
   return 0;
 }
 
+async function handlePause(
+  writeOutput: Output,
+  writeError: Output,
+  configurationFilePath: string | undefined,
+): Promise<number> {
+  try {
+    const result = await requestRuntimePause(configurationFilePath);
+    if (result.status === 'not-running') {
+      writeOutput('No impractical-bot engine is running for this configuration.');
+      return 0;
+    }
+    writeOutput(`Engine ${result.instanceId} paused.`);
+    return 0;
+  } catch (error) {
+    writeError(`Unable to pause impractical-bot: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+}
+
+async function handleResume(
+  writeOutput: Output,
+  writeError: Output,
+  configurationFilePath: string | undefined,
+): Promise<number> {
+  try {
+    const result = await requestRuntimeResume(configurationFilePath);
+    if (result.status === 'not-running') {
+      writeOutput('No impractical-bot engine is running for this configuration.');
+      return 0;
+    }
+    writeOutput(`Engine ${result.instanceId} resumed.`);
+    return 0;
+  } catch (error) {
+    writeError(`Unable to resume impractical-bot: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+}
+
 async function handleStop(
   writeOutput: Output,
   writeError: Output,
@@ -942,6 +992,8 @@ export async function runCli(
     ),
     updatekey: () => handleUpdateKey(writeOutput, writeError, configurationFilePath, runtime),
     start: () => handleStart(writeOutput, writeError, configurationFilePath, prompt, runtime),
+    pause: () => handlePause(writeOutput, writeError, configurationFilePath),
+    resume: () => handleResume(writeOutput, writeError, configurationFilePath),
     stop: () => handleStop(writeOutput, writeError, configurationFilePath),
   };
   const handler = command ? handlers[command] : undefined;

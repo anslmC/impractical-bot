@@ -116,6 +116,45 @@ test('automatic sending clicks only one matching visible enabled control', async
   assert.equal(approved.sendSelector, '[role="button"][aria-label="Press Enter to send"]');
 });
 
+test('waits at the pre-send gate before clicking the send control', async () => {
+  const mock = createPage();
+  let releaseSend!: () => void;
+  const sendGate = new Promise<void>(resolve => {
+    releaseSend = resolve;
+  });
+  let gateCalls = 0;
+  const composition = composeMessengerReply(mock.page, 'Draft', {
+    beforeSend: async () => {
+      gateCalls += 1;
+      await sendGate;
+    },
+  });
+
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(mock.filledText, 'Draft');
+  assert.equal(gateCalls, 1);
+  assert.equal(mock.sendClicks, 0);
+
+  releaseSend();
+  assert.deepEqual(await composition, { status: 'sent' });
+  assert.equal(mock.sendClicks, 1);
+});
+
+test('does not click the send control when the pre-send gate is cancelled', async () => {
+  const mock = createPage();
+
+  await assert.rejects(
+    composeMessengerReply(mock.page, 'Draft', {
+      beforeSend: async () => {
+        throw new Error('cancelled while paused');
+      },
+    }),
+    /cancelled while paused/,
+  );
+  assert.equal(mock.filledText, 'Draft');
+  assert.equal(mock.sendClicks, 0);
+});
+
 test('automatic sending requires one Thread composer region before looking up its control', async () => {
   for (const [composerRegionCount, reason] of [[0, 'composer-region-missing'], [2, 'composer-region-ambiguous']] as const) {
     const mock = createPage({ composerRegionCount });

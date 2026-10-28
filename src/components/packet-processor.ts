@@ -1,3 +1,5 @@
+import type { PauseGate } from './pause-gate.js';
+
 const DEBUG_RELIABILITY_WARNING =
   'Packet processing failed. IMPRACTICAL_BOT_DEBUG=1 bypasses key validation; ' +
   'rerun without debug mode to verify real reliability.';
@@ -6,6 +8,10 @@ export interface ProcessablePacket<Message = unknown> {
   packetId?: string;
   contextMessages?: Message[];
   newMessages?: Message[];
+}
+
+export interface ComposeReplyOptions {
+  beforeSend?: () => Promise<void>;
 }
 
 export interface PacketProcessorOptions<
@@ -18,10 +24,25 @@ export interface PacketProcessorOptions<
   page: PageType;
   apiKey: ApiKey;
   generateReply: (apiKey: ApiKey, messages: Message[]) => Reply | Promise<Reply>;
-  composeReply: (page: PageType, reply: Awaited<Reply>) => Composition | Promise<Composition>;
+  composeReply: (
+    page: PageType,
+    reply: Awaited<Reply>,
+    options?: ComposeReplyOptions,
+  ) => Composition | Promise<Composition>;
+  pauseGate?: PauseGate;
   debugMode?: boolean;
   logError?: (message: string) => void;
   logWarning?: (message: string) => void;
+}
+
+async function waitForPacketWork(pauseGate: PauseGate | undefined): Promise<void> {
+  if (!pauseGate) {
+    return;
+  }
+  const result = await pauseGate.waitUntilResumed();
+  if (result === 'cancelled') {
+    throw new Error('Packet processing cancelled while the engine is stopping.');
+  }
 }
 
 export function createPacketProcessor<
@@ -38,6 +59,7 @@ export function createPacketProcessor<
   apiKey,
   generateReply,
   composeReply,
+  pauseGate,
   debugMode = false,
   logError = message => console.error(message),
   logWarning = message => console.warn(message),
@@ -63,8 +85,15 @@ export function createPacketProcessor<
         `chars=${typeof reply === 'string' ? reply.length : 'unknown'}`,
       );
       stage = 'composition';
+      await waitForPacketWork(pauseGate);
       console.log(`[packet ${packetId}] stage=composition-start`);
-      const composition = await composeReply(page, reply);
+      const composition = await composeReply(
+        page,
+        reply,
+        pauseGate
+          ? { beforeSend: () => waitForPacketWork(pauseGate) }
+          : undefined,
+      );
       console.log(
         `[packet ${packetId}] stage=composition-returned ` +
         `status=${String(composition?.status ?? 'unknown')}`,

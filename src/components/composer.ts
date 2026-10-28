@@ -40,9 +40,14 @@ function describeError(error: unknown): string {
     : String(error);
 }
 
+export interface ReplyCompositionOptions {
+  beforeSend?: () => Promise<void>;
+}
+
 export async function composeMessengerReply(
   page: Page,
   reply: string,
+  { beforeSend }: ReplyCompositionOptions = {},
 ): Promise<ReplyCompositionResult> {
   const pageIdentity = describePage(page);
   const documentState = await describeDocumentState(page);
@@ -131,6 +136,14 @@ export async function composeMessengerReply(
   }
 
   console.log('[compose] stage=send-control-ready reason=visible-and-enabled');
+  if (beforeSend) {
+    try {
+      await beforeSend();
+    } catch (error) {
+      console.log(`[compose] stage=send-gate-failed error=${describeError(error)}`);
+      throw error;
+    }
+  }
   try {
     await sendButtons.click();
   } catch (error) {
