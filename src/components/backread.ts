@@ -157,23 +157,27 @@ export function classifyMessageLabel(
   };
 }
 
+function stripTrailingDeliveryStatus(content: string): string {
+  return content.replace(/(\S)Sent$/u, '$1');
+}
+
 function extractMessageContent(ariaLabel: string | null, textWithoutSenderHeading: string): string {
   if (ariaLabel === null) {
-    return textWithoutSenderHeading;
+    return stripTrailingDeliveryStatus(textWithoutSenderHeading);
   }
 
   const { remainder } = parseTimestampLabel(ariaLabel);
   const match = remainder.match(/^([^:\r\n]+):\s+([\s\S]*)$/);
   if (!match) {
-    return textWithoutSenderHeading;
+    return stripTrailingDeliveryStatus(textWithoutSenderHeading);
   }
 
   const sender = classifyMessageLabel(ariaLabel).sender;
   if (sender === 'UNKNOWN' || match[1].trim() !== sender) {
-    return textWithoutSenderHeading;
+    return stripTrailingDeliveryStatus(textWithoutSenderHeading);
   }
 
-  return match[2].trim();
+  return stripTrailingDeliveryStatus(match[2].trim());
 }
 
 export async function readMessengerMessages(page: Page): Promise<BackreadResult> {

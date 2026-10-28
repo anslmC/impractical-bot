@@ -96,6 +96,77 @@ test('message extraction preserves the parsed sender and message body', () => {
   });
 });
 
+test('message extraction ignores a directly attached Sent delivery status', () => {
+  const firstObservation = extractMessageDetails({
+    messageId: 'mid.$gAAW_kanMS16nsy41p2hgejq1c6Pc',
+    ariaLabel: 'At October 18, 2026, 1:15 PM, You: Hahaha!',
+    textWithoutSenderHeading: 'Hahaha!',
+  });
+  const statusObservation = extractMessageDetails({
+    messageId: 'mid.$gAAW_kanMS16nsy41p2hgejq1c6Pc',
+    ariaLabel: 'At October 18, 2026, 1:15 PM, You: Hahaha!Sent',
+    textWithoutSenderHeading: 'Hahaha!Sent',
+  });
+
+  assert.deepEqual(statusObservation, firstObservation);
+  assert.equal(statusObservation.message, 'Hahaha!');
+  assert.equal(extractMessageDetails({
+    messageId: 'fallback-1',
+    ariaLabel: null,
+    textWithoutSenderHeading: 'Hahaha!Sent',
+  }).message, 'Hahaha!');
+  assert.equal(extractMessageDetails({
+    messageId: 'genuine-sent-word',
+    ariaLabel: null,
+    textWithoutSenderHeading: 'I have Sent',
+  }).message, 'I have Sent');
+});
+
+test('context store keeps distinct IDs with identical text and rejects genuine conflicts', () => {
+  const store = createContextStore();
+  store.add([
+    { messageId: '7521145770279674844', message: 'same visible text' },
+    { messageId: 'mid.$gAAW_kanMS16nsy41p2hgejq1c6Pc', message: 'same visible text' },
+  ]);
+
+  assert.deepEqual(store.getState().messageIds, [
+    '7521145770279674844',
+    'mid.$gAAW_kanMS16nsy41p2hgejq1c6Pc',
+  ]);
+  assert.throws(
+    () => store.add([{ messageId: '7521145770279674844', message: 'genuinely different' }]),
+    /Message ID 7521145770279674844 was observed with different content\./,
+  );
+});
+
+test('packet builder does not reprocess repeated messages and still accepts the next message', () => {
+  const first = buildPacketTurn({
+    newMessages: [{ messageId: 'm-1', message: 'hello' }],
+  });
+  const repeated = buildPacketTurn({
+    newMessages: [],
+    recentContext: [{ messageId: 'm-1', message: 'hello' }],
+    state: first.state,
+  });
+  const next = buildPacketTurn({
+    newMessages: [{ messageId: 'm-2', message: '@Bot next', mention: true }],
+    recentContext: [{ messageId: 'm-1', message: 'hello' }],
+    state: repeated.state,
+  });
+  const released = buildPacketTurn({
+    newMessages: [],
+    recentContext: [{ messageId: 'm-1', message: 'hello' }],
+    state: next.state,
+  });
+
+  assert.equal(repeated.packet, null);
+  assert.deepEqual(repeated.state.observedMessages.map(message => message.messageId), ['m-1']);
+  assert.equal(next.packet, null);
+  assert.deepEqual(next.pendingPacket?.newMessages.map(message => message.messageId), ['m-2']);
+  assert.deepEqual(released.packet?.newMessages.map(message => message.messageId), ['m-2']);
+  assert.deepEqual(released.packet?.mentionMessages.map(message => message.messageId), ['m-2']);
+});
+
 test('packet processor sends context before new messages', async () => {
   const calls: unknown[][] = [];
   const processPacket = createPacketProcessor({
@@ -378,7 +449,7 @@ test('packet processor cancels waiting work when the engine stops while paused',
 test('default personality keeps the active reply instruction', () => {
   assert.equal(
     getDefaultPersonalityInstruction(),
-    'Write a short, natural Messenger reply that matches the conversation\'s tone and directly addresses the latest incoming message. Adapt to the group\'s languages, slang, expressions, and conversational style. Match its tone and social context: keep your playful, warm, spontaneous style and emoji use when they genuinely fit, but use humor, sarcasm, or teasing only when the conversation calls for it, respond normally when it is serious, simple, or informational, and keep the wording understandable rather than quirky, forced, or incoherent. Prioritize clear, natural phrasing in a language you handle well; do not force a language you handle less naturally or insert foreign words merely to appear culturally familiar, mix languages only when natural, and use a particular language when the context clearly calls for it and you can do so naturally. Do not add filler, repeat a point, or ask a follow-up question just to keep the conversation going; a short reply or no additional message is fine when nothing useful remains. Aim for roughly 3–12 words when appropriate, but do not force an exact word count; use more words when needed for a natural answer. Avoid unsolicited email copy, calls to action, headings, labels, and unrelated prefixes such as "Verse 3.1". Return only the reply text. This reply is a proposal until the application sends it.',
+    'Write a short, natural Messenger reply that matches the conversation\'s tone and directly addresses the latest incoming message. Adapt to the group\'s languages, slang, expressions, and conversational style. Match its tone and social context: keep your playful, warm, spontaneous style, using emojis selectively when they add genuine nuance, humor, or emphasis and fit the group\'s tone and moment; let many replies rely on words alone, avoid stacked or chained emojis, vary their use naturally rather than following a fixed frequency or quota, and do not compensate with repeated interjections, exaggerated reactions, or filler; use humor, sarcasm, or teasing only when the conversation calls for it, respond normally when it is serious, simple, or informational, and keep the wording understandable rather than quirky, forced, or incoherent. Prioritize clear, natural phrasing in a language you handle well; do not force a language you handle less naturally or insert foreign words merely to appear culturally familiar, mix languages only when natural, and use a particular language when the context clearly calls for it and you can do so naturally. Do not add filler, repeat a point, or ask a follow-up question just to keep the conversation going; a short reply or no additional message is fine when nothing useful remains. Aim for roughly 3–12 words when appropriate, but do not force an exact word count; use more words when needed for a natural answer. Avoid unsolicited email copy, calls to action, headings, labels, and unrelated prefixes such as "Verse 3.1". Return only the reply text. This reply is a proposal until the application sends it.',
   );
 });
 

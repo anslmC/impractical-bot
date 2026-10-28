@@ -44,3 +44,23 @@ test('uses rendered text and UNKNOWN classification when label evidence is absen
     direction: 'UNKNOWN',
   });
 });
+
+test('ignores a directly attached Sent delivery status', () => {
+  const firstObservation = extractMessageDetails({
+    messageId: 'mid.$gAAW_kanMS16nsy41p2hgejq1c6Pc',
+    ariaLabel: 'At October 18, 2026, 1:15 PM, You: Hahaha!',
+    textWithoutSenderHeading: 'Hahaha!',
+  });
+  const statusObservation = extractMessageDetails({
+    messageId: 'mid.$gAAW_kanMS16nsy41p2hgejq1c6Pc',
+    ariaLabel: 'At October 18, 2026, 1:15 PM, You: Hahaha!Sent',
+    textWithoutSenderHeading: 'Hahaha!Sent',
+  });
+
+  assert.deepEqual(statusObservation, firstObservation);
+  assert.equal(extractMessageDetails({
+    messageId: 'fallback-1',
+    ariaLabel: null,
+    textWithoutSenderHeading: 'Hahaha!Sent',
+  }).message, 'Hahaha!');
+});

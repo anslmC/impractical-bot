@@ -298,6 +298,14 @@ function createWakerPage() {
       currentLog.appendChild(message);
       return message;
     },
+    updateMessage(messageId: string, text: string, sender = 'Alex') {
+      const message = document.querySelectorAll(MESSAGE_SELECTOR)
+        .find(candidate => candidate.getAttribute('data-message-id') === messageId);
+      assert.ok(message, `expected message ${messageId} to be rendered`);
+      message.innerText = text;
+      message.setAttribute('aria-label', `At October 18, 2026, 1:15 PM, ${sender}: ${text}`);
+      return message;
+    },
     replaceLog() {
       const previousLog = document.querySelectorAll(LOG_SELECTOR)[0];
       assert.ok(previousLog, 'expected a rendered message log');
@@ -369,6 +377,84 @@ test('Combustion wakes from idle, detects a new message, and resumes polling', a
 
     assert.ok(wakerPage.messageReadCalls > readsBeforeWake);
     assert.ok(contextStore.getState().messageIds.includes('wake-1'));
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+  }
+});
+
+test('A Sent status suffix does not stop polling or duplicate the message', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  const wakerPage = createWakerPage();
+  const contextStore = createContextStore();
+  let stoppedError: unknown;
+  const controller = await startCombustion({
+    page: wakerPage.page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+  void controller.stopped.catch(error => {
+    stoppedError = error;
+  });
+
+  try {
+    assert.deepEqual(contextStore.getState().messageIds, ['baseline-1']);
+
+    wakerPage.updateMessage('baseline-1', 'helloSent');
+    await advanceToIdle(context, wakerPage);
+
+    assert.equal(stoppedError, undefined);
+    assert.deepEqual(contextStore.getState().messageIds, ['baseline-1']);
+    assert.equal(contextStore.getRecent(1)[0].message, 'hello');
+
+    const readsBeforeNewMessage = wakerPage.messageReadCalls;
+    wakerPage.appendMessage('after-status-1', 'next message');
+    await flush();
+
+    assert.equal(stoppedError, undefined);
+    assert.ok(wakerPage.messageReadCalls > readsBeforeNewMessage);
+    assert.deepEqual(contextStore.getState().messageIds, ['baseline-1', 'after-status-1']);
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+  }
+});
+
+test('A genuine same-ID content conflict still stops Combustion', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  const wakerPage = createWakerPage();
+  const contextStore = createContextStore();
+  let stoppedError: unknown;
+  const controller = await startCombustion({
+    page: wakerPage.page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+  void controller.stopped.catch(error => {
+    stoppedError = error;
+  });
+
+  try {
+    wakerPage.updateMessage('baseline-1', 'genuinely different');
+    context.mock.timers.tick(3_000);
+    await flush();
+
+    assert.match(
+      String((stoppedError as Error | undefined)?.message),
+      /Message ID baseline-1 was observed with different content\./,
+    );
   } finally {
     await controller.stop();
     Math.random = originalRandom;
