@@ -5,7 +5,7 @@ import { resolveConfigurationPaths } from './config/configuration.js';
 
 const PROTOCOL = 'IMPBOT_RUNTIME/1';
 const HANDSHAKE_TIMEOUT_MS = 5_000;
-const MAX_LINE_LENGTH = 256;
+const MAX_LINE_LENGTH = 4_096;
 
 export class RuntimeAlreadyRunningError extends Error {
   constructor() {
@@ -33,12 +33,43 @@ export type RuntimeResumeResult =
   | { status: 'resumed'; instanceId: string }
   | { status: 'not-running' };
 
-type RuntimeState = 'starting' | 'running' | 'paused' | 'stopping';
+export type RuntimeDestinationChangeResult =
+  | { status: 'changed'; resumed: boolean }
+  | { status: 'rejected'; reason: string }
+  | { status: 'failed'; reason: string };
+
+export type RuntimeChangeDestinationResult =
+  | { status: 'changed'; instanceId: string; resumed: boolean }
+  | { status: 'rejected'; instanceId: string; reason: string }
+  | { status: 'failed'; instanceId: string; reason: string }
+  | { status: 'not-running' };
+
+type RuntimeState = 'starting' | 'running' | 'paused' | 'changing' | 'stopping';
+
+export interface RuntimeDestinationChangeOptions {
+  resume: boolean;
+}
 
 export interface RuntimeControlHandlers {
   requestShutdown: () => void;
   requestPause?: () => void | Promise<void>;
   requestResume?: () => void | Promise<void>;
+  requestChangeDestination?: (
+    destination: string,
+    options: RuntimeDestinationChangeOptions,
+  ) => RuntimeDestinationChangeResult | Promise<RuntimeDestinationChangeResult>;
+}
+
+function encodeProtocolText(value: string): string {
+  return Buffer.from(value, 'utf8').toString('base64url');
+}
+
+function decodeProtocolText(value: string): string {
+  try {
+    return Buffer.from(value, 'base64url').toString('utf8');
+  } catch {
+    return '';
+  }
 }
 
 export interface RuntimeControl {
@@ -167,9 +198,52 @@ export async function createRuntimeControl(
       return `${exitCode === 0 || exitCode === 130 ? 'STOPPED' : 'FAILED'} ${instanceId} ${exitCode}\n`;
     }
 
+    const destinationPrefix = `DESTINATION ${instanceId} `;
+    if (command.startsWith(destinationPrefix)) {
+      if (state === 'stopping') {
+        return `ERROR ${instanceId} INVALID_STATE\n`;
+      }
+      if (!runtimeHandlers.requestChangeDestination) {
+        return `ERROR ${instanceId} UNSUPPORTED\n`;
+      }
+      if (state === 'changing') {
+        return `ERROR ${instanceId} BUSY\n`;
+      }
+      if (state !== 'running' && state !== 'paused') {
+        return `ERROR ${instanceId} INVALID_STATE\n`;
+      }
+
+      const destination = decodeProtocolText(command.slice(destinationPrefix.length));
+      const resume = state === 'running';
+      state = 'changing';
+      try {
+        const result = await runtimeHandlers.requestChangeDestination(destination, { resume });
+        if (isStopping()) {
+          return `ERROR ${instanceId} ABORTED\n`;
+        }
+        if (result.status === 'changed') {
+          state = result.resumed ? 'running' : 'paused';
+          return `CHANGED ${instanceId} ${result.resumed ? 'RUNNING' : 'PAUSED'}\n`;
+        }
+        state = 'paused';
+        return `${result.status === 'rejected' ? 'REJECTED' : 'FAILED'} ${instanceId} ` +
+          `${encodeProtocolText(result.reason)}\n`;
+      } catch (error) {
+        if (!isStopping()) {
+          state = 'paused';
+        }
+        return `FAILED ${instanceId} ${encodeProtocolText(
+          error instanceof Error ? error.message : String(error),
+        )}\n`;
+      }
+    }
+
     if (command === `PAUSE ${instanceId}`) {
       if (state === 'stopping') {
         return `ERROR ${instanceId} INVALID_STATE\n`;
+      }
+      if (state === 'changing') {
+        return `ERROR ${instanceId} BUSY\n`;
       }
       if (!runtimeHandlers.requestPause) {
         return `ERROR ${instanceId} UNSUPPORTED\n`;
@@ -180,6 +254,7 @@ export async function createRuntimeControl(
       if (state !== 'running') {
         return `ERROR ${instanceId} INVALID_STATE\n`;
       }
+      state = 'changing';
       try {
         await runtimeHandlers.requestPause();
         if (!isStopping()) {
@@ -187,6 +262,9 @@ export async function createRuntimeControl(
         }
         return `PAUSED ${instanceId}\n`;
       } catch {
+        if (!isStopping()) {
+          state = 'running';
+        }
         return `ERROR ${instanceId} PAUSE_FAILED\n`;
       }
     }
@@ -194,6 +272,9 @@ export async function createRuntimeControl(
     if (command === `RESUME ${instanceId}`) {
       if (state === 'stopping') {
         return `ERROR ${instanceId} INVALID_STATE\n`;
+      }
+      if (state === 'changing') {
+        return `ERROR ${instanceId} BUSY\n`;
       }
       if (!runtimeHandlers.requestResume) {
         return `ERROR ${instanceId} UNSUPPORTED\n`;
@@ -204,6 +285,7 @@ export async function createRuntimeControl(
       if (state !== 'paused') {
         return `ERROR ${instanceId} INVALID_STATE\n`;
       }
+      state = 'changing';
       try {
         await runtimeHandlers.requestResume();
         if (!isStopping()) {
@@ -211,6 +293,9 @@ export async function createRuntimeControl(
         }
         return `RESUMED ${instanceId}\n`;
       } catch {
+        if (!isStopping()) {
+          state = 'paused';
+        }
         return `ERROR ${instanceId} RESUME_FAILED\n`;
       }
     }
@@ -349,6 +434,77 @@ async function requestRuntimeTransition(
     }
     throw new RuntimeControlEndpointError(
       `The engine returned an invalid ${command.toLowerCase()} response.`,
+    );
+  } catch (error) {
+    if (isPipeMissing(error)) {
+      return { status: 'not-running' };
+    }
+    throw error;
+  } finally {
+    socket.destroy();
+  }
+}
+
+export async function requestRuntimeChangeDestination(
+  configurationFilePath: string | undefined,
+  destination: string,
+): Promise<RuntimeChangeDestinationResult> {
+  if (process.platform !== 'win32') {
+    throw new RuntimeControlEndpointError('Runtime control is only supported on Windows.');
+  }
+
+  const endpoint = getRuntimeControlEndpoint(configurationFilePath);
+  const socket = createConnection(endpoint);
+  try {
+    let instanceId: string;
+    try {
+      const greeting = await readLine(socket);
+      const match = greeting.match(new RegExp(`^${PROTOCOL} ([0-9a-f-]{36})$`, 'i'));
+      if (!match) {
+        throw new RuntimeControlEndpointError(
+          'The runtime-control endpoint is not owned by an impractical-bot engine; ' +
+          'no destination change request was sent.',
+        );
+      }
+      instanceId = match[1];
+    } catch (error) {
+      if (isPipeMissing(error)) {
+        return { status: 'not-running' };
+      }
+      throw error;
+    }
+
+    socket.setTimeout(0);
+    socket.write(`DESTINATION ${instanceId} ${encodeProtocolText(destination)}\n`);
+    const response = await readLine(socket, 0);
+    if (response === `CHANGED ${instanceId} RUNNING`) {
+      return { status: 'changed', instanceId, resumed: true };
+    }
+    if (response === `CHANGED ${instanceId} PAUSED`) {
+      return { status: 'changed', instanceId, resumed: false };
+    }
+    if (response.startsWith(`REJECTED ${instanceId} `)) {
+      return {
+        status: 'rejected',
+        instanceId,
+        reason: decodeProtocolText(response.slice(`REJECTED ${instanceId} `.length)),
+      };
+    }
+    if (response.startsWith(`FAILED ${instanceId} `)) {
+      return {
+        status: 'failed',
+        instanceId,
+        reason: decodeProtocolText(response.slice(`FAILED ${instanceId} `.length)),
+      };
+    }
+    if (response.startsWith(`ERROR ${instanceId} `)) {
+      const reason = response.slice(`ERROR ${instanceId} `.length);
+      throw new RuntimeControlEndpointError(
+        `The engine rejected the destination change request (${reason}).`,
+      );
+    }
+    throw new RuntimeControlEndpointError(
+      'The engine returned an invalid destination change response.',
     );
   } catch (error) {
     if (isPipeMissing(error)) {

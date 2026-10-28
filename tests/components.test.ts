@@ -53,6 +53,19 @@ test('context store retains Backread sender and direction metadata when seeded',
   }]);
 });
 
+test('context store clear removes all retained conversation state', () => {
+  const store = createContextStore();
+  store.add([
+    { messageId: 'm-1', message: 'first' },
+    { messageId: 'm-2', message: 'second' },
+  ]);
+
+  store.clear();
+
+  assert.deepEqual(store.getState().messageIds, []);
+  assert.deepEqual(store.getRecent(2), []);
+});
+
 test('packet builder holds a mention turn until the next poll', () => {
   const firstTurn = buildPacketTurn({
     newMessages: [{ messageId: 'm-1', message: '@Bot help', mention: true }],
@@ -206,6 +219,102 @@ test('packet scheduler cancels pending work when stopped while paused', async ()
     scheduler.getState().pendingPackets.map(packet => packet.packetId),
     ['packet-1', 'packet-2'],
   );
+});
+
+test('packet scheduler discards queued work without interrupting the active packet', async () => {
+  const processed: string[] = [];
+  let releaseFirst!: () => void;
+  let firstStarted!: () => void;
+  const firstStart = new Promise<void>(resolve => {
+    firstStarted = resolve;
+  });
+  const firstRelease = new Promise<void>(resolve => {
+    releaseFirst = resolve;
+  });
+  const scheduler = createPacketScheduler(async packet => {
+    if (packet.packetId === 'packet-1') {
+      firstStarted();
+      await firstRelease;
+    }
+    processed.push(packet.packetId);
+  });
+
+  assert.equal(scheduler.submit({ packetId: 'packet-1' }), true);
+  await firstStart;
+  assert.equal(scheduler.submit({ packetId: 'packet-2' }), true);
+  assert.equal(scheduler.submit({ packetId: 'packet-3' }), true);
+  assert.deepEqual(scheduler.discardPending(), ['packet-2', 'packet-3']);
+  assert.deepEqual(
+    scheduler.getState().pendingPackets.map(packet => packet.packetId),
+    [],
+  );
+
+  releaseFirst();
+  await scheduler.waitForIdle();
+  assert.deepEqual(processed, ['packet-1']);
+});
+
+test('packet processor abandons a stale packet after reply generation', async () => {
+  const calls: string[] = [];
+  let destinationEpoch = 0;
+  const processPacket = createPacketProcessor({
+    page: 'mock-page',
+    apiKey: 'mock-key',
+    isCurrent: packet => packet.packetId === 'packet-current' && destinationEpoch === 0,
+    generateReply: async () => {
+      calls.push('generate');
+      destinationEpoch += 1;
+      return 'reply';
+    },
+    composeReply: async () => {
+      calls.push('compose');
+      return { status: 'sent' };
+    },
+    logError: () => undefined,
+  });
+
+  await assert.rejects(
+    processPacket({ packetId: 'packet-current' }),
+    /destination changed/,
+  );
+  assert.deepEqual(calls, ['generate']);
+});
+
+test('packet processor rechecks the destination inside the send gate', async () => {
+  const calls: string[] = [];
+  const pauseGate = createPauseGate();
+  let destinationEpoch = 0;
+  let generationComplete!: () => void;
+  const generated = new Promise<void>(resolve => {
+    generationComplete = resolve;
+  });
+  const processPacket = createPacketProcessor({
+    page: 'mock-page',
+    apiKey: 'mock-key',
+    pauseGate,
+    isCurrent: () => destinationEpoch === 0,
+    generateReply: async () => {
+      calls.push('generate');
+      generationComplete();
+      return 'reply';
+    },
+    composeReply: async (_page, _reply, options) => {
+      calls.push('compose');
+      destinationEpoch += 1;
+      await options?.beforeSend?.();
+      calls.push('send');
+      return { status: 'sent' };
+    },
+    logError: () => undefined,
+  });
+
+  pauseGate.pause();
+  const processing = processPacket({ packetId: 'packet-paused' });
+  await generated;
+  pauseGate.resume();
+
+  await assert.rejects(processing, /destination changed/);
+  assert.deepEqual(calls, ['generate', 'compose']);
 });
 
 test('packet processor waits for resume before composing a reply', async () => {

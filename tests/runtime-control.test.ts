@@ -7,6 +7,7 @@ import { test, type TestContext } from 'node:test';
 import {
   createRuntimeControl,
   getRuntimeControlEndpoint,
+  requestRuntimeChangeDestination,
   requestRuntimePause,
   requestRuntimeResume,
   requestRuntimeStop,
@@ -136,6 +137,13 @@ test('runtime stop, pause, and resume report not-running when no owner exists', 
   assert.deepEqual(await requestRuntimeStop(configurationPath), { status: 'not-running' });
   assert.deepEqual(await requestRuntimePause(configurationPath), { status: 'not-running' });
   assert.deepEqual(await requestRuntimeResume(configurationPath), { status: 'not-running' });
+  assert.deepEqual(
+    await requestRuntimeChangeDestination(
+      configurationPath,
+      'https://www.facebook.com/messages/t/987654321',
+    ),
+    { status: 'not-running' },
+  );
 });
 
 test('runtime control pauses and resumes the engine and treats repeated commands as safe', async context => {
@@ -197,6 +205,174 @@ test('runtime control reports pause and resume handler failures without changing
   assert.match(await sendRuntimeCommand(configurationPath, 'PAUSE'), /^PAUSED /);
   assert.match(await sendRuntimeCommand(configurationPath, 'RESUME'), /RESUME_FAILED$/);
   assert.match(await sendRuntimeCommand(configurationPath, 'RESUME'), /RESUME_FAILED$/);
+});
+
+test('runtime control changes a destination and resumes the engine when it was running', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  const destination = 'https://www.facebook.com/messages/t/987654321';
+  let receivedDestination = '';
+  let receivedResume: boolean | undefined;
+  let pauseRequests = 0;
+  const control = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => undefined,
+    requestPause: () => {
+      pauseRequests += 1;
+    },
+    requestResume: () => undefined,
+    requestChangeDestination: (selectedDestination, options) => {
+      receivedDestination = selectedDestination;
+      receivedResume = options.resume;
+      return { status: 'changed', resumed: options.resume };
+    },
+  });
+  context.after(async () => {
+    control.complete(1);
+    await control.close();
+  });
+  control.setState('running');
+
+  const result = await requestRuntimeChangeDestination(configurationPath, destination);
+  assert.equal(result.status, 'changed');
+  if (result.status === 'changed') {
+    assert.match(result.instanceId, /^[0-9a-f-]{36}$/i);
+    assert.equal(result.resumed, true);
+  }
+  assert.equal(receivedDestination, destination);
+  assert.equal(receivedResume, true);
+
+  assert.match(await sendRuntimeCommand(configurationPath, 'PAUSE'), /^PAUSED /);
+  assert.equal(pauseRequests, 1);
+});
+
+test('runtime control keeps a rejected destination change paused and reports the reason', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  let pauseRequests = 0;
+  let resumeRequests = 0;
+  const control = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => undefined,
+    requestPause: () => {
+      pauseRequests += 1;
+    },
+    requestResume: () => {
+      resumeRequests += 1;
+    },
+    requestChangeDestination: () => ({
+      status: 'rejected',
+      reason: 'The destination conversation could not be verified.',
+    }),
+  });
+  context.after(async () => {
+    control.complete(1);
+    await control.close();
+  });
+  control.setState('running');
+
+  const result = await requestRuntimeChangeDestination(
+    configurationPath,
+    'https://www.facebook.com/messages/t/987654321',
+  );
+  assert.equal(result.status, 'rejected');
+  if (result.status === 'rejected') {
+    assert.equal(result.reason, 'The destination conversation could not be verified.');
+  }
+
+  assert.match(await sendRuntimeCommand(configurationPath, 'PAUSE'), /^PAUSED /);
+  assert.equal(pauseRequests, 0);
+  assert.match(await sendRuntimeCommand(configurationPath, 'RESUME'), /^RESUMED /);
+  assert.equal(resumeRequests, 1);
+});
+
+test('runtime control rejects overlapping destination, pause, and resume changes', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  let releaseChange!: () => void;
+  let changeEntered!: () => void;
+  const entered = new Promise<void>(resolve => {
+    changeEntered = resolve;
+  });
+  const release = new Promise<void>(resolve => {
+    releaseChange = resolve;
+  });
+  const control = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => undefined,
+    requestPause: () => undefined,
+    requestResume: () => undefined,
+    requestChangeDestination: async () => {
+      changeEntered();
+      await release;
+      return { status: 'changed', resumed: true };
+    },
+  });
+  context.after(async () => {
+    control.complete(1);
+    await control.close();
+  });
+  control.setState('running');
+
+  const first = requestRuntimeChangeDestination(
+    configurationPath,
+    'https://www.facebook.com/messages/t/987654321',
+  );
+  await entered;
+
+  await assert.rejects(
+    requestRuntimeChangeDestination(
+      configurationPath,
+      'https://www.facebook.com/messages/t/111111111',
+    ),
+    /BUSY/,
+  );
+  await assert.rejects(requestRuntimePause(configurationPath), /BUSY/);
+  await assert.rejects(requestRuntimeResume(configurationPath), /BUSY/);
+
+  releaseChange();
+  assert.equal((await first).status, 'changed');
+});
+
+test('runtime control aborts an in-progress destination change when stopped', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  let releaseChange!: () => void;
+  let changeEntered!: () => void;
+  const entered = new Promise<void>(resolve => {
+    changeEntered = resolve;
+  });
+  const release = new Promise<void>(resolve => {
+    releaseChange = resolve;
+  });
+  let shutdownRequested = false;
+  let resolveShutdown!: () => void;
+  const shutdown = new Promise<void>(resolve => {
+    resolveShutdown = resolve;
+  });
+  const control = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => {
+      shutdownRequested = true;
+      resolveShutdown();
+    },
+    requestChangeDestination: async () => {
+      changeEntered();
+      await release;
+      return { status: 'changed', resumed: true };
+    },
+  });
+  context.after(async () => {
+    control.complete(1);
+    await control.close();
+  });
+  control.setState('running');
+
+  const change = requestRuntimeChangeDestination(
+    configurationPath,
+    'https://www.facebook.com/messages/t/987654321',
+  );
+  await entered;
+  const stop = requestRuntimeStop(configurationPath);
+  await shutdown;
+  assert.equal(shutdownRequested, true);
+  control.complete(0);
+  releaseChange();
+
+  await assert.rejects(change, /ABORTED/);
+  assert.equal((await stop).status, 'stopped');
 });
 
 test('runtime control rejects unsupported and unknown commands without requesting shutdown', async context => {

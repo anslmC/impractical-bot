@@ -536,6 +536,86 @@ async function waitForConfiguredConversation(
   }
 }
 
+export interface ConversationNavigationOptions {
+  navigationTimeoutMs?: number;
+  readinessTimeoutMs?: number;
+}
+
+export async function navigatePageToMessengerDestination(
+  page: Page,
+  configuration: Configuration,
+  destination: string,
+  options: ConversationNavigationOptions = {},
+): Promise<void> {
+  const validatedConfiguration = validateConfiguration({
+    ...configuration,
+    messageDestination: destination,
+  });
+  const destinationUrl = new URL(validatedConfiguration.messageDestination!);
+  if (!isFacebookUrl(destinationUrl)) {
+    throw new Error('Message destination must be on Facebook.');
+  }
+  const expectedConversationId = conversationId(destinationUrl);
+  if (!expectedConversationId) {
+    throw new Error('Message destination must identify a Messenger conversation.');
+  }
+
+  const navigationTimeoutMs = options.navigationTimeoutMs ?? 30_000;
+  const readinessTimeoutMs = options.readinessTimeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS;
+  if (navigationTimeoutMs <= 0 || readinessTimeoutMs <= 0) {
+    throw new Error('Conversation navigation and readiness timeouts must be positive.');
+  }
+
+  let alreadyAtDestination = false;
+  try {
+    const currentUrl = new URL(page.url());
+    alreadyAtDestination = isFacebookUrl(currentUrl) &&
+      conversationId(currentUrl) === expectedConversationId;
+  } catch {
+    alreadyAtDestination = false;
+  }
+  if (!alreadyAtDestination) {
+    await page.goto(destinationUrl.href, {
+      waitUntil: 'domcontentloaded',
+      timeout: navigationTimeoutMs,
+    });
+  }
+
+  try {
+    await page.waitForLoadState('networkidle', { timeout: 5_000 });
+  } catch {
+    // Messenger may keep network activity open; the checks below validate the settled page.
+  }
+
+  await waitForConfiguredConversation(page, expectedConversationId, readinessTimeoutMs);
+  if (page.isClosed()) {
+    throw new Error('The conversation tab closed before the destination could be verified.');
+  }
+
+  const composers = page.locator('[role="textbox"][contenteditable="true"]:visible');
+  try {
+    await composers.first().waitFor({ state: 'visible', timeout: readinessTimeoutMs });
+  } catch {
+    throw new Error('A visible conversation composer did not become available.');
+  }
+  if (await composers.count() === 0 || !await composers.first().isEnabled()) {
+    throw new Error('The conversation composer is not ready.');
+  }
+
+  let resultingUrl: URL;
+  try {
+    resultingUrl = new URL(page.url());
+  } catch {
+    throw new Error('The destination tab has an invalid URL after navigation.');
+  }
+  if (!isFacebookUrl(resultingUrl) ||
+      conversationId(resultingUrl) !== expectedConversationId) {
+    throw new Error(
+      `The destination did not resolve to Messenger conversation ${expectedConversationId}.`,
+    );
+  }
+}
+
 export async function prepareConfiguredBrowser(
   browser: Browser,
   configuration: Configuration,

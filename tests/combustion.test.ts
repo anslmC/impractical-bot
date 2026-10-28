@@ -183,6 +183,110 @@ test('Combustion pauses polling and resumes it without duplicating reads', async
   }
 });
 
+test('Combustion changes destinations, resets conversation state, and resumes without duplicate observers', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const mockPage = createMockPage({ messageCount: 2 });
+  const contextStore = createContextStore();
+  contextStore.add([{ messageId: 'old-conversation', message: 'stale context' }]);
+  const navigation: string[] = [];
+  const persisted: string[] = [];
+  const firstDestination = 'https://www.facebook.com/messages/t/987654321';
+  const secondDestination = 'https://www.facebook.com/messages/t/111111111';
+  const controller = await startCombustion({
+    page: mockPage.page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+    navigateDestination: async destination => {
+      navigation.push(destination);
+    },
+  });
+
+  try {
+    assert.deepEqual(
+      contextStore.getState().messageIds,
+      ['old-conversation', 'historical-1', 'baseline-1'],
+    );
+    const first = await controller.changeDestination(firstDestination, {
+      resume: true,
+      persist: destination => {
+        persisted.push(destination);
+      },
+    });
+    assert.deepEqual(first, { status: 'changed', resumed: true });
+    assert.deepEqual(navigation, [firstDestination]);
+    assert.deepEqual(persisted, [firstDestination]);
+    assert.equal(configuration.messageDestination, firstDestination);
+    assert.deepEqual(contextStore.getState().messageIds, ['historical-1', 'baseline-1']);
+    assert.deepEqual(contextStore.getRecent(2).map(message => message.message), ['hello', 'hello']);
+
+    const second = await controller.changeDestination(secondDestination, {
+      resume: true,
+      persist: destination => {
+        persisted.push(destination);
+      },
+    });
+    assert.deepEqual(second, { status: 'changed', resumed: true });
+    assert.deepEqual(navigation, [firstDestination, secondDestination]);
+    assert.deepEqual(persisted, [firstDestination, secondDestination]);
+    assert.equal(configuration.messageDestination, secondDestination);
+    assert.equal(mockPage.baselineReadCalls, 3);
+    assert.equal(mockPage.observerSetupCalls, 1);
+    assert.equal(mockPage.listenerCount, 1);
+  } finally {
+    await controller.stop();
+    context.mock.timers.reset();
+  }
+});
+
+test('Combustion rejects an invalid destination, restores navigation, and keeps the paused session intact', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const mockPage = createMockPage();
+  const contextStore = createContextStore();
+  const originalDestination = configuration.messageDestination!;
+  const destination = 'https://www.facebook.com/messages/t/987654321';
+  const navigation: string[] = [];
+  let persisted = false;
+  const controller = await startCombustion({
+    page: mockPage.page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+    navigateDestination: async selectedDestination => {
+      navigation.push(selectedDestination);
+      if (selectedDestination === destination) {
+        throw new Error('destination could not be verified');
+      }
+    },
+  });
+
+  try {
+    assert.deepEqual(contextStore.getState().messageIds, ['historical-1']);
+    const result = await controller.changeDestination(destination, {
+      resume: true,
+      persist: () => {
+        persisted = true;
+      },
+    });
+    assert.equal(result.status, 'rejected');
+    if (result.status === 'rejected') {
+      assert.match(result.reason, /not a valid or accessible group conversation/);
+      assert.match(result.reason, /destination could not be verified/);
+    }
+    assert.equal(persisted, false);
+    assert.equal(configuration.messageDestination, originalDestination);
+    assert.deepEqual(navigation, [destination, originalDestination]);
+    assert.deepEqual(contextStore.getState().messageIds, ['historical-1']);
+  } finally {
+    await controller.stop();
+    context.mock.timers.reset();
+  }
+});
+
 test('Combustion initialization failure removes its listener without owning the page', async () => {
   const mockPage = createMockPage({ failObserverSetup: true });
   const contextStore = createContextStore();

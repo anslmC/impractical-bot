@@ -53,6 +53,7 @@ function createTestCombustionController(
   onStop?: () => void,
   onPause?: () => void,
   onResume?: () => void,
+  onChangeDestination?: CombustionController['changeDestination'],
 ): CombustionController {
   let resolveStopped!: () => void;
   const stopped = new Promise<void>(resolve => {
@@ -65,6 +66,16 @@ function createTestCombustionController(
     },
     async resume() {
       onResume?.();
+    },
+    async changeDestination(destination, options) {
+      if (onChangeDestination) {
+        return onChangeDestination(destination, options);
+      }
+      await options.persist?.(destination);
+      if (options.resume) {
+        onResume?.();
+      }
+      return { status: 'changed', resumed: options.resume };
     },
     async stop() {
       onStop?.();
@@ -1296,6 +1307,205 @@ test('pause and resume commands control the running Combustion engine', async co
   assert.deepEqual(events, ['paused', 'resumed', 'stopped', 'disconnected', 'browser-closed']);
 });
 
+test('changemsgdestination updates a running engine through runtime control', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const destination = 'https://www.facebook.com/messages/t/987654321';
+  const requests: {
+    destination: string;
+    resume: boolean;
+    destinationBeforePersist: string | undefined;
+  }[] = [];
+  const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
+    launchBrowser: async () => ({
+      endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+      browserVersion: 'Brave Chromium test',
+      disconnected: new Promise<void>(() => undefined),
+      async prepare() {
+        return stubPage;
+      },
+      async disconnect() {
+        return undefined;
+      },
+    }),
+    readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+    startCombustion: async () => createTestCombustionController(
+      undefined,
+      undefined,
+      undefined,
+      async (selectedDestination, options) => {
+        const saved = loadConfiguration(configurationFilePath);
+        requests.push({
+          destination: selectedDestination,
+          resume: options.resume,
+          destinationBeforePersist: saved.status === 'valid'
+            ? saved.configuration.messageDestination
+            : undefined,
+        });
+        await options.persist?.(selectedDestination);
+        return { status: 'changed', resumed: options.resume };
+      },
+    ),
+  }, message => {
+    if (message.startsWith('Engine ready')) ready.resolve();
+  });
+
+  await ready.promise;
+  const change = await captureCli(
+    ['changemsgdestination'],
+    configurationFilePath,
+    async () => destination,
+  );
+  assert.equal(change.exitCode, 0);
+  assert.deepEqual(requests, [{
+    destination,
+    resume: true,
+    destinationBeforePersist: validConfiguration.messageDestination,
+  }]);
+  assert.match(change.output[0], /Message destination changed/);
+  assert.match(change.output[0], /resumed/);
+  const savedAfterChange = loadConfiguration(configurationFilePath);
+  assert.equal(savedAfterChange.status, 'valid');
+  if (savedAfterChange.status === 'valid') {
+    assert.equal(savedAfterChange.configuration.messageDestination, destination);
+  }
+
+  const stopped = await captureCli(['stop'], configurationFilePath);
+  assert.equal(stopped.exitCode, 0);
+  assert.equal((await start).exitCode, 0);
+});
+
+test('changemsgdestination rejection preserves a running engine destination and requires resume', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const events: string[] = [];
+  const destination = 'https://www.facebook.com/messages/t/987654321';
+  const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
+    launchBrowser: async () => ({
+      endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+      browserVersion: 'Brave Chromium test',
+      disconnected: new Promise<void>(() => undefined),
+      async prepare() {
+        return stubPage;
+      },
+      async disconnect() {
+        return undefined;
+      },
+    }),
+    readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+    startCombustion: async () => createTestCombustionController(
+      () => events.push('stopped'),
+      () => events.push('paused'),
+      () => events.push('resumed'),
+      async () => {
+        events.push('destination-rejected');
+        return {
+          status: 'rejected',
+          reason: 'The destination conversation could not be verified.',
+        };
+      },
+    ),
+  }, message => {
+    if (message.startsWith('Engine ready')) ready.resolve();
+  });
+
+  await ready.promise;
+  const change = await captureCli(
+    ['changemsgdestination'],
+    configurationFilePath,
+    async () => destination,
+  );
+  assert.equal(change.exitCode, 1);
+  assert.match(change.errors[0], /not a valid or accessible group conversation/);
+  assert.match(change.output[0], /remains paused/);
+  const savedAfterRejection = loadConfiguration(configurationFilePath);
+  assert.equal(savedAfterRejection.status, 'valid');
+  if (savedAfterRejection.status === 'valid') {
+    assert.equal(
+      savedAfterRejection.configuration.messageDestination,
+      validConfiguration.messageDestination,
+    );
+  }
+  assert.deepEqual(events, ['destination-rejected']);
+
+  const resumed = await captureCli(['resume'], configurationFilePath);
+  assert.equal(resumed.exitCode, 0);
+  assert.match(resumed.output[0], /resumed/);
+  assert.deepEqual(events, ['destination-rejected', 'resumed']);
+
+  const stopped = await captureCli(['stop'], configurationFilePath);
+  assert.equal(stopped.exitCode, 0);
+  assert.equal((await start).exitCode, 0);
+});
+
+test('a second destination change is rejected while the first is in progress', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const changeEntered = deferred<void>();
+  const releaseChange = deferred<void>();
+  const destination = 'https://www.facebook.com/messages/t/987654321';
+
+  const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
+    launchBrowser: async () => ({
+      endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+      browserVersion: 'Brave Chromium test',
+      disconnected: new Promise<void>(() => undefined),
+      async prepare() {
+        return stubPage;
+      },
+      async disconnect() {
+        return undefined;
+      },
+    }),
+    readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+    startCombustion: async () => createTestCombustionController(
+      undefined,
+      undefined,
+      undefined,
+      async (selectedDestination, options) => {
+        changeEntered.resolve();
+        await releaseChange.promise;
+        await options.persist?.(selectedDestination);
+        return { status: 'changed', resumed: options.resume };
+      },
+    ),
+  }, message => {
+    if (message.startsWith('Engine ready')) ready.resolve();
+  });
+
+  await ready.promise;
+  const firstChange = captureCli(
+    ['changemsgdestination'],
+    configurationFilePath,
+    async () => destination,
+  );
+  await changeEntered.promise;
+  const secondChange = await captureCli(
+    ['changemsgdestination'],
+    configurationFilePath,
+    async () => 'https://www.facebook.com/messages/t/111111111',
+  );
+  assert.equal(secondChange.exitCode, 1);
+  assert.match(secondChange.errors[0], /BUSY/);
+
+  releaseChange.resolve();
+  const firstResult = await firstChange;
+  assert.equal(firstResult.exitCode, 0);
+
+  const stopped = await captureCli(['stop'], configurationFilePath);
+  assert.equal(stopped.exitCode, 0);
+  assert.equal((await start).exitCode, 0);
+});
+
 test('stop waits for Combustion cleanup before disconnecting Playwright and closing the attached browser', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
@@ -1331,6 +1541,10 @@ test('stop waits for Combustion cleanup before disconnecting Playwright and clos
       },
       async resume() {
         events.push('combustion-resumed');
+      },
+      async changeDestination(destination, options) {
+        await options.persist?.(destination);
+        return { status: 'changed', resumed: options.resume };
       },
       async stop() {
         events.push('combustion-stop-started');
@@ -1512,16 +1726,16 @@ test('init dispatches to its injected initialization workflow', async () => {
   assert.match(result.errors[0], /browser discovery is unavailable/);
 });
 
-test('changemessagedestination validates first and saves only after navigation succeeds', async context => {
+test('changemsgdestination validates before saving a pre-start destination', async context => {
   const filePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, filePath);
   const destination = 'https://www.facebook.com/messages/t/987654321';
   const promptCalls: string[] = [];
   const answers = ['ftp://www.facebook.com/messages/t/987654321', destination];
-  let navigationCalls = 0;
+  const runtimeChecks: string[] = [];
 
   const result = await captureCli(
-    ['changemessagedestination'],
+    ['changemsgdestination'],
     filePath,
     async question => {
       promptCalls.push(question);
@@ -1529,20 +1743,20 @@ test('changemessagedestination validates first and saves only after navigation s
     },
     undefined,
     {
-      navigateMessageDestination: async (configuration, selectedDestination) => {
-        navigationCalls += 1;
-        assert.deepEqual(configuration, validConfiguration);
-        assert.equal(selectedDestination, destination);
+      requestRuntimeChangeDestination: async (configurationFilePath, selectedDestination) => {
+        runtimeChecks.push(selectedDestination);
+        assert.equal(configurationFilePath, filePath);
         assert.deepEqual(loadConfiguration(filePath), {
           status: 'valid',
           configuration: validConfiguration,
         });
+        return { status: 'not-running' };
       },
     },
   );
 
   assert.equal(result.exitCode, 0);
-  assert.equal(navigationCalls, 1);
+  assert.deepEqual(runtimeChecks, [destination]);
   assert.equal(promptCalls.length, 2);
   assert.match(result.errors[0], /valid HTTP or HTTPS URL/);
   assert.deepEqual(loadConfiguration(filePath), {
@@ -1551,48 +1765,46 @@ test('changemessagedestination validates first and saves only after navigation s
   });
 });
 
-test('changemessagedestination cancellation and navigation failure retain the configured destination', async context => {
+test('changemsgdestination cancellation and invalid input retain the configured destination', async context => {
   const filePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, filePath);
-  let navigationCalls = 0;
+  let runtimeChecks = 0;
 
   const cancelled = await captureCli(
-    ['changemessagedestination'],
+    ['changemsgdestination'],
     filePath,
     async () => null,
     undefined,
     {
-      navigateMessageDestination: async () => {
-        navigationCalls += 1;
+      requestRuntimeChangeDestination: async () => {
+        runtimeChecks += 1;
+        return { status: 'not-running' };
       },
     },
   );
   assert.equal(cancelled.exitCode, 0);
-  assert.equal(navigationCalls, 0);
+  assert.equal(runtimeChecks, 0);
   assert.deepEqual(loadConfiguration(filePath), {
     status: 'valid',
     configuration: validConfiguration,
   });
 
+  const invalidAnswers = ['not-a-url', null];
   const failed = await captureCli(
-    ['changemessagedestination'],
+    ['changemsgdestination'],
     filePath,
-    async () => 'https://www.facebook.com/messages/t/987654321',
+    async () => invalidAnswers.shift() ?? null,
     undefined,
     {
-      navigateMessageDestination: async () => {
-        navigationCalls += 1;
-        assert.deepEqual(loadConfiguration(filePath), {
-          status: 'valid',
-          configuration: validConfiguration,
-        });
-        throw new Error('CDP attachment failed');
+      requestRuntimeChangeDestination: async () => {
+        runtimeChecks += 1;
+        return { status: 'not-running' };
       },
     },
   );
-  assert.equal(failed.exitCode, 1);
-  assert.equal(navigationCalls, 1);
-  assert.match(failed.errors[0], /CDP attachment failed/);
+  assert.equal(failed.exitCode, 0);
+  assert.equal(runtimeChecks, 0);
+  assert.match(failed.errors[0], /valid HTTP or HTTPS URL/);
   assert.deepEqual(loadConfiguration(filePath), {
     status: 'valid',
     configuration: validConfiguration,
@@ -1649,6 +1861,8 @@ test('help options and no command display usage', async () => {
     assert.match(result.output[0], /init\s+Initialize impractical-bot/);
     assert.match(result.output[0], /config\s+Configure impractical-bot/);
     assert.match(result.output[0], /changebrowser\s+Change the configured browser/);
+    assert.match(result.output[0], /changemsgdestination\s+Change the message destination/);
+    assert.doesNotMatch(result.output[0], /changemessagedestination/);
     assert.match(result.output[0], /updatekey\s+Replace the NVIDIA API key/);
       assert.match(result.output[0], /start\s+Start impractical-bot/);
       assert.match(result.output[0], /pause\s+Pause impractical-bot/);

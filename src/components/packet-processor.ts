@@ -30,6 +30,7 @@ export interface PacketProcessorOptions<
     options?: ComposeReplyOptions,
   ) => Composition | Promise<Composition>;
   pauseGate?: PauseGate;
+  isCurrent?: (packet: ProcessablePacket<Message>) => boolean;
   debugMode?: boolean;
   logError?: (message: string) => void;
   logWarning?: (message: string) => void;
@@ -42,6 +43,15 @@ async function waitForPacketWork(pauseGate: PauseGate | undefined): Promise<void
   const result = await pauseGate.waitUntilResumed();
   if (result === 'cancelled') {
     throw new Error('Packet processing cancelled while the engine is stopping.');
+  }
+}
+
+function assertPacketCurrent<Message>(
+  isCurrent: ((packet: ProcessablePacket<Message>) => boolean) | undefined,
+  packet: ProcessablePacket<Message>,
+): void {
+  if (isCurrent && !isCurrent(packet)) {
+    throw new Error('Packet processing abandoned because the destination changed.');
   }
 }
 
@@ -60,6 +70,7 @@ export function createPacketProcessor<
   generateReply,
   composeReply,
   pauseGate,
+  isCurrent,
   debugMode = false,
   logError = message => console.error(message),
   logWarning = message => console.warn(message),
@@ -85,13 +96,20 @@ export function createPacketProcessor<
         `chars=${typeof reply === 'string' ? reply.length : 'unknown'}`,
       );
       stage = 'composition';
+      assertPacketCurrent(isCurrent, packet);
       await waitForPacketWork(pauseGate);
+      assertPacketCurrent(isCurrent, packet);
       console.log(`[packet ${packetId}] stage=composition-start`);
       const composition = await composeReply(
         page,
         reply,
-        pauseGate
-          ? { beforeSend: () => waitForPacketWork(pauseGate) }
+        pauseGate || isCurrent
+          ? {
+            beforeSend: async () => {
+              await waitForPacketWork(pauseGate);
+              assertPacketCurrent(isCurrent, packet);
+            },
+          }
           : undefined,
       );
       console.log(

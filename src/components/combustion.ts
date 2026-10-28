@@ -2,6 +2,7 @@ import type { ConsoleMessage, Page } from 'playwright';
 import {
   generateNvidiaReply,
 } from '../ai/nvidia.js';
+import { navigatePageToMessengerDestination } from '../browser/launch.js';
 import type { BackreadMessage } from './backread.js';
 import {
   composeMessengerReply,
@@ -56,13 +57,32 @@ export interface CombustionOptions {
   aliases: readonly string[];
   apiKey: string;
   debugMode?: boolean;
+  navigateDestination?: (destination: string) => Promise<void>;
+}
+
+export type DestinationChangeResult =
+  | { status: 'changed'; resumed: boolean }
+  | { status: 'rejected'; reason: string }
+  | { status: 'failed'; reason: string };
+
+export interface DestinationChangeOptions {
+  resume: boolean;
+  persist?: (destination: string) => void | Promise<void>;
 }
 
 export interface CombustionController {
   stopped: Promise<void>;
   pause(): Promise<void>;
   resume(): Promise<void>;
+  changeDestination(
+    destination: string,
+    options: DestinationChangeOptions,
+  ): Promise<DestinationChangeResult>;
   stop(): Promise<void>;
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function createWakeSignal(): { promise: Promise<void>; resolve: () => void } {
@@ -362,10 +382,17 @@ export async function startCombustion({
   aliases,
   apiKey,
   debugMode = false,
+  navigateDestination,
 }: CombustionOptions): Promise<CombustionController> {
   const pauseGate = createPauseGate();
+  const navigateToDestination = navigateDestination ?? ((destination: string) =>
+    navigatePageToMessengerDestination(page, configuration, destination));
   let observerAttached = false;
   let stopRequested = false;
+  let destinationChangeInProgress = false;
+  let pendingDestination: string | null = null;
+  let destinationEpoch = 0;
+  const packetEpochs = new WeakMap<object, number>();
   let mode: 'polling' | 'idle' = 'polling';
   let wakerActive = false;
   let mainPollInProgress = false;
@@ -373,6 +400,7 @@ export async function startCombustion({
   let rngOperationActive = false;
   let rngCooldownActive = false;
   let rngPacketInFlightId: string | null = null;
+  let rngPacketEpoch: number | null = null;
   let lastRngSkipReason: string | null = null;
   let rngPollTimer: ReturnType<typeof setInterval> | undefined;
   let rngCooldownTimer: ReturnType<typeof setTimeout> | undefined;
@@ -407,13 +435,15 @@ export async function startCombustion({
     if (packetId !== rngPacketInFlightId) {
       return;
     }
+    const completedEpoch = rngPacketEpoch;
     rngPacketInFlightId = null;
+    rngPacketEpoch = null;
     rngOperationActive = false;
     const outcome = succeeded
       ? 'success'
       : `failure: ${error instanceof Error ? error.message : String(error)}`;
     console.log(`[rng] Processing completed: ${packetId} (${outcome})`);
-    if (stopRequested) {
+    if (stopRequested || completedEpoch !== destinationEpoch) {
       return;
     }
     rngCooldownActive = true;
@@ -750,6 +780,129 @@ export async function startCombustion({
   };
   let seenMessageIds = new Set<string>();
 
+  const resetConversationState = async (baseline: MessageDetails[]): Promise<void> => {
+    destinationEpoch += 1;
+    packetScheduler?.discardPending();
+    const nextPacketNumber = packetBuilderState?.nextPacketNumber ?? 1;
+    packetBuilderState = createPacketBuilderState();
+    packetBuilderState.nextPacketNumber = nextPacketNumber;
+    contextStore.clear();
+    seenMessageIds = new Set(baseline.map(message => message.messageId).filter(Boolean));
+    appendContextMessages(contextStore, baseline, packetScheduler, packetBuilderState);
+    packetBuilderState = buildPacketTurn({
+      newMessages: [],
+      recentContext: baseline
+        .filter(message => message.messageId)
+        .map(message => ({
+          ...message,
+          mention: containsMention(message.message, aliases),
+        })),
+      state: packetBuilderState,
+    }).state;
+
+    rngOperationActive = false;
+    rngPacketInFlightId = null;
+    rngPacketEpoch = null;
+    lastRngSkipReason = null;
+    rngCooldownActive = false;
+    clearTimeout(rngCooldownTimer);
+    rngCooldownTimer = undefined;
+  };
+
+  const returnToPreviousDestination = async (
+    previousDestination: string | undefined,
+  ): Promise<void> => {
+    if (!previousDestination) {
+      return;
+    }
+    try {
+      await navigateToDestination(previousDestination);
+      console.log('[engine] Returned to the previous message destination.');
+    } catch (error) {
+      console.error(
+        '[engine] Could not return to the previous message destination: ' +
+        `${describeError(error)}`,
+      );
+    }
+  };
+
+  const changeDestination = async (
+    destination: string,
+    { resume, persist }: DestinationChangeOptions,
+  ): Promise<DestinationChangeResult> => {
+    if (destinationChangeInProgress || pendingDestination !== null) {
+      return { status: 'rejected', reason: 'A destination change is already in progress.' };
+    }
+    if (stopRequested) {
+      return { status: 'failed', reason: 'The engine is stopping.' };
+    }
+
+    const previousDestination = configuration.messageDestination;
+    destinationChangeInProgress = true;
+    pendingDestination = destination;
+    try {
+      await pauseEngine();
+      if (stopRequested) {
+        return { status: 'failed', reason: 'The engine stopped during the destination change.' };
+      }
+
+      let baseline: MessageDetails[];
+      try {
+        await navigateToDestination(destination);
+        if (stopRequested) {
+          return {
+            status: 'failed',
+            reason: 'The engine stopped during destination navigation.',
+          };
+        }
+        baseline = await readLatestMessages();
+      } catch (error) {
+        const reason = describeError(error);
+        console.error(`[engine] Destination change rejected: ${reason}`);
+        await returnToPreviousDestination(previousDestination);
+        return {
+          status: 'rejected',
+          reason: `The proposed destination is not a valid or accessible group conversation. ${reason}`,
+        };
+      }
+
+      try {
+        await persist?.(destination);
+        configuration.messageDestination = destination;
+      } catch (error) {
+        const reason = describeError(error);
+        await returnToPreviousDestination(previousDestination);
+        return {
+          status: 'failed',
+          reason: `The destination was validated but the configuration could not be saved. ${reason}`,
+        };
+      }
+
+      pendingDestination = null;
+      try {
+        await resetConversationState(baseline);
+      } catch (error) {
+        return {
+          status: 'failed',
+          reason:
+            'The destination was saved but the engine session could not be reset. ' +
+            `${describeError(error)}`,
+        };
+      }
+
+      if (stopRequested) {
+        return { status: 'failed', reason: 'The engine stopped during the destination change.' };
+      }
+      if (resume) {
+        await resumeEngine();
+      }
+      return { status: 'changed', resumed: resume && !pauseGate.isPaused() };
+    } finally {
+      pendingDestination = null;
+      destinationChangeInProgress = false;
+    }
+  };
+
   try {
     console.log(`[engine] Starting Combustion for ${configuration.messageDestination}.`);
     const systemInstruction = getDefaultPersonalityInstruction();
@@ -769,9 +922,11 @@ export async function startCombustion({
       ),
       composeReply: composeMessengerReply,
       pauseGate,
+      isCurrent: packet => packetEpochs.get(packet) === destinationEpoch,
       debugMode,
     });
     packetScheduler = createPacketScheduler<ScheduledPacket>(async packet => {
+      packetEpochs.set(packet, destinationEpoch);
       if (packet.packetId === rngPacketInFlightId) {
         console.log(`[rng] Processing started: ${packet.packetId}`);
       }
@@ -902,6 +1057,7 @@ export async function startCombustion({
 
         const packet = buildRngPacket(recentMessages);
         rngPacketInFlightId = packet.packetId;
+        rngPacketEpoch = destinationEpoch;
         console.log(`[rng] Packet created: ${packet.packetId} (${packet.contextMessages.length} context messages)`);
         if (!packetScheduler!.submit(packet)) {
           rngPacketInFlightId = null;
@@ -935,6 +1091,7 @@ export async function startCombustion({
       stopped,
       pause: pauseEngine,
       resume: resumeEngine,
+      changeDestination,
       async stop() {
         requestStop();
         await stopped.catch(() => undefined);

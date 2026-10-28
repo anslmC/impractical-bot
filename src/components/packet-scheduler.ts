@@ -73,6 +73,14 @@ export function createPacketScheduler<Packet extends ScheduledPacket>(
       void drain();
       return true;
     },
+    discardPending(): string[] {
+      const discardedPacketIds = pendingPackets.map(packet => packet.packetId);
+      pendingPackets.length = 0;
+      if (!processing) {
+        notifyIdle();
+      }
+      return discardedPacketIds;
+    },
     getState() {
       return {
         activePacket,

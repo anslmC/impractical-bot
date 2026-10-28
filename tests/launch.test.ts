@@ -6,12 +6,13 @@ import {
   closeConfiguredBrowser,
   launchConfiguredBrowser,
   navigateConfiguredBrowserToMessageDestination,
+  navigatePageToMessengerDestination,
   prepareConfiguredBrowser,
   type BrowserCloseOptions,
   type BrowserLaunchFileSystem,
   type BrowserProcessHandle,
 } from '../src/browser/launch.js';
-import type { Browser } from 'playwright';
+import type { Browser, Page } from 'playwright';
 import type { Configuration } from '../src/config/configuration.js';
 
 const baseConfiguration: Configuration = {
@@ -160,6 +161,10 @@ class StartupPage {
 
   isClosed(): boolean { return false; }
   url(): string { return this.currentUrl; }
+
+  async waitForLoadState(): Promise<void> {
+    this.events.push('load-state-checked');
+  }
 
   getByRole(role: string, options: { name: string }): StartupLocator {
     if (role === 'alertdialog' && options.name === 'Push notifications request') {
@@ -806,6 +811,62 @@ test('launches configured browser, connects to its configured port, then disconn
   assert.equal(browser.calls.close, 1);
   assert.equal(server.listening, true);
   assert.equal(child.exited, false);
+});
+
+test('navigates an engine page to a verified Messenger conversation', async () => {
+  const destination = 'https://www.facebook.com/messages/t/987654321';
+  const page = new StartupPage(destination, 'no-pin');
+  page.loginDetected = true;
+
+  await navigatePageToMessengerDestination(
+    page as unknown as Page,
+    baseConfiguration,
+    destination,
+  );
+
+  assert.deepEqual(page.gotoUrls, [destination]);
+  assert.equal(page.url(), destination);
+  assert.ok(page.events.includes('load-state-checked'));
+  assert.ok(page.events.includes('conversation-verified'));
+  assert.ok(page.events.includes('composer-readiness-checked'));
+});
+
+test('conversation navigation skips redundant navigation and rejects unverifiable destinations', async () => {
+  const destination = 'https://www.facebook.com/messages/t/987654321';
+  const currentPage = new StartupPage(destination, 'no-pin');
+  currentPage.currentUrl = destination;
+  currentPage.composerReady = true;
+
+  await navigatePageToMessengerDestination(
+    currentPage as unknown as Page,
+    baseConfiguration,
+    destination,
+  );
+  assert.deepEqual(currentPage.gotoUrls, []);
+
+  const wrongPage = new StartupPage(destination, 'wrong-conversation');
+  wrongPage.loginDetected = true;
+  await assert.rejects(
+    navigatePageToMessengerDestination(
+      wrongPage as unknown as Page,
+      baseConfiguration,
+      destination,
+    ),
+    /did not settle on conversation/,
+  );
+
+  const invalidDestination = 'https://www.facebook.com/messages/t/not-a-number';
+  const invalidPage = new StartupPage(destination, 'no-pin');
+  invalidPage.loginDetected = true;
+  await assert.rejects(
+    navigatePageToMessengerDestination(
+      invalidPage as unknown as Page,
+      baseConfiguration,
+      invalidDestination,
+    ),
+    /Messenger conversation/,
+  );
+  assert.deepEqual(invalidPage.gotoUrls, []);
 });
 
 test('navigates a unique existing Facebook tab through CDP and disconnects Playwright only', async () => {

@@ -7,6 +7,7 @@ export interface ContextMessage {
 
 export interface ContextStore {
   add(incomingMessages: ContextMessage[]): void;
+  clear(): void;
   getRecent(limit: number): ContextMessage[];
   getState(): { maxMessages: number; size: number; messageIds: string[] };
 }
@@ -59,6 +60,10 @@ export function createContextStore({ maxMessages = 60 }: { maxMessages?: number 
           messagesById.delete(evictedMessage!.messageId);
         }
       }
+    },
+    clear() {
+      messages.length = 0;
+      messagesById.clear();
     },
     getRecent(limit) {
       if (!Number.isInteger(limit) || limit < 0) {

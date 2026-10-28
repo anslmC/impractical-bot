@@ -26,7 +26,6 @@ import {
   assertConfiguredBrowserCanStart,
   closeConfiguredBrowser,
   launchConfiguredBrowser,
-  navigateConfiguredBrowserToMessageDestination,
   type BrowserLaunchSession,
 } from './browser/launch.js';
 import {
@@ -58,6 +57,7 @@ import {
 } from './components/backread.js';
 import {
   createRuntimeControl,
+  requestRuntimeChangeDestination,
   requestRuntimePause,
   requestRuntimeResume,
   requestRuntimeStop,
@@ -79,10 +79,7 @@ export interface CliRuntimeOptions {
   composeMessengerReply?: typeof composeMessengerReply;
   waitForShutdown?: () => Promise<void>;
   closeBrowser?: (configuration: Configuration) => Promise<void>;
-  navigateMessageDestination?: (
-    configuration: Configuration,
-    destination: string,
-  ) => Promise<void>;
+  requestRuntimeChangeDestination?: typeof requestRuntimeChangeDestination;
   discoverBrowsers?: (options?: BrowserDiscoveryOptions) => Promise<BrowserCandidate[]>;
   browserExecutableExists?: (path: string) => boolean;
 }
@@ -93,7 +90,7 @@ Commands:
   init     Initialize impractical-bot
   config   Configure impractical-bot
   changebrowser  Change the configured browser
-  changemessagedestination  Change the message destination
+  changemsgdestination  Change the message destination
   updatekey  Replace the NVIDIA API key
   start    Start impractical-bot
   pause    Pause impractical-bot
@@ -528,9 +525,10 @@ async function handleChangeMessageDestination(
     }
   }
 
+  let result;
   try {
-    await (runtime.navigateMessageDestination ?? navigateConfiguredBrowserToMessageDestination)(
-      configuration,
+    result = await (runtime.requestRuntimeChangeDestination ?? requestRuntimeChangeDestination)(
+      configurationFilePath,
       messageDestination,
     );
   } catch (error) {
@@ -538,15 +536,46 @@ async function handleChangeMessageDestination(
     return 1;
   }
 
-  try {
-    saveConfiguration({ ...configuration, messageDestination }, configurationFilePath);
-  } catch (error) {
-    writeError(`Unable to save message destination: ${error instanceof Error ? error.message : String(error)}`);
+  if (result.status === 'not-running') {
+    try {
+      saveConfiguration({ ...configuration, messageDestination }, configurationFilePath);
+    } catch (error) {
+      writeError(`Unable to save message destination: ${error instanceof Error ? error.message : String(error)}`);
+      return 1;
+    }
+
+    writeOutput(`Message destination saved: ${messageDestination}.`);
+    return 0;
+  }
+
+  if (result.status === 'changed') {
+    writeOutput(
+      `Message destination changed: ${messageDestination}. ` +
+      (result.resumed
+        ? `Engine ${result.instanceId} resumed.`
+        : `Engine ${result.instanceId} remains paused.`),
+    );
+    return 0;
+  }
+
+  if (result.status === 'rejected') {
+    writeError(
+      `The proposed message destination is not a valid or accessible group conversation. ` +
+      result.reason,
+    );
+    writeOutput(
+      'The message destination was not changed. The engine remains paused; ' +
+      'run `impbot resume` to resume normal operation.',
+    );
     return 1;
   }
 
-  writeOutput(`Message destination saved: ${messageDestination}.`);
-  return 0;
+  writeError(`Message destination change failed: ${result.reason}`);
+  writeOutput(
+    'The engine remains paused. Run `impbot resume` after resolving the failure, ' +
+    'or `impbot stop` to shut down.',
+  );
+  return 1;
 }
 
 async function handleStart(
@@ -637,6 +666,28 @@ async function handleStart(
         },
         requestResume: async () => {
           await combustionController?.resume();
+        },
+        requestChangeDestination: async (destination, options) => {
+          if (!combustionController) {
+            return {
+              status: 'failed',
+              reason: 'The engine is not ready to change destinations.',
+            };
+          }
+          return combustionController.changeDestination(destination, {
+            resume: options.resume,
+            persist: newDestination => {
+              const savedConfiguration = saveConfiguration(
+                {
+                  ...configurationResult.configuration,
+                  messageDestination: newDestination,
+                },
+                configurationFilePath,
+              );
+              configurationResult.configuration.messageDestination =
+                savedConfiguration.messageDestination;
+            },
+          });
         },
       },
     );
@@ -983,7 +1034,7 @@ export async function runCli(
       prompt,
       runtime,
     ),
-    changemessagedestination: () => handleChangeMessageDestination(
+    changemsgdestination: () => handleChangeMessageDestination(
       writeOutput,
       writeError,
       configurationFilePath,
