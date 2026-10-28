@@ -942,7 +942,6 @@ export async function launchConfiguredBrowser(
     chromium.connectOverCDP(url, connectOptions));
   const browser = await connectOverCDP(endpoint, {
     isLocal: true,
-    noDefaults: true,
     timeout: connectionTimeoutMs,
   });
 

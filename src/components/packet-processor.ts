@@ -48,17 +48,32 @@ export function createPacketProcessor<
   }
 
   return async packet => {
+    const packetId = packet?.packetId ?? 'unknown';
+    let stage = 'reply-generation';
+    console.log(`[packet ${packetId}] stage=start messages=${(packet.contextMessages?.length ?? 0) + (packet.newMessages?.length ?? 0)}`);
     try {
       const messages = [
         ...(packet.contextMessages ?? []),
         ...(packet.newMessages ?? []),
       ];
+      console.log(`[packet ${packetId}] stage=reply-generation-start`);
       const reply = await generateReply(apiKey, messages);
+      console.log(
+        `[packet ${packetId}] stage=reply-generation-complete ` +
+        `chars=${typeof reply === 'string' ? reply.length : 'unknown'}`,
+      );
+      stage = 'composition';
+      console.log(`[packet ${packetId}] stage=composition-start`);
       const composition = await composeReply(page, reply);
+      console.log(
+        `[packet ${packetId}] stage=composition-returned ` +
+        `status=${String(composition?.status ?? 'unknown')}`,
+      );
       if (composition?.status !== 'sent') {
         const reason = composition?.reason ?? composition?.status ?? 'unknown';
         throw new Error(`Composer send blocked: ${reason}.`);
       }
+      console.log(`[packet ${packetId}] stage=complete status=sent delivery=unconfirmed`);
       return composition;
     } catch (error) {
       const details = error instanceof Error
@@ -67,7 +82,11 @@ export function createPacketProcessor<
       const safeDetails = typeof apiKey === 'string' && apiKey
         ? details.replaceAll(apiKey, '[REDACTED]')
         : details;
-      logError(`[packet ${packet?.packetId ?? 'unknown'}] Processing failed: ${safeDetails}`);
+      logError(
+        `[packet ${packetId}] stage=${stage}-failed ` +
+        `error=${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}`,
+      );
+      logError(`[packet ${packetId}] Processing failed: ${safeDetails}`);
       if (debugMode) {
         logWarning(DEBUG_RELIABILITY_WARNING);
       }

@@ -751,6 +751,7 @@ test('launches configured browser, connects to its configured port, then disconn
   const browser = browserMock();
   let args: string[] = [];
   let connectEndpoint = '';
+  let connectOptions: { noDefaults?: boolean } | undefined;
   let launchedEnvironment: NodeJS.ProcessEnv | undefined;
   let processScans = 0;
   const originalNvidiaApiKey = process.env.NVIDIA_API_KEY;
@@ -777,8 +778,9 @@ test('launches configured browser, connects to its configured port, then disconn
       void start(port);
       return child;
     },
-    connectOverCDP: async endpoint => {
+    connectOverCDP: async (endpoint, options) => {
       connectEndpoint = endpoint;
+      connectOptions = options;
       return browser.browser as never;
     },
   });
@@ -790,6 +792,7 @@ test('launches configured browser, connects to its configured port, then disconn
     `--user-data-dir=${config.profilePath}`,
   ]);
   assert.equal(connectEndpoint, `ws://127.0.0.1:${port}/devtools/browser/test-session`);
+  assert.notEqual(connectOptions?.noDefaults, true);
   assert.equal(child.unrefCalls, 1);
   assert.equal(browser.calls.version, 1);
   assert.equal(launchedEnvironment?.NVIDIA_API_KEY, undefined);
