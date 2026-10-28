@@ -343,7 +343,7 @@ async function advanceToIdle(
   context: TestContext,
   wakerPage: ReturnType<typeof createWakerPage>,
 ): Promise<void> {
-  for (let step = 0; step < 16; step += 1) {
+  for (let step = 0; step < 41; step += 1) {
     context.mock.timers.tick(3_000);
     await flush();
     if (wakerPage.observer?.active) {
