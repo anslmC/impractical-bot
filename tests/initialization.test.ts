@@ -80,6 +80,7 @@ const existingConfiguration: Configuration = {
   cdpPort: 9222,
   startupUrl: 'https://www.facebook.com',
   messageDestination: 'https://www.facebook.com/messages',
+  botTemperament: 'balanced',
 };
 
 test('browser profile paths use stable browser-specific names', () => {
@@ -158,7 +159,7 @@ test('initial setup retries invalid message destination URLs', async context => 
   const errors: string[] = [];
   const options = createOptions(filePath, {
     installedPaths: [bravePath],
-    answers: ['y', 'not-a-url', 'ftp://example.test/messages', ' https://example.test/messages ', 'yes'],
+    answers: ['y', 'not-a-url', 'ftp://example.test/messages', ' https://example.test/messages ', 'yes', ''],
     errors,
   });
 
@@ -177,7 +178,7 @@ test('a single discovered browser requires confirmation before saving', async co
   const promptCalls: string[] = [];
   const options = createOptions(filePath, {
     installedPaths: [bravePath],
-    answers: ['y', 'https://example.test/messages', '', '123456'],
+    answers: ['y', 'https://example.test/messages', '', '123456', ''],
     promptCalls,
   });
 
@@ -200,7 +201,7 @@ test('initial setup saves an affirmative PIN-restoration skip preference', async
   const filePath = createConfigurationPath(context);
   const options = createOptions(filePath, {
     installedPaths: [bravePath],
-    answers: ['y', 'https://example.test/messages', 'yes'],
+    answers: ['y', 'https://example.test/messages', 'yes', '3'],
   });
 
   assert.equal(await initializeConfiguration(options), 'saved');
@@ -210,6 +211,54 @@ test('initial setup saves an affirmative PIN-restoration skip preference', async
     assert.equal(loaded.configuration.skipPinRestoration, true);
     assert.equal(loaded.configuration.pin, null);
     assert.equal(loaded.configuration.messageDestination, 'https://example.test/messages');
+    assert.equal(loaded.configuration.botTemperament, 'talkative');
+  }
+});
+
+test('initial setup asks for bot temperament last and defaults to Balanced', async context => {
+  const filePath = createConfigurationPath(context);
+  const promptCalls: string[] = [];
+  const options = createOptions(filePath, {
+    installedPaths: [bravePath],
+    answers: ['y', 'https://example.test/messages', 'yes', ''],
+    promptCalls,
+  });
+
+  assert.equal(await initializeConfiguration(options), 'saved');
+  assert.equal(promptCalls.length, 4);
+  assert.match(promptCalls[3], /temperament/i);
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.equal(loaded.configuration.botTemperament, 'balanced');
+  }
+});
+
+test('legacy configuration without temperament defaults to Balanced and can be backfilled', async context => {
+  const filePath = createConfigurationPath(context);
+  const legacyConfiguration: Record<string, unknown> = { ...existingConfiguration };
+  delete legacyConfiguration.botTemperament;
+  writeFileSync(filePath, JSON.stringify(legacyConfiguration));
+
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.equal(loaded.configuration.botTemperament, 'balanced');
+    assert.equal(loaded.needsBotTemperamentBackfill, true);
+  }
+
+  const promptCalls: string[] = [];
+  assert.equal(await initializeConfiguration(createOptions(filePath, {
+    installedPaths: [bravePath],
+    answers: ['1'],
+    promptCalls,
+  })), 'saved');
+  assert.equal(promptCalls.length, 1);
+  assert.match(promptCalls[0], /temperament/i);
+  const saved = loadConfiguration(filePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.botTemperament, 'quiet');
   }
 });
 
@@ -319,7 +368,7 @@ test('multiple browsers show a menu and persist only the selected browser', asyn
   const output: string[] = [];
   const options = createOptions(filePath, {
     installedPaths: [bravePath, chromePath],
-    answers: ['2', 'https://example.test/messages', 'n', '012345'],
+    answers: ['2', 'https://example.test/messages', 'n', '012345', '1'],
     output,
   });
 
@@ -353,7 +402,7 @@ test('manual path input retries invalid values and saves only an existing suppor
   const errors: string[] = [];
   const options = createOptions(filePath, {
     installedPaths: [edgePath],
-    answers: ['4', ` ${edgePath} `, edgePath, 'https://example.test/messages', 'n', '012345'],
+    answers: ['4', ` ${edgePath} `, edgePath, 'https://example.test/messages', 'n', '012345', ''],
     errors,
   });
 

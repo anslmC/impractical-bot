@@ -21,6 +21,7 @@ const configuration: Configuration = {
   cdpPort: 9222,
   startupUrl: 'https://www.facebook.com',
   messageDestination: 'https://www.facebook.com/messages/t/123456789',
+  botTemperament: 'balanced',
 };
 
 function matchesSelector(element: FakeElement, selector: string): boolean {

@@ -25,6 +25,7 @@ const baseConfiguration: Configuration = {
   cdpPort: 49271,
   startupUrl: 'https://www.facebook.com',
   messageDestination: 'https://www.facebook.com/messages/t/1618007223454558',
+  botTemperament: 'balanced',
 };
 
 function deferred<T>() {

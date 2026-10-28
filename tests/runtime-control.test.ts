@@ -10,6 +10,7 @@ import {
   requestRuntimeChangeDestination,
   requestRuntimePause,
   requestRuntimeResume,
+  requestRuntimeSetTemperament,
   requestRuntimeStop,
   RuntimeAlreadyRunningError,
   RuntimeControlEndpointError,
@@ -142,6 +143,10 @@ test('runtime stop, pause, and resume report not-running when no owner exists', 
       configurationPath,
       'https://www.facebook.com/messages/t/987654321',
     ),
+    { status: 'not-running' },
+  );
+  assert.deepEqual(
+    await requestRuntimeSetTemperament(configurationPath, 'quiet'),
     { status: 'not-running' },
   );
 });
@@ -390,4 +395,74 @@ test('runtime control rejects unsupported and unknown commands without requestin
   assert.match(await sendRuntimeCommand(configurationPath, 'PAUSE'), /UNSUPPORTED$/);
   assert.match(await sendRuntimeCommand(configurationPath, 'BOGUS'), /INVALID_REQUEST$/);
   assert.equal(shutdownRequests, 0);
+});
+
+test('runtime control changes temperament without pausing, resuming, or restarting the engine', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  const received: string[] = [];
+  let pauseRequests = 0;
+  let resumeRequests = 0;
+  const control = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => undefined,
+    requestPause: () => {
+      pauseRequests += 1;
+    },
+    requestResume: () => {
+      resumeRequests += 1;
+    },
+    requestSetTemperament: temperament => {
+      received.push(temperament);
+      return { status: 'changed' };
+    },
+  });
+  context.after(async () => {
+    control.complete(1);
+    await control.close();
+  });
+  control.setState('running');
+
+  const result = await requestRuntimeSetTemperament(configurationPath, 'quiet');
+  assert.equal(result.status, 'changed');
+  if (result.status === 'changed') {
+    assert.equal(result.temperament, 'quiet');
+    assert.match(result.instanceId, /^[0-9a-f-]{36}$/i);
+  }
+  assert.deepEqual(received, ['quiet']);
+  assert.equal(pauseRequests, 0);
+  assert.equal(resumeRequests, 0);
+  assert.match(await sendRuntimeCommand(configurationPath, 'PAUSE'), /^PAUSED /);
+  assert.equal(pauseRequests, 1);
+
+  assert.equal((await requestRuntimeSetTemperament(configurationPath, 'talkative')).status, 'changed');
+  assert.deepEqual(received, ['quiet', 'talkative']);
+  assert.match(await sendRuntimeCommand(configurationPath, 'PAUSE'), /^PAUSED /);
+  assert.equal(pauseRequests, 1);
+});
+
+test('runtime control reports temperament failure without changing engine state', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  let pauseRequests = 0;
+  const control = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => undefined,
+    requestPause: () => {
+      pauseRequests += 1;
+    },
+    requestSetTemperament: () => ({
+      status: 'failed',
+      reason: 'The temperament could not be saved.',
+    }),
+  });
+  context.after(async () => {
+    control.complete(1);
+    await control.close();
+  });
+  control.setState('running');
+
+  const result = await requestRuntimeSetTemperament(configurationPath, 'balanced');
+  assert.equal(result.status, 'failed');
+  if (result.status === 'failed') {
+    assert.equal(result.reason, 'The temperament could not be saved.');
+  }
+  assert.match(await sendRuntimeCommand(configurationPath, 'PAUSE'), /^PAUSED /);
+  assert.equal(pauseRequests, 1);
 });

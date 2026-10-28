@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { runInNewContext } from 'node:vm';
 import type { Page } from 'playwright';
-import { startCombustion } from '../src/components/combustion.js';
+import { startCombustion, shouldRngRespond } from '../src/components/combustion.js';
 import { createContextStore } from '../src/components/context-store.js';
 import type { Configuration } from '../src/config/configuration.js';
 
@@ -20,6 +20,7 @@ const configuration: Configuration = {
   cdpPort: 9222,
   startupUrl: 'https://www.facebook.com',
   messageDestination: 'https://www.facebook.com/messages/t/123456789',
+  botTemperament: 'balanced',
 };
 
 function createMockPage({ failObserverSetup = false, messageCount = 1 } = {}) {
@@ -327,4 +328,60 @@ test('Combustion passes the established eight-message limit into the isolated pa
     'baseline-8',
   ]);
   await controller.stop();
+});
+test('RNG decisions use the configured temperament and update without restarting', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
+  const originalRandom = Math.random;
+  const originalLog = console.log;
+  const logs: string[] = [];
+  Math.random = () => 0.2;
+  console.log = (...values: unknown[]) => {
+    logs.push(values.map(String).join(' '));
+  };
+  const mockPage = createMockPage({ messageCount: 0 });
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page: mockPage.page,
+    contextStore,
+    configuration: { ...configuration, botTemperament: 'talkative' },
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+  const flush = async (): Promise<void> => {
+    for (let turn = 0; turn < 8; turn += 1) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+  };
+
+  try {
+    context.mock.timers.tick(15_000);
+    await flush();
+    assert.ok(logs.some(message => message.includes('Roll: YES (85% chance)')));
+
+    controller.setTemperament('quiet');
+    context.mock.timers.tick(15_000);
+    await flush();
+    assert.ok(logs.some(message => message.includes('Roll: NO (90% chance)')));
+
+    assert.equal(mockPage.observerSetupCalls, 1);
+    assert.equal(
+      logs.filter(message => message.includes('Starting Combustion')).length,
+      1,
+    );
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    console.log = originalLog;
+    context.mock.timers.reset();
+  }
+});
+
+test('RNG decision boundaries follow each temperament without sampling randomness', () => {
+  assert.equal(shouldRngRespond('quiet', 0.0999), true);
+  assert.equal(shouldRngRespond('quiet', 0.1), false);
+  assert.equal(shouldRngRespond('balanced', 0.4999), true);
+  assert.equal(shouldRngRespond('balanced', 0.5), false);
+  assert.equal(shouldRngRespond('talkative', 0.8499), true);
+  assert.equal(shouldRngRespond('talkative', 0.85), false);
 });

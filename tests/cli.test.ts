@@ -54,6 +54,7 @@ function createTestCombustionController(
   onPause?: () => void,
   onResume?: () => void,
   onChangeDestination?: CombustionController['changeDestination'],
+  onSetTemperament?: CombustionController['setTemperament'],
 ): CombustionController {
   let resolveStopped!: () => void;
   const stopped = new Promise<void>(resolve => {
@@ -66,6 +67,9 @@ function createTestCombustionController(
     },
     async resume() {
       onResume?.();
+    },
+    setTemperament(temperament) {
+      onSetTemperament?.(temperament);
     },
     async changeDestination(destination, options) {
       if (onChangeDestination) {
@@ -106,6 +110,7 @@ const validConfiguration: Configuration = {
   cdpPort: 9222,
   startupUrl: 'https://www.facebook.com',
   messageDestination: 'https://www.facebook.com/messages/t/1618007223454558',
+  botTemperament: 'balanced',
 };
 const profileButton = {
   count: async () => 1,
@@ -1307,7 +1312,7 @@ test('pause and resume commands control the running Combustion engine', async co
   assert.deepEqual(events, ['paused', 'resumed', 'stopped', 'disconnected', 'browser-closed']);
 });
 
-test('changemsgdestination updates a running engine through runtime control', async context => {
+test('changegcUrl updates a running engine through runtime control', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
   saveApplicationApiKey(configurationFilePath);
@@ -1355,7 +1360,7 @@ test('changemsgdestination updates a running engine through runtime control', as
 
   await ready.promise;
   const change = await captureCli(
-    ['changemsgdestination'],
+    ['changegcUrl'],
     configurationFilePath,
     async () => destination,
   );
@@ -1378,7 +1383,7 @@ test('changemsgdestination updates a running engine through runtime control', as
   assert.equal((await start).exitCode, 0);
 });
 
-test('changemsgdestination rejection preserves a running engine destination and requires resume', async context => {
+test('changegcUrl rejection preserves a running engine destination and requires resume', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
   saveApplicationApiKey(configurationFilePath);
@@ -1417,7 +1422,7 @@ test('changemsgdestination rejection preserves a running engine destination and 
 
   await ready.promise;
   const change = await captureCli(
-    ['changemsgdestination'],
+    ['changegcUrl'],
     configurationFilePath,
     async () => destination,
   );
@@ -1484,13 +1489,13 @@ test('a second destination change is rejected while the first is in progress', a
 
   await ready.promise;
   const firstChange = captureCli(
-    ['changemsgdestination'],
+    ['changegcUrl'],
     configurationFilePath,
     async () => destination,
   );
   await changeEntered.promise;
   const secondChange = await captureCli(
-    ['changemsgdestination'],
+    ['changegcUrl'],
     configurationFilePath,
     async () => 'https://www.facebook.com/messages/t/111111111',
   );
@@ -1541,6 +1546,9 @@ test('stop waits for Combustion cleanup before disconnecting Playwright and clos
       },
       async resume() {
         events.push('combustion-resumed');
+      },
+      setTemperament() {
+        return undefined;
       },
       async changeDestination(destination, options) {
         await options.persist?.(destination);
@@ -1726,7 +1734,7 @@ test('init dispatches to its injected initialization workflow', async () => {
   assert.match(result.errors[0], /browser discovery is unavailable/);
 });
 
-test('changemsgdestination validates before saving a pre-start destination', async context => {
+test('changegcUrl validates before saving a pre-start destination', async context => {
   const filePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, filePath);
   const destination = 'https://www.facebook.com/messages/t/987654321';
@@ -1735,7 +1743,7 @@ test('changemsgdestination validates before saving a pre-start destination', asy
   const runtimeChecks: string[] = [];
 
   const result = await captureCli(
-    ['changemsgdestination'],
+    ['changegcUrl'],
     filePath,
     async question => {
       promptCalls.push(question);
@@ -1765,13 +1773,13 @@ test('changemsgdestination validates before saving a pre-start destination', asy
   });
 });
 
-test('changemsgdestination cancellation and invalid input retain the configured destination', async context => {
+test('changegcUrl cancellation and invalid input retain the configured destination', async context => {
   const filePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, filePath);
   let runtimeChecks = 0;
 
   const cancelled = await captureCli(
-    ['changemsgdestination'],
+    ['changegcUrl'],
     filePath,
     async () => null,
     undefined,
@@ -1791,7 +1799,7 @@ test('changemsgdestination cancellation and invalid input retain the configured 
 
   const invalidAnswers = ['not-a-url', null];
   const failed = await captureCli(
-    ['changemsgdestination'],
+    ['changegcUrl'],
     filePath,
     async () => invalidAnswers.shift() ?? null,
     undefined,
@@ -1809,6 +1817,233 @@ test('changemsgdestination cancellation and invalid input retain the configured 
     status: 'valid',
     configuration: validConfiguration,
   });
+});
+
+test('setbottemp while stopped persists the selection without launching a browser or engine', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  let launchAttempted = false;
+  let runtimeArguments: { configurationFilePath?: string; temperament?: string } = {};
+
+  const result = await captureCli(
+    ['setbottemp'],
+    configurationFilePath,
+    async () => '3',
+    undefined,
+    {
+      requestRuntimeSetTemperament: async (path, temperament) => {
+        runtimeArguments = { configurationFilePath: path, temperament };
+        return { status: 'not-running' };
+      },
+      launchBrowser: async () => {
+        launchAttempted = true;
+        throw new Error('must not launch');
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(launchAttempted, false);
+  assert.deepEqual(runtimeArguments, {
+    configurationFilePath,
+    temperament: 'talkative',
+  });
+  assert.match(result.output.at(-1) ?? '', /Bot temperament saved: talkative/);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.botTemperament, 'talkative');
+  }
+});
+
+test('setbottemp rejects invalid selections without changing configuration', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration({ ...validConfiguration, botTemperament: 'quiet' }, configurationFilePath);
+  const answers = ['loud', null];
+  let runtimeCalls = 0;
+
+  const result = await captureCli(
+    ['setbottemp'],
+    configurationFilePath,
+    async () => answers.shift() ?? null,
+    undefined,
+    {
+      requestRuntimeSetTemperament: async () => {
+        runtimeCalls += 1;
+        return { status: 'not-running' };
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(runtimeCalls, 0);
+  assert.match(result.errors[0], /Choose Quiet, Balanced, or Talkative/);
+  assert.match(result.output.at(-1) ?? '', /cancelled/);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.botTemperament, 'quiet');
+  }
+});
+
+test('setbottemp updates a running engine and persists the selection', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const receivedTemperaments: string[] = [];
+  let launchCalls = 0;
+  const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
+    launchBrowser: async () => {
+      launchCalls += 1;
+      return {
+        endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+        browserVersion: 'Brave Chromium test',
+        disconnected: new Promise<void>(() => undefined),
+        async prepare() {
+          return stubPage;
+        },
+        async disconnect() {
+          return undefined;
+        },
+      };
+    },
+    readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+    startCombustion: async () => createTestCombustionController(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      temperament => {
+        receivedTemperaments.push(temperament);
+      },
+    ),
+  }, message => {
+    if (message.startsWith('Engine ready')) ready.resolve();
+  });
+
+  await ready.promise;
+  const change = await captureCli(
+    ['setbottemp'],
+    configurationFilePath,
+    async () => '1',
+  );
+  assert.equal(change.exitCode, 0);
+  assert.match(change.output.at(-1) ?? '', /Bot temperament changed: quiet/);
+  assert.deepEqual(receivedTemperaments, ['quiet']);
+  assert.equal(launchCalls, 1);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.botTemperament, 'quiet');
+  }
+
+  const stopped = await captureCli(['stop'], configurationFilePath);
+  assert.equal(stopped.exitCode, 0);
+  assert.equal((await start).exitCode, 0);
+});
+
+test('setbottemp rolls back persisted configuration when the runtime update fails', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
+    launchBrowser: async () => ({
+      endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+      browserVersion: 'Brave Chromium test',
+      disconnected: new Promise<void>(() => undefined),
+      async prepare() {
+        return stubPage;
+      },
+      async disconnect() {
+        return undefined;
+      },
+    }),
+    readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+    startCombustion: async () => createTestCombustionController(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      () => {
+        throw new Error('runtime rejected the temperament update');
+      },
+    ),
+  }, message => {
+    if (message.startsWith('Engine ready')) ready.resolve();
+  });
+
+  await ready.promise;
+  const change = await captureCli(
+    ['setbottemp'],
+    configurationFilePath,
+    async () => '3',
+  );
+  assert.equal(change.exitCode, 1);
+  assert.match(change.errors[0], /runtime temperament update failed/);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.botTemperament, 'balanced');
+  }
+
+  const stopped = await captureCli(['stop'], configurationFilePath);
+  assert.equal(stopped.exitCode, 0);
+  assert.equal((await start).exitCode, 0);
+});
+
+test('setbottemp reports persistence failure without applying the runtime update', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const receivedTemperaments: string[] = [];
+  const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
+    launchBrowser: async () => ({
+      endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+      browserVersion: 'Brave Chromium test',
+      disconnected: new Promise<void>(() => undefined),
+      async prepare() {
+        return stubPage;
+      },
+      async disconnect() {
+        return undefined;
+      },
+    }),
+    readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+    startCombustion: async () => createTestCombustionController(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      temperament => {
+        receivedTemperaments.push(temperament);
+      },
+    ),
+  }, message => {
+    if (message.startsWith('Engine ready')) ready.resolve();
+  });
+
+  await ready.promise;
+  const change = await captureCli(
+    ['setbottemp'],
+    configurationFilePath,
+    async () => {
+      writeFileSync(configurationFilePath, '{ malformed');
+      return '1';
+    },
+  );
+  assert.equal(change.exitCode, 1);
+  assert.match(change.errors[0], /temperament could not be saved/);
+  assert.deepEqual(receivedTemperaments, []);
+
+  const stopped = await captureCli(['stop'], configurationFilePath);
+  assert.equal(stopped.exitCode, 0);
+  assert.equal((await start).exitCode, 0);
 });
 
 test('config reports when configuration is missing', async context => {
@@ -1834,6 +2069,7 @@ test('config reports persisted settings and puppet name', async context => {
   assert.match(result.output[0], /CDP port: 9222/);
   assert.match(result.output[0], /Startup URL: https:\/\/www\.facebook\.com/);
   assert.match(result.output[0], /Message destination: https:\/\/www\.facebook\.com\/messages\/t\/1618007223454558/);
+  assert.match(result.output[0], /Bot temperament: balanced/);
   assert.match(result.output[0], /Puppet name: Test Puppet/);
   assert.deepEqual(result.errors, []);
 
@@ -1861,7 +2097,9 @@ test('help options and no command display usage', async () => {
     assert.match(result.output[0], /init\s+Initialize impractical-bot/);
     assert.match(result.output[0], /config\s+Configure impractical-bot/);
     assert.match(result.output[0], /changebrowser\s+Change the configured browser/);
-    assert.match(result.output[0], /changemsgdestination\s+Change the message destination/);
+    assert.match(result.output[0], /changegcUrl\s+Change the message destination/);
+    assert.match(result.output[0], /setbottemp\s+Set the bot temperament/);
+    assert.doesNotMatch(result.output[0], /changemsgdestination/);
     assert.doesNotMatch(result.output[0], /changemessagedestination/);
     assert.match(result.output[0], /updatekey\s+Replace the NVIDIA API key/);
       assert.match(result.output[0], /start\s+Start impractical-bot/);

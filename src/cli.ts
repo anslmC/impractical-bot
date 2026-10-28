@@ -16,6 +16,7 @@ import {
   initializeConfiguration,
   getBrowserProfilePath,
   isBrowserExecutableAvailable,
+  promptBotTemperament,
   promptPinRestorationSettings,
   selectBrowserCandidate,
   type InitializationOptions,
@@ -36,6 +37,7 @@ import {
 } from './browser/discovery.js';
 import {
   loadConfiguration,
+  resolveBotTemperament,
   resolveConfigurationPaths,
   saveConfiguration,
   validateConfiguration,
@@ -60,6 +62,7 @@ import {
   requestRuntimeChangeDestination,
   requestRuntimePause,
   requestRuntimeResume,
+  requestRuntimeSetTemperament,
   requestRuntimeStop,
   RuntimeAlreadyRunningError,
   type RuntimeControl,
@@ -80,6 +83,7 @@ export interface CliRuntimeOptions {
   waitForShutdown?: () => Promise<void>;
   closeBrowser?: (configuration: Configuration) => Promise<void>;
   requestRuntimeChangeDestination?: typeof requestRuntimeChangeDestination;
+  requestRuntimeSetTemperament?: typeof requestRuntimeSetTemperament;
   discoverBrowsers?: (options?: BrowserDiscoveryOptions) => Promise<BrowserCandidate[]>;
   browserExecutableExists?: (path: string) => boolean;
 }
@@ -90,7 +94,8 @@ Commands:
   init     Initialize impractical-bot
   config   Configure impractical-bot
   changebrowser  Change the configured browser
-  changemsgdestination  Change the message destination
+  changegcUrl  Change the message destination
+  setbottemp  Set the bot temperament
   updatekey  Replace the NVIDIA API key
   start    Start impractical-bot
   pause    Pause impractical-bot
@@ -294,6 +299,7 @@ function handleConfig(writeOutput: Output, writeError: Output, filePath?: string
     `  CDP port: ${configuration.cdpPort ?? 'not configured'}`,
     `  Startup URL: ${configuration.startupUrl ?? 'not configured'}`,
     `  Message destination: ${configuration.messageDestination ?? 'not configured'}`,
+    `  Bot temperament: ${resolveBotTemperament(configuration)}`,
     `  Puppet name: ${configuration.puppetName || 'Not set'}`,
   ].join('\n'));
   return 0;
@@ -475,7 +481,7 @@ async function handleChangeBrowser(
   return 0;
 }
 
-async function handleChangeMessageDestination(
+async function handleChangeGcUrl(
   writeOutput: Output,
   writeError: Output,
   configurationFilePath: string | undefined,
@@ -575,6 +581,83 @@ async function handleChangeMessageDestination(
     'The engine remains paused. Run `impbot resume` after resolving the failure, ' +
     'or `impbot stop` to shut down.',
   );
+  return 1;
+}
+
+async function handleSetBotTemperament(
+  writeOutput: Output,
+  writeError: Output,
+  configurationFilePath: string | undefined,
+  prompt: TerminalPrompt,
+  runtime: CliRuntimeOptions,
+): Promise<number> {
+  let configurationResult;
+  try {
+    configurationResult = loadConfiguration(configurationFilePath);
+  } catch (error) {
+    writeError(`Unable to load configuration: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+
+  if (configurationResult.status === 'missing') {
+    writeError('Configuration has not been initialized. Run `impbot init` first.');
+    return 1;
+  }
+  if (configurationResult.status === 'malformed') {
+    writeError(`Configuration is malformed: ${configurationResult.message}`);
+    return 1;
+  }
+  if (configurationResult.status === 'unsupported-version') {
+    writeError(`Configuration schema version ${configurationResult.version} is not supported.`);
+    return 1;
+  }
+  if (configurationResult.status === 'pin-required') {
+    writeError('Messenger PIN configuration is required. Run `impbot init` to reconfigure it.');
+    return 1;
+  }
+
+  const configuration = configurationResult.configuration;
+  const temperament = await promptBotTemperament(
+    prompt,
+    writeOutput,
+    writeError,
+    resolveBotTemperament(configuration),
+  );
+  if (temperament === null) {
+    writeOutput('Bot temperament change cancelled. The current configuration was not changed.');
+    return 0;
+  }
+
+  let result;
+  try {
+    result = await (runtime.requestRuntimeSetTemperament ?? requestRuntimeSetTemperament)(
+      configurationFilePath,
+      temperament,
+    );
+  } catch (error) {
+    writeError(`Unable to change bot temperament: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+
+  if (result.status === 'not-running') {
+    try {
+      saveConfiguration({ ...configuration, botTemperament: temperament }, configurationFilePath);
+    } catch (error) {
+      writeError(`Unable to save bot temperament: ${error instanceof Error ? error.message : String(error)}`);
+      return 1;
+    }
+
+    writeOutput(`Bot temperament saved: ${temperament}.`);
+    return 0;
+  }
+
+  if (result.status === 'changed') {
+    writeOutput(`Bot temperament changed: ${temperament}. Engine ${result.instanceId} updated.`);
+    return 0;
+  }
+
+  writeError(`Bot temperament change failed: ${result.reason}`);
+  writeOutput('The previous bot temperament remains active and configured.');
   return 1;
 }
 
@@ -688,6 +771,67 @@ async function handleStart(
                 savedConfiguration.messageDestination;
             },
           });
+        },
+        requestSetTemperament: async temperament => {
+          if (!combustionController) {
+            return {
+              status: 'failed',
+              reason: 'The engine is not ready to change temperaments.',
+            };
+          }
+
+          const previousTemperament = resolveBotTemperament(configurationResult.configuration);
+          try {
+            const savedConfiguration = saveConfiguration(
+              {
+                ...configurationResult.configuration,
+                botTemperament: temperament,
+              },
+              configurationFilePath,
+            );
+            configurationResult.configuration.botTemperament =
+              savedConfiguration.botTemperament;
+          } catch (error) {
+            return {
+              status: 'failed',
+              reason:
+                'The temperament could not be saved. ' +
+                `${error instanceof Error ? error.message : String(error)}`,
+            };
+          }
+
+          try {
+            combustionController.setTemperament(temperament);
+          } catch (error) {
+            try {
+              const restoredConfiguration = saveConfiguration(
+                {
+                  ...configurationResult.configuration,
+                  botTemperament: previousTemperament,
+                },
+                configurationFilePath,
+              );
+              configurationResult.configuration.botTemperament =
+                restoredConfiguration.botTemperament;
+            } catch (rollbackError) {
+              return {
+                status: 'failed',
+                reason:
+                  'The runtime temperament update failed and the persisted temperament ' +
+                  'could not be restored. ' +
+                  `${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+              };
+            }
+            return {
+              status: 'failed',
+              reason:
+                'The runtime temperament update failed; the previous temperament remains ' +
+                'active and configured. ' +
+                `${error instanceof Error ? error.message : String(error)}`,
+            };
+          }
+
+          return { status: 'changed' };
         },
       },
     );
@@ -1034,7 +1178,14 @@ export async function runCli(
       prompt,
       runtime,
     ),
-    changemsgdestination: () => handleChangeMessageDestination(
+    changegcUrl: () => handleChangeGcUrl(
+      writeOutput,
+      writeError,
+      configurationFilePath,
+      prompt,
+      runtime,
+    ),
+    setbottemp: () => handleSetBotTemperament(
       writeOutput,
       writeError,
       configurationFilePath,

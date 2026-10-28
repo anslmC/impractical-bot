@@ -46,6 +46,8 @@ These are agreed M2 behaviors; they are not all implemented in the current one-s
 
 `personality.txt` is the optional, editable default personality configuration. If it is missing or empty, use a short built-in fallback; loading personality must not block startup. Personality governs conversational style, not whether the bot participates.
 
+The configured bot temperament (`quiet`, `balanced`, or `talkative`) maps to RNG participation probabilities and is independent of personality. It is stored in `config.json` and can be changed with `setbottemp`; changing it updates a running engine without pausing, resuming, or restarting it.
+
 Saved conversation context is a future extension. Until it exists, recent messages are sufficient for initial operation. Historical messages provide context only; they are not reply triggers.
 
 ## Safety Invariants

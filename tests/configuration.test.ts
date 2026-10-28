@@ -10,6 +10,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join, win32 } from 'node:path';
 import { test, type TestContext } from 'node:test';
 import {
+  BOT_TEMPERAMENT_YES_PROBABILITIES,
+  getBotTemperamentYesProbability,
   loadConfiguration,
   resolveConfigurationPaths,
   saveConfiguration,
@@ -28,6 +30,7 @@ const validConfiguration: Configuration = {
   startupUrl: 'https://www.facebook.com',
   messageDestination: 'https://www.facebook.com/messages',
   puppetName: 'Test Puppet',
+  botTemperament: 'balanced',
 };
 
 function createTemporaryConfigPath(context: TestContext): string {
@@ -304,5 +307,37 @@ test('loading a legacy skipped-restoration config safely backfills a null PIN', 
     assert.equal(result.configuration.skipPinRestoration, true);
     assert.equal(result.configuration.pin, null);
     assert.equal(result.needsPinBackfill, true);
+  }
+});
+test('bot temperaments map deterministically to RNG YES probabilities', () => {
+  assert.deepEqual(BOT_TEMPERAMENT_YES_PROBABILITIES, {
+    quiet: 0.1,
+    balanced: 0.5,
+    talkative: 0.85,
+  });
+  assert.equal(getBotTemperamentYesProbability('quiet'), 0.1);
+  assert.equal(getBotTemperamentYesProbability('balanced'), 0.5);
+  assert.equal(getBotTemperamentYesProbability('talkative'), 0.85);
+});
+
+test('missing temperament defaults to Balanced and invalid values are rejected', context => {
+  const missingTemperament: Record<string, unknown> = { ...validConfiguration };
+  delete missingTemperament.botTemperament;
+  assert.equal(validateConfiguration(missingTemperament).botTemperament, 'balanced');
+
+  const filePath = createTemporaryConfigPath(context);
+  writeFileSync(filePath, JSON.stringify(missingTemperament));
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.equal(loaded.configuration.botTemperament, 'balanced');
+    assert.equal(loaded.needsBotTemperamentBackfill, true);
+  }
+
+  for (const botTemperament of [null, 'loud', 1, false]) {
+    assert.throws(
+      () => validateConfiguration({ ...validConfiguration, botTemperament }),
+      /botTemperament must be one of 'quiet', 'balanced', or 'talkative'/,
+    );
   }
 });

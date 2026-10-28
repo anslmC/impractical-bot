@@ -9,6 +9,11 @@ import {
   type ReplyCompositionResult,
 } from './composer.js';
 import type { Configuration } from '../config/configuration.js';
+import {
+  getBotTemperamentYesProbability,
+  resolveBotTemperament,
+  type BotTemperament,
+} from '../config/configuration.js';
 import type { ContextMessage, ContextStore } from './context-store.js';
 import {
   extractMessageDetails,
@@ -36,7 +41,6 @@ const CONTEXT_STORE_CAPACITY = 60;
 const POLL_INTERVAL_MS = 3000;
 const RNG_POLL_INTERVAL_MS = 15000;
 const RNG_CONTEXT_MESSAGE_LIMIT = 10;
-const RNG_YES_PROBABILITY = 0.75;
 const RNG_COOLDOWN_MS = 50000;
 const IDLE_THRESHOLD_MS = 30000;
 const LOG_PREFIX = '__MESSENGER_WAKER__:';
@@ -49,6 +53,13 @@ type ScheduledPacket = (PacketBuilderPacket | RngPacket) & {
 type PacketScheduler = ReturnType<typeof createPacketScheduler<ScheduledPacket>>;
 type ContextStoreState = ReturnType<ContextStore['getState']>;
 type MessageText = Pick<ContextMessage, 'messageId' | 'message' | 'mention'>;
+
+export function shouldRngRespond(
+  temperament: BotTemperament,
+  randomValue: number = Math.random(),
+): boolean {
+  return randomValue < getBotTemperamentYesProbability(temperament);
+}
 
 export interface CombustionOptions {
   page: Page;
@@ -74,6 +85,7 @@ export interface CombustionController {
   stopped: Promise<void>;
   pause(): Promise<void>;
   resume(): Promise<void>;
+  setTemperament(temperament: BotTemperament): void;
   changeDestination(
     destination: string,
     options: DestinationChangeOptions,
@@ -399,6 +411,7 @@ export async function startCombustion({
   const mainPollIdleWaiters: (() => void)[] = [];
   let rngOperationActive = false;
   let rngCooldownActive = false;
+  let botTemperament = resolveBotTemperament(configuration);
   let rngPacketInFlightId: string | null = null;
   let rngPacketEpoch: number | null = null;
   let lastRngSkipReason: string | null = null;
@@ -1045,11 +1058,15 @@ export async function startCombustion({
         console.log('[rng] Skipping dice roll: latest Context Store message is OUTGOING.');
         return;
       }
-      if (Math.random() >= RNG_YES_PROBABILITY) {
-        console.log('[rng] Roll: NO (25% chance)');
+      if (!shouldRngRespond(botTemperament)) {
+        const noProbability = Math.round(
+          (1 - getBotTemperamentYesProbability(botTemperament)) * 100,
+        );
+        console.log(`[rng] Roll: NO (${noProbability}% chance)`);
         return;
       }
-      console.log('[rng] Roll: YES (75% chance)');
+      const yesProbability = Math.round(getBotTemperamentYesProbability(botTemperament) * 100);
+      console.log(`[rng] Roll: YES (${yesProbability}% chance)`);
 
       rngOperationActive = true;
       try {
@@ -1101,6 +1118,9 @@ export async function startCombustion({
       stopped,
       pause: pauseEngine,
       resume: resumeEngine,
+      setTemperament(temperament) {
+        botTemperament = temperament;
+      },
       changeDestination,
       async stop() {
         requestStop();

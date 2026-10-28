@@ -14,8 +14,17 @@ import { randomUUID } from 'node:crypto';
 
 export const CONFIGURATION_VERSION = 1;
 export const BROWSER_IDS = ['brave', 'chrome', 'edge'] as const;
+export const BOT_TEMPERAMENTS = ['quiet', 'balanced', 'talkative'] as const;
+export const DEFAULT_BOT_TEMPERAMENT = 'balanced' as const;
 
 export type BrowserId = typeof BROWSER_IDS[number];
+export type BotTemperament = typeof BOT_TEMPERAMENTS[number];
+
+export const BOT_TEMPERAMENT_YES_PROBABILITIES: Readonly<Record<BotTemperament, number>> = {
+  quiet: 0.1,
+  balanced: 0.5,
+  talkative: 0.85,
+};
 
 export interface Configuration {
   version: typeof CONFIGURATION_VERSION;
@@ -28,6 +37,21 @@ export interface Configuration {
   startupUrl?: string;
   messageDestination?: string;
   puppetName?: string;
+  botTemperament?: BotTemperament;
+}
+
+export function isBotTemperament(value: unknown): value is BotTemperament {
+  return typeof value === 'string' && (BOT_TEMPERAMENTS as readonly string[]).includes(value);
+}
+
+export function resolveBotTemperament(
+  configuration: Pick<Configuration, 'botTemperament'>,
+): BotTemperament {
+  return configuration.botTemperament ?? DEFAULT_BOT_TEMPERAMENT;
+}
+
+export function getBotTemperamentYesProbability(temperament: BotTemperament): number {
+  return BOT_TEMPERAMENT_YES_PROBABILITIES[temperament];
 }
 
 export type ConfigurationWithoutPin = Omit<Configuration, 'pin'>;
@@ -44,8 +68,9 @@ export type ConfigurationLoadResult =
     configuration: Configuration;
     needsSkipPinRestorationBackfill?: true;
     needsPinBackfill?: true;
+    needsBotTemperamentBackfill?: true;
   }
-  | { status: 'pin-required'; configuration: ConfigurationWithoutPin }
+  | { status: 'pin-required'; configuration: ConfigurationWithoutPin; needsBotTemperamentBackfill?: true }
   | { status: 'malformed'; message: string }
   | { status: 'unsupported-version'; version: number };
 
@@ -62,6 +87,7 @@ const CONFIGURATION_KEYS = new Set([
   'startupUrl',
   'messageDestination',
   'puppetName',
+  'botTemperament',
 ]);
 const BROWSER_EXECUTABLE_NAMES: Record<BrowserId, string> = {
   brave: 'brave.exe',
@@ -185,6 +211,9 @@ function validateConfigurationFields(value: unknown): ConfigurationWithoutPin {
   ) {
     throw new Error('puppetName must be a trimmed string without control characters.');
   }
+  if (value.botTemperament !== undefined && !isBotTemperament(value.botTemperament)) {
+    throw new Error("botTemperament must be one of 'quiet', 'balanced', or 'talkative'.");
+  }
 
   return {
     version: CONFIGURATION_VERSION,
@@ -198,6 +227,9 @@ function validateConfigurationFields(value: unknown): ConfigurationWithoutPin {
       ? {}
       : { messageDestination: value.messageDestination as string }),
     ...(value.puppetName === undefined ? {} : { puppetName: value.puppetName as string }),
+    botTemperament: isBotTemperament(value.botTemperament)
+      ? value.botTemperament
+      : DEFAULT_BOT_TEMPERAMENT,
   };
 }
 
@@ -264,7 +296,13 @@ export function loadConfiguration(filePath?: string): ConfigurationLoadResult {
   const hasPin = Object.prototype.hasOwnProperty.call(parsed, 'pin');
   if (!hasPin && parsed.skipPinRestoration !== true) {
     try {
-      return { status: 'pin-required', configuration: validateConfigurationFields(parsed) };
+      return {
+        status: 'pin-required',
+        configuration: validateConfigurationFields(parsed),
+        ...(!Object.prototype.hasOwnProperty.call(parsed, 'botTemperament')
+          ? { needsBotTemperamentBackfill: true as const }
+          : {}),
+      };
     } catch (error) {
       return {
         status: 'malformed',
@@ -284,6 +322,9 @@ export function loadConfiguration(filePath?: string): ConfigurationLoadResult {
         ? { needsSkipPinRestorationBackfill: true as const }
         : {}),
       ...(!hasPin ? { needsPinBackfill: true as const } : {}),
+      ...(!Object.prototype.hasOwnProperty.call(parsed, 'botTemperament')
+        ? { needsBotTemperamentBackfill: true as const }
+        : {}),
     };
   } catch (error) {
     return {

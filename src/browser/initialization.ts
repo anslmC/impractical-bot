@@ -2,10 +2,14 @@ import { statSync } from 'node:fs';
 import { randomInt } from 'node:crypto';
 import { win32 } from 'node:path';
 import {
+  BOT_TEMPERAMENTS,
   CONFIGURATION_VERSION,
+  DEFAULT_BOT_TEMPERAMENT,
+  getBotTemperamentYesProbability,
   loadConfiguration,
   resolveConfigurationPaths,
   saveConfiguration,
+  type BotTemperament,
   type BrowserId,
   type Configuration,
   type ConfigurationWithoutPin,
@@ -80,6 +84,51 @@ export async function promptPinRestorationSettings(
       return { skipPinRestoration: false, pin };
     }
     writeError('PIN must contain exactly six digits. The PIN was not saved.');
+  }
+}
+
+export async function promptBotTemperament(
+  prompt: TerminalPrompt,
+  writeOutput: (message: string) => void,
+  writeError: (message: string) => void,
+  currentTemperament: BotTemperament = DEFAULT_BOT_TEMPERAMENT,
+): Promise<BotTemperament | null> {
+  const labels: Record<BotTemperament, string> = {
+    quiet: 'Quiet',
+    balanced: 'Balanced',
+    talkative: 'Talkative',
+  };
+  writeOutput('Bot temperament:');
+  for (const temperament of BOT_TEMPERAMENTS) {
+    const yesProbability = Math.round(getBotTemperamentYesProbability(temperament) * 100);
+    writeOutput(
+      `  ${temperament === currentTemperament ? '*' : ' '} ${labels[temperament]}: ` +
+      `${yesProbability}% yes / ${100 - yesProbability}% no`,
+    );
+  }
+
+  while (true) {
+    const answer = await prompt(
+      `Select bot temperament [quiet, balanced, talkative] (default: ${labels[currentTemperament]}): `,
+    );
+    if (answer === null) {
+      return null;
+    }
+
+    const normalized = answer.trim().toLowerCase();
+    if (normalized === '') {
+      return currentTemperament;
+    }
+    if (normalized === '1' || normalized === 'q' || normalized === 'quiet') {
+      return 'quiet';
+    }
+    if (normalized === '2' || normalized === 'b' || normalized === 'balanced') {
+      return 'balanced';
+    }
+    if (normalized === '3' || normalized === 't' || normalized === 'talkative') {
+      return 'talkative';
+    }
+    writeError('Choose Quiet, Balanced, or Talkative. The bot temperament was not changed.');
   }
 }
 
@@ -216,6 +265,7 @@ function configurationForSelection(
   configurationFilePath: string,
   messageDestination: string,
   pinSettings: PinRestorationSettings,
+  botTemperament: BotTemperament,
   existingConfiguration?: ConfigurationWithoutPin,
 ): Configuration {
   const profilePath = getBrowserProfilePath(candidate.browser, configurationFilePath);
@@ -230,6 +280,7 @@ function configurationForSelection(
     cdpPort: existingConfiguration?.cdpPort ?? randomInt(20_000, 60_000),
     startupUrl: existingConfiguration?.startupUrl ?? 'https://www.facebook.com',
     messageDestination,
+    botTemperament,
   };
 }
 
@@ -285,9 +336,24 @@ export async function initializeConfiguration(
           return 'cancelled';
         }
       }
+      let botTemperament = saved.configuration.botTemperament ?? DEFAULT_BOT_TEMPERAMENT;
+      if (saved.needsBotTemperamentBackfill === true) {
+        const selectedTemperament = await promptBotTemperament(
+          options.prompt,
+          writeOutput,
+          writeError,
+          DEFAULT_BOT_TEMPERAMENT,
+        );
+        if (selectedTemperament === null) {
+          writeOutput('Initialization cancelled. Existing configuration was not changed.');
+          return 'cancelled';
+        }
+        botTemperament = selectedTemperament;
+      }
       if (
         saved.needsSkipPinRestorationBackfill === true ||
         saved.needsPinBackfill === true ||
+        saved.needsBotTemperamentBackfill === true ||
         saved.configuration.cdpPort === undefined ||
         saved.configuration.startupUrl === undefined ||
         saved.configuration.messageDestination === undefined
@@ -299,6 +365,7 @@ export async function initializeConfiguration(
           cdpPort: saved.configuration.cdpPort ?? randomInt(20_000, 60_000),
           startupUrl: saved.configuration.startupUrl ?? 'https://www.facebook.com',
           messageDestination,
+          botTemperament,
         }, configurationFilePath);
         writeOutput('Existing configuration updated with missing default values.');
         return 'saved';
@@ -332,6 +399,20 @@ export async function initializeConfiguration(
         writeOutput('Initialization cancelled. No configuration was written.');
         return 'cancelled';
       }
+      let botTemperament = saved.configuration.botTemperament ?? DEFAULT_BOT_TEMPERAMENT;
+      if (saved.needsBotTemperamentBackfill === true) {
+        const selectedTemperament = await promptBotTemperament(
+          options.prompt,
+          writeOutput,
+          writeError,
+          DEFAULT_BOT_TEMPERAMENT,
+        );
+        if (selectedTemperament === null) {
+          writeOutput('Initialization cancelled. No configuration was written.');
+          return 'cancelled';
+        }
+        botTemperament = selectedTemperament;
+      }
       try {
         saveConfiguration({
           ...saved.configuration,
@@ -339,6 +420,7 @@ export async function initializeConfiguration(
           ...pinSettings,
           cdpPort: saved.configuration.cdpPort ?? randomInt(20_000, 60_000),
           startupUrl: saved.configuration.startupUrl ?? 'https://www.facebook.com',
+          botTemperament,
         }, configurationFilePath);
       } catch (error) {
         writeError(`Unable to save configuration: ${error instanceof Error ? error.message : String(error)}`);
@@ -406,11 +488,30 @@ export async function initializeConfiguration(
     return 'cancelled';
   }
 
+  let botTemperament = existingConfiguration?.botTemperament ?? DEFAULT_BOT_TEMPERAMENT;
+  if (
+    existingConfiguration === undefined ||
+    (saved.status === 'valid' && saved.needsBotTemperamentBackfill === true)
+  ) {
+    const selectedTemperament = await promptBotTemperament(
+      options.prompt,
+      writeOutput,
+      writeError,
+      DEFAULT_BOT_TEMPERAMENT,
+    );
+    if (selectedTemperament === null) {
+      writeOutput('Initialization cancelled. No configuration was written.');
+      return 'cancelled';
+    }
+    botTemperament = selectedTemperament;
+  }
+
   const configuration = configurationForSelection(
     selection.candidate,
     configurationFilePath,
     messageDestination,
     pinSettings,
+    botTemperament,
     existingConfiguration,
   );
   try {
