@@ -304,7 +304,7 @@ export async function generateNvidiaReply(
           },
           ...conversationMessages,
         ],
-        chat_template_kwargs: { enable_thinking: true },
+        chat_template_kwargs: { enable_thinking: false },
         max_tokens: 4096,
         stream: false,
       }),

@@ -816,6 +816,12 @@ async function handleStart(
         writeError(`Unable to disconnect Playwright: ${error instanceof Error ? error.message : String(error)}`);
         exitCode = 1;
       }
+      try {
+        await (runtime.closeBrowser ?? closeConfiguredBrowser)(configurationResult.configuration);
+      } catch (error) {
+        writeError(`Unable to close the configured browser: ${error instanceof Error ? error.message : String(error)}`);
+        exitCode = 1;
+      }
     }
     runtimeControl.complete(exitCode);
     try {

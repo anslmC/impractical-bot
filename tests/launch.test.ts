@@ -464,7 +464,7 @@ test('startup detects login on the feed tab and navigates the configured Messeng
   const feedPage = new StartupPage(destination, 'no-pin');
   feedPage.loginGate.resolve();
   const messengerPage = new StartupPage(destination, 'no-pin');
-  messengerPage.currentUrl = destination;
+  messengerPage.currentUrl = 'https://www.facebook.com/messages/';
   messengerPage.loginDetected = true;
   messengerPage.loginIndicatorsAvailable = false;
 
@@ -509,6 +509,7 @@ test('startup skips feed login indicators when already at the configured convers
   const page = new StartupPage(baseConfiguration.messageDestination!, 'no-pin');
   page.currentUrl = baseConfiguration.messageDestination!;
   page.loginIndicatorsAvailable = false;
+  page.composerReady = true;
 
   await prepareConfiguredBrowser(browserForStartupPage(page), baseConfiguration, {
     loginTimeoutMs: 10,
@@ -516,8 +517,9 @@ test('startup skips feed login indicators when already at the configured convers
   });
 
   assert.equal(page.loginDetected, false);
-  assert.equal(page.navigationCount, 1);
-  assert.deepEqual(page.gotoUrls, [baseConfiguration.messageDestination]);
+  assert.equal(page.navigationCount, 0);
+  assert.deepEqual(page.gotoUrls, []);
+  assert.deepEqual(page.loginTimeouts, []);
 });
 
 test('startup still requires login detection on another conversation or checkpoint redirect', async () => {

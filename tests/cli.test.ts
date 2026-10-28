@@ -27,6 +27,7 @@ async function captureCli(
   const testRuntime: CliRuntimeOptions = {
     ...runtime,
     checkBrowserStartup: runtime?.checkBrowserStartup ?? (async () => undefined),
+    closeBrowser: runtime?.closeBrowser ?? (async () => undefined),
     startCombustion: runtime?.startCombustion ?? (async () => createTestCombustionController()),
   };
   const exitCode = await runCli(
@@ -117,7 +118,7 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-test('start prepares the destination, remains alive after readiness, and disconnects on shutdown', async context => {
+test('start prepares the destination, remains alive after readiness, and closes the launched browser on shutdown', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
   saveApplicationApiKey(configurationFilePath);
@@ -180,6 +181,9 @@ test('start prepares the destination, remains alive after readiness, and disconn
       receivedConfiguration = configuration;
       events.push('launched');
       return session;
+    },
+    closeBrowser: async () => {
+      events.push('browser-closed');
     },
     validateNvidiaApiKey: async apiKey => {
       assert.equal(apiKey, 'nvapi-test-key');
@@ -283,6 +287,7 @@ test('start prepares the destination, remains alive after readiness, and disconn
     'engine-ready-logged',
     'combustion-stopped',
     'disconnected',
+    'browser-closed',
   ]);
   assert.deepEqual(result.output, [
     'NVIDIA API key validated successfully.',
@@ -1222,7 +1227,7 @@ test('stop reports clearly when no engine is running', async context => {
   assert.deepEqual(result.errors, []);
 });
 
-test('stop waits for Combustion cleanup before disconnecting Playwright', async context => {
+test('stop waits for Combustion cleanup before disconnecting Playwright and closing the attached browser', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
   saveApplicationApiKey(configurationFilePath);
@@ -1237,6 +1242,7 @@ test('stop waits for Combustion cleanup before disconnecting Playwright', async 
       endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
       browserVersion: 'Brave Chromium test',
       disconnected: new Promise<void>(() => undefined),
+      reusedExistingBrowser: true,
       async prepare() {
         return stubPage;
       },
@@ -1245,6 +1251,9 @@ test('stop waits for Combustion cleanup before disconnecting Playwright', async 
         disconnects += 1;
       },
     }),
+    closeBrowser: async () => {
+      events.push('browser-closed');
+    },
     readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
     startCombustion: async () => ({
       stopped: new Promise<void>(() => undefined),
@@ -1279,11 +1288,47 @@ test('stop waits for Combustion cleanup before disconnecting Playwright', async 
     'combustion-stop-started',
     'combustion-stopped',
     'playwright-disconnected',
+    'browser-closed',
   ]);
   assert.equal(disconnects, 1);
 
   const afterShutdown = await captureCli(['stop'], configurationFilePath);
   assert.match(afterShutdown.output[0], /No impractical-bot engine is running/);
+});
+
+test('stop reports failure when graceful browser closure fails', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    validateNvidiaApiKey: async () => undefined,
+    launchBrowser: async () => ({
+      endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+      browserVersion: 'Brave Chromium test',
+      disconnected: new Promise<void>(() => undefined),
+      async prepare() {
+        return stubPage;
+      },
+      async disconnect() {
+        return undefined;
+      },
+    }),
+    closeBrowser: async () => {
+      throw new Error('shutdown timed out');
+    },
+    readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+  }, message => {
+    if (message.startsWith('Engine ready')) ready.resolve();
+  });
+
+  await ready.promise;
+  const stopResult = await captureCli(['stop'], configurationFilePath);
+  const startResult = await start;
+  assert.equal(stopResult.exitCode, 1);
+  assert.match(stopResult.errors[0], /shutdown failed/);
+  assert.equal(startResult.exitCode, 1);
+  assert.match(startResult.errors[0], /Unable to close the configured browser: shutdown timed out/);
 });
 
 test('duplicate start is rejected before a second browser launch', async context => {
@@ -1344,6 +1389,7 @@ test('SIGINT still performs owner cleanup and releases runtime ownership', async
   saveApplicationApiKey(configurationFilePath);
   const ready = deferred<void>();
   let disconnects = 0;
+  let browserCloses = 0;
   const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
     validateNvidiaApiKey: async () => undefined,
     launchBrowser: async () => ({
@@ -1357,6 +1403,9 @@ test('SIGINT still performs owner cleanup and releases runtime ownership', async
         disconnects += 1;
       },
     }),
+    closeBrowser: async () => {
+      browserCloses += 1;
+    },
     readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
   }, message => {
     if (message.startsWith('Engine ready')) ready.resolve();
@@ -1367,6 +1416,7 @@ test('SIGINT still performs owner cleanup and releases runtime ownership', async
   const result = await start;
   assert.equal(result.exitCode, 130);
   assert.equal(disconnects, 1);
+  assert.equal(browserCloses, 1);
   const afterShutdown = await captureCli(['stop'], configurationFilePath);
   assert.match(afterShutdown.output[0], /No impractical-bot engine is running/);
 });
