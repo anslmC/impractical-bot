@@ -204,6 +204,31 @@ test('rejects conflicting content for a repeated message ID', () => {
   }), /observed with different content/);
 });
 
+test('accepts a delivery-status-only difference once normalized', () => {
+  const firstObservation = extractMessageDetails({
+    messageId: 'mid.$gAAW_kanMS16ns3jGqGhgjN7o1gW1',
+    ariaLabel: 'At October 18, 2026, 1:15 PM, You: haha look it up yourself',
+    textWithoutSenderHeading: 'haha look it up yourself',
+  });
+  const statusObservation = extractMessageDetails({
+    messageId: 'mid.$gAAW_kanMS16ns3jGqGhgjN7o1gW1',
+    ariaLabel: 'At October 18, 2026, 1:15 PM, You: haha look it up yourself Sent',
+    textWithoutSenderHeading: 'haha look it up yourself Sent',
+  });
+
+  const firstPoll = buildPacketTurn({ newMessages: [firstObservation] });
+  const repeatedPoll = buildPacketTurn({
+    newMessages: [statusObservation],
+    state: firstPoll.state,
+  });
+
+  assert.equal(repeatedPoll.packet, null);
+  assert.deepEqual(
+    repeatedPoll.state.observedMessages.map(item => item.message),
+    ['haha look it up yourself'],
+  );
+});
+
 test('does not mutate its input state', () => {
   const state = createPacketBuilderState();
   buildPacketTurn({

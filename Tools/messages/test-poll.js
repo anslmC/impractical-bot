@@ -142,8 +142,19 @@ function classifyMessageLabel(ariaLabel) {
   };
 }
 
+const LEGITIMATE_SENT_PRECEDING_WORDS = new Set(['have', 'has', 'had']);
+
 function stripTrailingDeliveryStatus(content) {
-  return content.replace(/(\S)Sent$/u, '$1');
+  const withoutAttachedStatus = content.replace(/(\S)Sent$/u, '$1');
+  const separatedStatus = withoutAttachedStatus.match(/^(.*?\S)\s+Sent$/su);
+  if (!separatedStatus) {
+    return withoutAttachedStatus;
+  }
+  const precedingWord = separatedStatus[1].match(/(\S+)$/u)?.[1].toLowerCase() ?? '';
+  if (LEGITIMATE_SENT_PRECEDING_WORDS.has(precedingWord)) {
+    return withoutAttachedStatus;
+  }
+  return separatedStatus[1];
 }
 
 function extractMessageContent(ariaLabel, textWithoutSenderHeading) {

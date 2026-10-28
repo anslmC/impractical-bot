@@ -122,6 +122,82 @@ test('message extraction ignores a directly attached Sent delivery status', () =
   }).message, 'I have Sent');
 });
 
+test('message extraction ignores a whitespace-separated Sent delivery status', () => {
+  const firstObservation = extractMessageDetails({
+    messageId: 'mid.$gAAW_kanMS16ns3jGqGhgjN7o1gW1',
+    ariaLabel: 'At October 18, 2026, 1:15 PM, You: haha look it up yourself',
+    textWithoutSenderHeading: 'haha look it up yourself',
+  });
+  const statusObservation = extractMessageDetails({
+    messageId: 'mid.$gAAW_kanMS16ns3jGqGhgjN7o1gW1',
+    ariaLabel: 'At October 18, 2026, 1:15 PM, You: haha look it up yourself Sent',
+    textWithoutSenderHeading: 'haha look it up yourself Sent',
+  });
+
+  assert.equal(statusObservation.message, 'haha look it up yourself');
+  assert.deepEqual(statusObservation, firstObservation);
+});
+
+test('message extraction ignores a newline-separated Sent delivery status', () => {
+  assert.equal(extractMessageDetails({
+    messageId: 'newline-status',
+    ariaLabel: null,
+    textWithoutSenderHeading: 'haha look it up yourself\nSent',
+  }).message, 'haha look it up yourself');
+});
+
+test('message extraction preserves the legitimate phrase "I have Sent"', () => {
+  assert.equal(extractMessageDetails({
+    messageId: 'legitimate-have-sent',
+    ariaLabel: 'At October 18, 2026, 1:15 PM, You: I have Sent',
+    textWithoutSenderHeading: 'I have Sent',
+  }).message, 'I have Sent');
+  assert.equal(extractMessageDetails({
+    messageId: 'legitimate-have-sent-fallback',
+    ariaLabel: null,
+    textWithoutSenderHeading: 'I have Sent',
+  }).message, 'I have Sent');
+});
+
+test('packet builder accepts a delivery-status-only difference once normalized', () => {
+  const firstObservation = extractMessageDetails({
+    messageId: 'mid.$gAAW_kanMS16ns3jGqGhgjN7o1gW1',
+    ariaLabel: 'At October 18, 2026, 1:15 PM, You: haha look it up yourself',
+    textWithoutSenderHeading: 'haha look it up yourself',
+  });
+  const statusObservation = extractMessageDetails({
+    messageId: 'mid.$gAAW_kanMS16ns3jGqGhgjN7o1gW1',
+    ariaLabel: 'At October 18, 2026, 1:15 PM, You: haha look it up yourself Sent',
+    textWithoutSenderHeading: 'haha look it up yourself Sent',
+  });
+
+  const firstPoll = buildPacketTurn({ newMessages: [firstObservation] });
+  const repeatedPoll = buildPacketTurn({
+    newMessages: [statusObservation],
+    state: firstPoll.state,
+  });
+
+  assert.equal(repeatedPoll.packet, null);
+  assert.deepEqual(
+    repeatedPoll.state.observedMessages.map(message => message.message),
+    ['haha look it up yourself'],
+  );
+});
+
+test('packet builder still rejects a genuine same-ID content change', () => {
+  const firstPoll = buildPacketTurn({
+    newMessages: [{ messageId: 'genuine-change', message: 'first content' }],
+  });
+
+  assert.throws(
+    () => buildPacketTurn({
+      newMessages: [{ messageId: 'genuine-change', message: 'second content' }],
+      state: firstPoll.state,
+    }),
+    /Message ID genuine-change was observed with different content\./,
+  );
+});
+
 test('context store keeps distinct IDs with identical text and rejects genuine conflicts', () => {
   const store = createContextStore();
   store.add([
