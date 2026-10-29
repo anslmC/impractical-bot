@@ -2,14 +2,18 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { runInNewContext } from 'node:vm';
 import type { Page } from 'playwright';
+import { generateAliases } from '../src/components/alias-engine.js';
 import { startCombustion, shouldRngRespond } from '../src/components/combustion.js';
 import { createContextStore } from '../src/components/context-store.js';
 import {
+  composeSystemInstruction,
+  getBotIdentityInstruction,
   getDefaultBehavioralInstruction,
   getDefaultPersonalityInstruction,
 } from '../src/components/personality.js';
 import type { Configuration } from '../src/config/configuration.js';
 import * as nvidiaModule from '../src/ai/nvidia.js';
+import * as composerModule from '../src/components/composer.js';
 
 const MESSAGE_SELECTOR =
   '[data-scope="messages_table"][aria-roledescription="message"][data-message-id]';
@@ -310,8 +314,8 @@ test('Combustion initialization failure removes its listener without owning the 
   assert.equal(mockPage.observerCleanupCalls, 0);
 });
 
-test('Combustion passes the established eight-message limit into the isolated page callback', async () => {
-  const mockPage = createMockPage({ messageCount: 9 });
+test('Combustion passes the twenty-message poll window into the isolated page callback', async () => {
+  const mockPage = createMockPage({ messageCount: 21 });
   const contextStore = createContextStore();
   const controller = await startCombustion({
     page: mockPage.page,
@@ -322,6 +326,8 @@ test('Combustion passes the established eight-message limit into the isolated pa
     debugMode: true,
   });
 
+  // 21 rendered messages: 'historical-1' plus baseline-1..baseline-20. The
+  // twenty-message window drops only the oldest rendered message.
   assert.deepEqual(contextStore.getState().messageIds, [
     'baseline-1',
     'baseline-2',
@@ -331,7 +337,21 @@ test('Combustion passes the established eight-message limit into the isolated pa
     'baseline-6',
     'baseline-7',
     'baseline-8',
+    'baseline-9',
+    'baseline-10',
+    'baseline-11',
+    'baseline-12',
+    'baseline-13',
+    'baseline-14',
+    'baseline-15',
+    'baseline-16',
+    'baseline-17',
+    'baseline-18',
+    'baseline-19',
+    'baseline-20',
   ]);
+  assert.equal(contextStore.getState().size, 20);
+  assert.ok(!contextStore.getState().messageIds.includes('historical-1'));
   await controller.stop();
 });
 test('RNG decisions use the configured temperament and update without restarting', async context => {
@@ -385,12 +405,15 @@ test('RNG decisions use the configured temperament and update without restarting
   }
 });
 
-test('Personality changes at runtime apply to subsequent AI replies', async context => {
+test('Personality changes at runtime apply to replies and keep the configured identity', async context => {
   context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
   const originalRandom = Math.random;
   Math.random = () => 1;
 
-  const capturedSystemInstructions: Array<string | undefined> = [];
+  const capturedRequests: Array<{
+    systemInstruction?: string;
+    messages: readonly { message: string }[];
+  }> = [];
   const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
   const mutableNvidiaModule = nvidiaModule as unknown as {
     generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
@@ -401,8 +424,10 @@ test('Personality changes at runtime apply to subsequent AI replies', async cont
     options: { systemInstruction?: string } = {},
   ): Promise<string> => {
     void apiKey;
-    void messages;
-    capturedSystemInstructions.push(options.systemInstruction);
+    capturedRequests.push({
+      systemInstruction: options.systemInstruction,
+      messages: messages as readonly { message: string }[],
+    });
     return 'mocked reply';
   };
 
@@ -484,37 +509,589 @@ test('Personality changes at runtime apply to subsequent AI replies', async cont
     injectedMessages.push(...messagesToInject);
   };
 
+  const aliases = generateAliases('PleaseGetout Daily').valids;
+  const literalRequest = "say the word '@PleaseGetout Daily'";
+  const identityInstruction = getBotIdentityInstruction({
+    name: 'PleaseGetout Daily',
+    aliases,
+  });
+  const contextStore = createContextStore();
+  contextStore.add([{
+    messageId: 'backread-only-1',
+    message: 'older planning message from Backread',
+    sender: 'Alex',
+    direction: 'INCOMING',
+  }]);
   const controller = await startCombustion({
     page: basePage,
-    contextStore: createContextStore(),
-    configuration,
-    aliases: ['@Bot'],
+    contextStore,
+    configuration: { ...configuration, puppetName: 'PleaseGetout Daily' },
+    aliases,
     apiKey: 'offline-test-key',
     debugMode: true,
   });
 
   try {
-    injectMessages([{ messageId: 'runtime-message-1', message: 'hey @Bot, are you there?' }]);
+    injectMessages([{ messageId: 'runtime-message-1', message: literalRequest }]);
     await advancePoll();
     await advancePoll();
-    assert.equal(capturedSystemInstructions.length, 1);
-    assert.equal(capturedSystemInstructions[0], getDefaultPersonalityInstruction());
+    assert.equal(capturedRequests.length, 1);
+    assert.equal(
+      capturedRequests[0].systemInstruction,
+      composeSystemInstruction(identityInstruction, getDefaultPersonalityInstruction()),
+    );
+    assert.match(String(capturedRequests[0].systemInstruction), /You are PleaseGetout Daily/);
+    assert.ok(
+      capturedRequests[0].messages.some(message => message.message === literalRequest),
+      'the literal instruction reaches the request unchanged',
+    );
+    assert.ok(
+      capturedRequests[0].messages.some(message =>
+        message.message === 'older planning message from Backread'),
+      'Backread-seeded Context Store history outside the rendered window reaches the request',
+    );
 
     const customPersonality = 'Always reply in rhyming couplets.';
-    const updatedInstruction = `${customPersonality}\n\n${getDefaultBehavioralInstruction()}`;
+    const updatedInstruction = `${customPersonality}
+
+${getDefaultBehavioralInstruction()}`;
     controller.setPersonality(updatedInstruction);
 
-    injectMessages([{ messageId: 'runtime-message-2', message: 'hey @Bot, what do you think?' }]);
+    injectMessages([{
+      messageId: 'runtime-message-2',
+      message: 'hey @PleaseGetoutDaily, what do you think?',
+    }]);
     await advancePoll();
     await advancePoll();
-    assert.equal(capturedSystemInstructions.length, 2);
-    assert.equal(capturedSystemInstructions[1], updatedInstruction);
-    assert.notEqual(capturedSystemInstructions[1], capturedSystemInstructions[0]);
+    assert.equal(capturedRequests.length, 2);
+    assert.equal(
+      capturedRequests[1].systemInstruction,
+      composeSystemInstruction(identityInstruction, updatedInstruction),
+    );
+    assert.match(String(capturedRequests[1].systemInstruction), /rhyming couplets/);
+    assert.match(String(capturedRequests[1].systemInstruction), /You are PleaseGetout Daily/);
+    assert.match(
+      String(capturedRequests[1].systemInstruction),
+      /Do not begin an ordinary reply with your own name or alias/,
+      'a runtime personality change cannot remove the self-mention rule',
+    );
+    assert.doesNotMatch(
+      String(capturedRequests[1].systemInstruction),
+      /playful, warm, spontaneous/,
+    );
   } finally {
     await controller.stop();
     Math.random = originalRandom;
     context.mock.timers.reset();
     mutableNvidiaModule.generateNvidiaReply = originalGenerateNvidiaReply;
+  }
+});
+
+test('a burst is fully observed and a follow-up mention is still answered during the cooldown', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+
+  const generatedRequests: Array<readonly { messageId: string; message: string }[]> = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    void apiKey;
+    generatedRequests.push(messages as readonly { messageId: string; message: string }[]);
+    return 'mocked reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => ({ status: 'sent' });
+
+  const flush = async (): Promise<void> => {
+    for (let turn = 0; turn < 8; turn += 1) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+  };
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3000);
+    await flush();
+  };
+
+  const mockPage = createMockPage({ messageCount: 0 });
+  const basePage = mockPage.page;
+  const originalLocator = basePage.locator.bind(basePage);
+  const injectedMessages: Array<{ messageId: string; sender: string; message: string }> = [];
+
+  const messageLocator = {
+    evaluateAll: async (
+      callback: (items: unknown[], limit: number) => unknown[],
+      limit: number,
+    ): Promise<unknown[]> => {
+      const elements = injectedMessages.map(message => ({
+        getAttribute(name: string) {
+          if (name === 'data-message-id') {
+            return message.messageId;
+          }
+          if (name === 'aria-label') {
+            return `At October 18, 2026, 1:15 PM, ${message.sender}: ${message.message}`;
+          }
+          return null;
+        },
+        cloneNode() {
+          return {
+            innerText: message.message,
+            querySelectorAll: () => [],
+          };
+        },
+      }));
+      return runInNewContext(
+        `(${callback.toString()})(items, limit)`,
+        { items: elements, limit },
+      ) as unknown[];
+    },
+  };
+
+  (basePage as { locator: (selector: string) => unknown }).locator = (selector: string) => {
+    if (selector === MESSAGE_SELECTOR) {
+      return messageLocator;
+    }
+    return originalLocator(selector);
+  };
+
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page: basePage,
+    contextStore,
+    configuration,
+    aliases: generateAliases('PleaseGetout Daily').valids,
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    // Ten messages arrive between polls; the mention is the oldest of them.
+    injectedMessages.push({
+      messageId: 'burst-1',
+      sender: 'Alex',
+      message: 'hey @PleaseGetout Daily are you there?',
+    });
+    for (let index = 2; index <= 10; index += 1) {
+      injectedMessages.push({
+        messageId: `burst-${index}`,
+        sender: 'Blair',
+        message: `burst message ${index}`,
+      });
+    }
+
+    await advancePoll();
+    await advancePoll();
+    await advancePoll();
+    assert.equal(generatedRequests.length, 1, 'the oldest mention still opens exactly one packet');
+    assert.deepEqual(
+      generatedRequests[0].map(message => message.messageId),
+      ['burst-1', 'burst-2', 'burst-3', 'burst-4', 'burst-5', 'burst-6', 'burst-7', 'burst-8', 'burst-9', 'burst-10'],
+      'the whole burst is kept in order',
+    );
+    assert.equal(
+      generatedRequests[0].filter(message => message.messageId === 'burst-1').length,
+      1,
+      'the trigger is sent exactly once',
+    );
+    assert.equal(contextStore.getState().size, 10, 'every burst message enters the Context Store');
+
+    // A poll with no new messages must not duplicate work.
+    await advancePoll();
+    await advancePoll();
+    assert.equal(generatedRequests.length, 1);
+
+    // A follow-up mention is answered even though the previous reply started the
+    // RNG cooldown, and the earlier turn is still available as context.
+    injectedMessages.push({
+      messageId: 'burst-11',
+      sender: 'Alex',
+      message: '@PleaseGetoutDaily summarise that',
+    });
+    await advancePoll();
+    await advancePoll();
+    assert.equal(generatedRequests.length, 2, 'a follow-up mention is not blocked by the cooldown');
+    const followUp = generatedRequests[1];
+    assert.equal(followUp.at(-1)?.messageId, 'burst-11');
+    assert.equal(
+      followUp.filter(message => message.messageId === 'burst-11').length,
+      1,
+      'the follow-up trigger is sent exactly once',
+    );
+    assert.ok(
+      followUp.some(message => message.messageId === 'burst-1'),
+      'the earlier mention remains part of the follow-up context',
+    );
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('a sent mention reply starts the RNG cooldown so one turn cannot be answered twice', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  const originalLog = console.log;
+  const logs: string[] = [];
+  Math.random = () => 0;
+  console.log = (...values: unknown[]) => {
+    logs.push(values.map(String).join(' '));
+  };
+
+  const generatedReplies: unknown[][] = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    void apiKey;
+    generatedReplies.push([...messages]);
+    return 'mocked reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => ({ status: 'sent' });
+
+  const flush = async (): Promise<void> => {
+    for (let turn = 0; turn < 8; turn += 1) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+  };
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3000);
+    await flush();
+  };
+
+  const mockPage = createMockPage({ messageCount: 0 });
+  const basePage = mockPage.page;
+  const originalLocator = basePage.locator.bind(basePage);
+  const injectedMessages: Array<{ messageId: string; sender: string; message: string }> = [];
+
+  const messageLocator = {
+    evaluateAll: async (
+      callback: (items: unknown[], limit: number) => unknown[],
+      limit: number,
+    ): Promise<unknown[]> => {
+      const elements = injectedMessages.map(message => ({
+        getAttribute(name: string) {
+          if (name === 'data-message-id') {
+            return message.messageId;
+          }
+          if (name === 'aria-label') {
+            return `At October 18, 2026, 1:15 PM, ${message.sender}: ${message.message}`;
+          }
+          return null;
+        },
+        cloneNode() {
+          return {
+            innerText: message.message,
+            querySelectorAll: () => [],
+          };
+        },
+      }));
+      return runInNewContext(
+        `(${callback.toString()})(items, limit)`,
+        { items: elements, limit },
+      ) as unknown[];
+    },
+  };
+
+  function createLocator(count: number) {
+    return {
+      count: () => count,
+      fill: async (): Promise<void> => undefined,
+      locator: (selectedSelector: string) => createLocatorForSelector(selectedSelector),
+      isVisible: async (): Promise<boolean> => true,
+      isEnabled: async (): Promise<boolean> => true,
+      click: async (): Promise<void> => undefined,
+    };
+  }
+
+  function createLocatorForSelector(selector: string) {
+    return createLocator(
+      selector === '[role="textbox"][contenteditable="true"]:visible' ||
+      selector === '[aria-label="Thread composer"]' ||
+      selector === '[role="button"][aria-label="Press Enter to send"]'
+        ? 1
+        : 0,
+    );
+  }
+
+  (basePage as { locator: (selector: string) => unknown }).locator = (selector: string) => {
+    if (selector === MESSAGE_SELECTOR) {
+      return messageLocator;
+    }
+    return originalLocator(selector);
+  };
+
+  const controller = await startCombustion({
+    page: basePage,
+    contextStore: createContextStore(),
+    configuration,
+    aliases: generateAliases('PleaseGetout Daily').valids,
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    injectedMessages.push({
+      messageId: 'incoming-1',
+      sender: 'Alex',
+      message: 'hey @PleaseGetout Daily',
+    });
+    await advancePoll();
+    await advancePoll();
+    await advancePoll();
+    assert.equal(generatedReplies.length, 1, 'the mention is answered exactly once');
+    assert.ok(logs.some(line => line.includes('Cooldown started')), 'the reply starts a cooldown');
+
+    context.mock.timers.tick(15_000);
+    await flush();
+    assert.equal(
+      generatedReplies.length,
+      1,
+      'the RNG cycle does not answer the same turn again during the cooldown',
+    );
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    console.log = originalLog;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('Combustion never treats its own outgoing alias as a mention trigger', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  const generatedReplies: unknown[][] = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const mutableNvidiaModule = nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  };
+  mutableNvidiaModule.generateNvidiaReply = async (
+    apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    void apiKey;
+    generatedReplies.push([...messages]);
+    return 'mocked reply';
+  };
+
+  const flush = (): Promise<void> => new Promise(resolve => setImmediate(resolve));
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3000);
+    await flush();
+    await flush();
+  };
+
+  const mockPage = createMockPage({ messageCount: 0 });
+  const basePage = mockPage.page;
+  const originalLocator = basePage.locator.bind(basePage);
+  const injectedMessages: Array<{ messageId: string; sender: string; message: string }> = [];
+
+  const messageLocator = {
+    evaluateAll: async (
+      callback: (items: unknown[], limit: number) => unknown[],
+      limit: number,
+    ): Promise<unknown[]> => {
+      const elements = injectedMessages.map(message => ({
+        getAttribute(name: string) {
+          if (name === 'data-message-id') {
+            return message.messageId;
+          }
+          if (name === 'aria-label') {
+            return `At October 18, 2026, 1:15 PM, ${message.sender}: ${message.message}`;
+          }
+          return null;
+        },
+        cloneNode() {
+          return {
+            innerText: message.message,
+            querySelectorAll: () => [],
+          };
+        },
+      }));
+      return runInNewContext(
+        `(${callback.toString()})(items, limit)`,
+        { items: elements, limit },
+      ) as unknown[];
+    },
+  };
+
+  (basePage as { locator: (selector: string) => unknown }).locator = (selector: string) => {
+    if (selector === MESSAGE_SELECTOR) {
+      return messageLocator;
+    }
+    return originalLocator(selector);
+  };
+
+  const controller = await startCombustion({
+    page: basePage,
+    contextStore: createContextStore(),
+    configuration,
+    aliases: generateAliases('PleaseGetout Daily').valids,
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    injectedMessages.push(
+      {
+        messageId: 'outgoing-1',
+        sender: 'You',
+        message: "@PleaseGetout Daily, that's what I meant.",
+      },
+      {
+        messageId: 'outgoing-2',
+        sender: 'You',
+        message: "@PleaseGetoutDaily, that's what I meant.",
+      },
+      {
+        messageId: 'outgoing-3',
+        sender: 'You',
+        message: "@PleaseGetout_Daily, that's what I meant.",
+      },
+    );
+    await advancePoll();
+    await advancePoll();
+    await advancePoll();
+    assert.deepEqual(generatedReplies, []);
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    mutableNvidiaModule.generateNvidiaReply = originalGenerateNvidiaReply;
+  }
+});
+
+test('Combustion strips a self-identifying prefix before composing and keeps a requested alias', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+
+  const composedReplies: string[] = [];
+  const generatedReplies = [
+    '@PleaseGetout Daily Oh, nice? That is it?',
+    "@PleaseGetout Daily",
+  ];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (): Promise<string> => generatedReplies.shift() ?? 'ok';
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async (_page, reply) => {
+    composedReplies.push(reply);
+    return { status: 'sent' };
+  };
+
+  const flush = async (): Promise<void> => {
+    for (let turn = 0; turn < 8; turn += 1) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+  };
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3000);
+    await flush();
+  };
+
+  const mockPage = createMockPage({ messageCount: 0 });
+  const basePage = mockPage.page;
+  const originalLocator = basePage.locator.bind(basePage);
+  const injectedMessages: Array<{ messageId: string; message: string }> = [];
+
+  (basePage as { locator: (selector: string) => unknown }).locator = (selector: string) => {
+    if (selector !== MESSAGE_SELECTOR) {
+      return originalLocator(selector);
+    }
+    return {
+      evaluateAll: async (
+        callback: (items: unknown[], limit: number) => unknown[],
+        limit: number,
+      ): Promise<unknown[]> => {
+        const elements = injectedMessages.map(message => ({
+          getAttribute(name: string) {
+            if (name === 'data-message-id') {
+              return message.messageId;
+            }
+            return name === 'aria-label'
+              ? `At October 18, 2026, 1:15 PM, Alex: ${message.message}`
+              : null;
+          },
+          cloneNode() {
+            return {
+              innerText: message.message,
+              querySelectorAll: () => [],
+            };
+          },
+        }));
+        return runInNewContext(
+          `(${callback.toString()})(items, limit)`,
+          { items: elements, limit },
+        ) as unknown[];
+      },
+    };
+  };
+
+  const aliases = generateAliases('PleaseGetout Daily').valids;
+  const controller = await startCombustion({
+    page: basePage,
+    contextStore: createContextStore(),
+    configuration: { ...configuration, puppetName: 'PleaseGetout Daily' },
+    aliases,
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    injectedMessages.push({
+      messageId: 'prefix-1',
+      message: '@PleaseGetout Daily nice',
+    });
+    await advancePoll();
+    await advancePoll();
+    assert.deepEqual(composedReplies, ['Oh, nice? That is it?']);
+
+    injectedMessages.push({
+      messageId: 'prefix-2',
+      message: "say '@PleaseGetout Daily'",
+    });
+    await advancePoll();
+    await advancePoll();
+    assert.deepEqual(composedReplies, ['Oh, nice? That is it?', '@PleaseGetout Daily']);
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
   }
 });
 

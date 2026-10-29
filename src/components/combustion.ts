@@ -28,9 +28,14 @@ import {
   type PacketBuilderState,
 } from './mention-packet-builder.js';
 import { createPacketProcessor } from './packet-processor.js';
+import { stripSelfIdentifyingPrefix } from './reply-normalization.js';
 import { createPacketScheduler } from './packet-scheduler.js';
 import { createPauseGate } from './pause-gate.js';
-import { getPersonalityInstruction } from './personality.js';
+import {
+  composeSystemInstruction,
+  getBotIdentityInstruction,
+  getPersonalityInstruction,
+} from './personality.js';
 import { buildRngPacket, type RngPacket } from './rng-packet-builder.js';
 import { formatPollSummary, formatTerminalText } from './terminal-formatting.js';
 
@@ -38,11 +43,16 @@ const MESSAGE_SELECTOR =
   '[data-scope="messages_table"][aria-roledescription="message"][data-message-id]';
 const LOG_SELECTOR = '[role="log"][aria-live="polite"]';
 const WAKER_MESSAGE_SELECTOR = '[data-message-id]';
-const MESSAGE_LIMIT = 8;
+// Per-poll DOM window. Applied to the rendered message list before stable-ID
+// deduplication, so a burst larger than this would lose its oldest messages
+// permanently (they never enter the Context Store). It is independent of
+// CONTEXT_STORE_CAPACITY, which remains 60.
+const MESSAGE_LIMIT = 20;
 const CONTEXT_STORE_CAPACITY = 60;
 const POLL_INTERVAL_MS = 3000;
 const RNG_POLL_INTERVAL_MS = 15000;
 const RNG_CONTEXT_MESSAGE_LIMIT = 10;
+const PACKET_CONTEXT_MESSAGE_LIMIT = 20;
 const RNG_COOLDOWN_MS = 35000;
 const IDLE_THRESHOLD_MS = 120000;
 const LOG_PREFIX = '__MESSENGER_WAKER__:';
@@ -482,6 +492,20 @@ export async function startCombustion({
     const details = message.replace(/^\[rng\]\s*/, '');
     console.log(`${leadingNewline ? '\n' : ''}${formatSubsystemStatus('rng', details)}`);
   };
+  const startRngCooldown = (details = ''): void => {
+    rngCooldownActive = true;
+    clearTimeout(rngCooldownTimer);
+    console.log(formatSubsystemStatus(
+      'rng',
+      `Cooldown started: ${styled(`${RNG_COOLDOWN_MS / 1000}s`, 'bold')}` +
+      (details ? ` (${details})` : ''),
+    ));
+    rngCooldownTimer = setTimeout(() => {
+      rngCooldownTimer = undefined;
+      rngCooldownActive = false;
+      console.log(formatSubsystemStatus('rng', 'Cooldown ended'));
+    }, RNG_COOLDOWN_MS);
+  };
   const completeRngPacket = (packetId: string, succeeded: boolean, error?: unknown): void => {
     if (packetId !== rngPacketInFlightId) {
       return;
@@ -501,16 +525,7 @@ export async function startCombustion({
     if (stopRequested || completedEpoch !== destinationEpoch) {
       return;
     }
-    rngCooldownActive = true;
-    console.log(formatSubsystemStatus(
-      'rng',
-      `Cooldown started: ${styled(`${RNG_COOLDOWN_MS / 1000}s`, 'bold')}`,
-    ));
-    rngCooldownTimer = setTimeout(() => {
-      rngCooldownTimer = undefined;
-      rngCooldownActive = false;
-      console.log(formatSubsystemStatus('rng', 'Cooldown ended'));
-    }, RNG_COOLDOWN_MS);
+    startRngCooldown();
   };
   const requestStop = (): void => {
     if (stopRequested) {
@@ -790,7 +805,13 @@ export async function startCombustion({
         }
 
         const newMessageIds = new Set(newMessagesWithMentions.map(message => message.messageId));
-        const recentContext = messages
+        // Backread-seeded history from the Context Store plus the rendered window
+        // gives the model real conversational context; the packet builder removes
+        // duplicates and anything already in newMessages.
+        const recentContext = [
+          ...contextStore.getRecent(PACKET_CONTEXT_MESSAGE_LIMIT),
+          ...messages,
+        ]
           .filter(message => message.messageId && !newMessageIds.has(message.messageId))
           .map(message => ({
             ...message,
@@ -996,10 +1017,15 @@ export async function startCombustion({
       `\n${styled('[COMBUSTION]', 'cyan')} ` +
       styled(`Starting Combustion for ${configuration.messageDestination}.`, 'bold'),
     );
-    let systemInstruction = getPersonalityInstruction(
+    let personalityInstruction = getPersonalityInstruction(
       resolveBotPersonalityMode(configuration),
       configuration.customPersonalityInstruction,
     );
+    const identityInstruction = getBotIdentityInstruction({
+      name: configuration.puppetName ?? '',
+      aliases,
+    });
+    let systemInstruction = composeSystemInstruction(identityInstruction, personalityInstruction);
     const processPacket = createPacketProcessor<
       PacketBuilderMessage,
       string,
@@ -1009,11 +1035,32 @@ export async function startCombustion({
     >({
       page,
       apiKey,
-      generateReply: (requestApiKey, messages) => generateNvidiaReply(
-        requestApiKey,
-        messages as unknown as readonly BackreadMessage[],
-        { systemInstruction },
-      ),
+      generateReply: async (requestApiKey, messages) => {
+        // The model can echo its own alias from earlier assistant turns. The
+        // prompt forbids it, so this only guards the boundary where the raw
+        // reply becomes the message we send.
+        const reply = await generateNvidiaReply(
+          requestApiKey,
+          messages as unknown as readonly BackreadMessage[],
+          { systemInstruction },
+        );
+        const normalizedReply = stripSelfIdentifyingPrefix(
+          reply,
+          { name: configuration.puppetName ?? '', aliases },
+          messages,
+        );
+        if (normalizedReply !== reply) {
+          const trimmedReply = reply.trim();
+          const removedPrefix = trimmedReply
+            .slice(0, Math.max(0, trimmedReply.length - normalizedReply.length))
+            .trim();
+          console.log(
+            `${styled('[reply]', 'cyan')} removed self-identifying prefix: ` +
+            `${JSON.stringify(removedPrefix)}`,
+          );
+        }
+        return normalizedReply;
+      },
       composeReply: composeMessengerReply,
       pauseGate,
       isCurrent: packet => packetEpochs.get(packet) === destinationEpoch,
@@ -1021,7 +1068,8 @@ export async function startCombustion({
     });
     packetScheduler = createPacketScheduler<ScheduledPacket>(async packet => {
       packetEpochs.set(packet, destinationEpoch);
-      if (packet.packetId === rngPacketInFlightId) {
+      const isRngPacket = packet.packetId === rngPacketInFlightId;
+      if (isRngPacket) {
         console.log(formatSubsystemStatus(
           'rng',
           `${styled('Processing started:', 'green')} ${styled(packet.packetId, 'bold')}`,
@@ -1038,6 +1086,12 @@ export async function startCombustion({
         throw error;
       } finally {
         completeRngPacket(packet.packetId, succeeded, processingError);
+        // A completed mention reply also starts the RNG cooldown, so a second
+        // generation cannot fire for the same turn while the sent message is
+        // still travelling back into the poller as an incoming DOM update.
+        if (succeeded && !isRngPacket && !stopRequested) {
+          startRngCooldown('reply sent');
+        }
       }
     }, { pauseGate });
 
@@ -1142,7 +1196,7 @@ export async function startCombustion({
       }
       lastRngSkipReason = null;
       const latestMessage = contextStore.getRecent(1)[0];
-      if (latestMessage?.sender === 'You' && latestMessage.direction === 'OUTGOING') {
+      if (latestMessage?.direction === 'OUTGOING') {
         console.log(formatSubsystemStatus(
           'rng',
           `${styled('Skipping dice roll:', 'yellow')} ` +
@@ -1239,7 +1293,8 @@ export async function startCombustion({
         botTemperament = temperament;
       },
       setPersonality(instruction) {
-        systemInstruction = instruction;
+        personalityInstruction = instruction;
+        systemInstruction = composeSystemInstruction(identityInstruction, personalityInstruction);
       },
       changeDestination,
       async stop() {

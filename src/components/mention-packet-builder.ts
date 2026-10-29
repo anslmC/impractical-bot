@@ -46,6 +46,13 @@ function normalizeMessage(message: PacketBuilderMessage): PacketBuilderMessage {
   };
 }
 
+// A new message may open or extend a mention packet only when Messenger reported
+// it as INCOMING. Outgoing replies can echo the bot's own alias, so direction is
+// enforced here independently of how the mention flag was computed.
+function isMentionTrigger(message: PacketBuilderMessage): boolean {
+  return message.direction === 'INCOMING' && message.mention === true;
+}
+
 function assertMatchingContent(existing: PacketBuilderMessage, incoming: PacketBuilderMessage): void {
   if (existing.message !== incoming.message) {
     throw new Error(`Message ID ${incoming.messageId} was observed with different content.`);
@@ -137,16 +144,22 @@ export function buildPacketTurn({
   if (pendingPacket) {
     pendingPacket.newMessages.push(...uniqueNewMessages.map(message => ({ ...message })));
     pendingPacket.mentionMessages.push(
-      ...uniqueNewMessages.filter(message => message.mention).map(message => ({ ...message })),
+      ...uniqueNewMessages.filter(isMentionTrigger).map(message => ({ ...message })),
     );
+    // Context supplied for the trigger may already contain the trigger itself
+    // (for example when it comes from the Context Store). A packet must never
+    // send the same message twice: once as context and once as new work.
+    const newMessageIds = new Set(pendingPacket.newMessages.map(message => message.messageId));
+    pendingPacket.contextMessages = pendingPacket.contextMessages
+      .filter(message => !newMessageIds.has(message.messageId));
     packet = pendingPacket;
     pendingPacket = null;
-  } else if (uniqueNewMessages.some(message => message.mention)) {
+  } else if (uniqueNewMessages.some(isMentionTrigger)) {
     pendingPacket = {
       packetId: `packet-${String(nextPacketNumber).padStart(3, '0')}`,
       newMessages: uniqueNewMessages.map(message => ({ ...message })),
       mentionMessages: uniqueNewMessages
-        .filter(message => message.mention)
+        .filter(isMentionTrigger)
         .map(message => ({ ...message })),
       contextMessages: [...contextById.values()].map(message => ({ ...message })),
     };

@@ -163,7 +163,7 @@ test('reply generation sends known-direction messages in order and extracts trim
       { role: 'user', content: 'Blair: Great, what time works?' },
     ],
     chat_template_kwargs: { enable_thinking: false },
-    max_tokens: 4096,
+    max_tokens: 256,
     stream: false,
   });
 });
@@ -193,7 +193,7 @@ test('reply generation uses a supplied system instruction before conversation me
   ]);
 });
 
-test('reply generation coalesces consecutive roles and ends with the incoming turn', async () => {
+test('reply generation keeps one API turn per Messenger message and ends with the incoming turn', async () => {
   let requestedOptions: RequestInit | undefined;
 
   await generateNvidiaReply('nvapi-test-key', [{
@@ -240,13 +240,15 @@ test('reply generation coalesces consecutive roles and ends with the incoming tu
 
   const body = JSON.parse(String(requestedOptions?.body));
   assert.deepEqual(body.messages.slice(1), [
-    { role: 'user', content: 'Alex: First incoming.\nBlair: Second incoming.' },
-    { role: 'assistant', content: 'First outgoing.\nSecond outgoing.' },
+    { role: 'user', content: 'Alex: First incoming.' },
+    { role: 'user', content: 'Blair: Second incoming.' },
+    { role: 'assistant', content: 'First outgoing.' },
+    { role: 'assistant', content: 'Second outgoing.' },
     { role: 'user', content: 'Casey: Latest incoming.' },
   ]);
 });
 
-test('reply generation repeats the latest actual incoming turn after a trailing assistant turn', async () => {
+test('reply generation drops assistant turns that trail the latest incoming message', async () => {
   let requestedOptions: RequestInit | undefined;
 
   await generateNvidiaReply('nvapi-test-key', [{
@@ -273,8 +275,107 @@ test('reply generation repeats the latest actual incoming turn after a trailing 
   const body = JSON.parse(String(requestedOptions?.body));
   assert.deepEqual(body.messages.slice(1), [
     { role: 'user', content: 'Alex: Can you check this?' },
-    { role: 'assistant', content: 'I will check.' },
-    { role: 'user', content: 'Alex: Can you check this?' },
+  ]);
+});
+
+test('reply generation preserves the literal trigger and attributes prior bot output as assistant', async () => {
+  let requestedOptions: RequestInit | undefined;
+  const literalRequest = "say the word '@PleaseGetout Daily'";
+
+  await generateNvidiaReply('nvapi-test-key', [{
+    id: 'incoming-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Alex',
+    direction: 'INCOMING',
+    message: 'hey',
+    ariaLabel: null,
+  }, {
+    id: 'outgoing-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'You',
+    direction: 'OUTGOING',
+    message: 'Hey, what is up?',
+    ariaLabel: null,
+  }, {
+    id: 'incoming-2',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Blair',
+    direction: 'INCOMING',
+    message: literalRequest,
+    ariaLabel: null,
+  }], {
+    fetch: async (_input, init) => {
+      requestedOptions = init;
+      return successfulCompletion('@PleaseGetout Daily');
+    },
+  });
+
+  const body = JSON.parse(String(requestedOptions?.body));
+  assert.deepEqual(body.messages.slice(1), [
+    { role: 'user', content: 'Alex: hey' },
+    { role: 'assistant', content: 'Hey, what is up?' },
+    { role: 'user', content: `Blair: ${literalRequest}` },
+  ]);
+  assert.equal(
+    body.messages.filter((message: { content: string }) =>
+      message.content.includes(literalRequest)).length,
+    1,
+    'the literal trigger appears exactly once, unchanged',
+  );
+});
+
+test('reply generation includes every message once and never repeats the latest incoming', async () => {
+  let requestedOptions: RequestInit | undefined;
+  const messages = [{
+    id: 'incoming-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Alex',
+    direction: 'INCOMING' as const,
+    message: 'same text',
+    ariaLabel: null,
+  }, {
+    id: 'incoming-2',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Blair',
+    direction: 'INCOMING' as const,
+    message: 'same text',
+    ariaLabel: null,
+  }];
+
+  await generateNvidiaReply('nvapi-test-key', messages, {
+    fetch: async (_input, init) => {
+      requestedOptions = init;
+      return successfulCompletion('ok');
+    },
+  });
+
+  const body = JSON.parse(String(requestedOptions?.body));
+  assert.deepEqual(body.messages.slice(1), [
+    { role: 'user', content: 'Alex: same text' },
+    { role: 'user', content: 'Blair: same text' },
+  ]);
+});
+
+test('reply generation omits the sender prefix when the sender is unknown', async () => {
+  let requestedOptions: RequestInit | undefined;
+
+  await generateNvidiaReply('nvapi-test-key', [{
+    id: 'incoming-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'UNKNOWN',
+    direction: 'INCOMING',
+    message: 'no sender label',
+    ariaLabel: null,
+  }], {
+    fetch: async (_input, init) => {
+      requestedOptions = init;
+      return successfulCompletion('ok');
+    },
+  });
+
+  const body = JSON.parse(String(requestedOptions?.body));
+  assert.deepEqual(body.messages.slice(1), [
+    { role: 'user', content: 'no sender label' },
   ]);
 });
 

@@ -2,62 +2,72 @@
 
 ## Status and Scope
 
-The project is a local Node.js CLI, intended to run as one process and one bot instance. It needs no server, database, or plugin system. Production code already provides browser discovery and managed launch, configuration, NVIDIA key validation and reply generation, message backread, and a tested Messenger composer.
+The project is a local Node.js CLI, intended to run as one process and one bot instance. It needs no server, database, or plugin system. Production code provides browser discovery and managed launch, configuration, NVIDIA key validation and reply generation, message backread, the persistent M2 conversation engine ("Combustion"), and a tested Messenger composer.
 
-The current `start` path is a proven one-shot pipeline: validate the NVIDIA API key, launch and prepare the configured browser/conversation, read rendered messages, generate one reply, attempt to send it, then wait for shutdown. It is not yet the persistent conversation engine described below. Code under `Tools/` contains independent experiments and is not production behavior. This document marks the M2 target as planned unless explicitly identified as implemented/proven.
+The M2 engine is implemented: initialization seeds historical context, runtime polling observes new messages, explicitly incoming mentions open response packets, a FIFO scheduler runs one generation/send at a time, and a temperament-driven RNG path participates without a mention. Live end-to-end behavior in a real Messenger conversation still requires smoke verification. Code under `Tools/` contains independent experiments and is not production behavior.
+
+Not implemented: bounded NVIDIA retries/backoff, saved or persistent conversation context (recent messages plus Backread are the whole context), and pre-send content reassessment beyond pause and destination checks.
 
 ## Responsibilities
 
 - **CLI (`src/cli.ts`, `bin/`):** route commands and coordinate startup, operation, and shutdown.
 - **Configuration (`src/config/`):** load and validate local settings. Configuration, credentials, and runtime state belong outside the repository, under the user's local application-data directory.
 - **Browser (`src/browser/`):** discover Brave, Google Chrome, or Microsoft Edge, prepare a dedicated profile, launch the selected browser with remote debugging bound to loopback, and connect Playwright through CDP. Firefox is out of scope.
-- **Messages (`src/components/`):** read rendered messages and provide stable identity, sender, direction, and freshness information to the engine.
-- **AI (`src/ai/`):** validate the NVIDIA API key and generate reply text from caller-provided context. It does not control browser actions, files, or secrets independently.
-- **Conversation engine (M2 target):** coordinate observation, batching, participation decisions, generation, pre-send checks, and lifecycle without owning browser discovery.
+- **Messages (`src/components/backread.ts`, `src/components/message-extraction.ts`):** read rendered messages and provide stable identity, sender, direction, and freshness information.
+- **Context Store (`src/components/context-store.ts`):** retain observed messages in observation order with stable-ID deduplication and bounded capacity.
+- **Conversation engine (`src/components/combustion.ts` and its collaborators):** coordinate observation, mention-triggered packet building, FIFO scheduling, generation, pre-send checks, and lifecycle without owning browser discovery.
+- **AI (`src/ai/nvidia.ts`):** validate the NVIDIA API key and generate reply text from caller-provided context. It does not control browser actions, files, or secrets independently.
 
-Keep implementation incremental and reuse the existing tested composer. The engine remains one active generation/send operation at a time, while message observation continues during that operation.
+The engine keeps one active generation/send operation at a time; message observation continues during that operation.
 
-## M2 Conversation Flow
+## M2 Running Pipeline
 
-The M2 target transitions from the proven one-shot pipeline to a persistent, decision-driven conversation engine:
+1. **Initialization (`impbot start`):** validate the configured NVIDIA API key; launch and prepare the configured browser and conversation; handle login and Messenger startup challenges; retrieve the puppet account name from the Messenger profile and persist it; initialize the Alias Engine from that name; run Backread over rendered history (up to 30 messages) and seed the Context Store with it; record the rendered message-ID baseline; start Combustion. Backread runs only during initialization; there is no runtime Backread.
+2. **Runtime observation:** poll the rendered conversation every 3 seconds over a bounded window (the newest 20 rendered messages). Freshness is decided by stable `data-message-id` comparison against the IDs already seen, so re-reading a message is not new work. When no genuinely new message has appeared for 120 seconds the engine goes idle and arms a `MutationObserver` wake-up; the observer only signals possible activity and never classifies messages or decides whether to reply.
+3. **Trigger eligibility:** a message may open a mention packet only when Messenger reported it as `INCOMING` and the alias match flagged it as a mention. `OUTGOING` and `UNKNOWN` messages never trigger a reply, even when their text contains one of the bot's aliases. Direction comes from the extracted `aria-label` sender (`You` means outgoing); a label that cannot be parsed stays `UNKNOWN`. The direction check lives at the packet-creation boundary, independently of how the mention flag was computed.
+4. **Packet building (`src/components/mention-packet-builder.ts`):** a qualifying mention opens a packet (sequential `packet-NNN` ID) and holds it until the next poll. Messages observed while a packet is open are appended to it, so a short burst becomes one response opportunity. On finalization the packet carries `newMessages` (all fresh messages), `mentionMessages` (the qualifying incoming triggers), and `contextMessages` (conversation preceding the trigger). Context is the newest 20 Context Store messages plus the rendered window, deduplicated by message ID; anything that is already in `newMessages` is removed, so the current trigger is never sent twice.
+5. **Scheduling (`src/components/packet-scheduler.ts`):** finalized packets are submitted to a FIFO queue that processes one packet at a time and rejects a packet ID it has already accepted. Pause holds queued packets; destination changes discard queued work; stop cancels it. Completed and failed packet IDs are recorded, and a failed packet is not retried.
+6. **Generation (`src/ai/nvidia.ts`):** the request is a single system message followed by one API turn per Messenger message: incoming messages become `user` turns prefixed with their sender, outgoing messages become `assistant` turns (the bot's own posts), and `UNKNOWN` messages are dropped. The request is truncated after the latest incoming message so it always ends with the message being answered and never repeats it. Replies are capped at 256 tokens with thinking disabled and a 50-second timeout.
+7. **Composition and sending (`src/components/composer.ts`):** verify the composer region and send control are unambiguous, visible, and enabled; enter the text; run the pre-send gate (pause state and destination epoch); click the send control exactly once. A click is a send attempt, not confirmed delivery, and an uncertain outcome is never resent automatically.
+8. **Continuous operation:** return to observation after every cycle. A poll with no new messages changes nothing; the engine never replays a turn it has already answered.
 
-1. **Initialization:** validate the NVIDIA API key; connect to the configured browser and conversation; handle startup challenges; establish an initial message-ID baseline; load recent messages; and load optional saved context and personality instructions. A startup baseline is context, not a reply trigger.
-2. **Fresh-message observation:** poll a small recent-message window and deduplicate by stable message ID. A `MutationObserver` may wake the engine during idle periods, but it is only a wake-up mechanism; polling and stable-ID comparison determine freshness, and the observer does not classify messages or decide whether to reply.
-3. **Batching:** collect fresh messages during a short quiet period and group related arrivals into one response opportunity.
-4. **Smart decisions:** prioritize genuine reactive opportunities, such as direct mentions and clear requests. Evaluate proactive opportunities separately with local decision rules, cooldowns, and configurable talkativeness. Do not use historical messages as reply triggers.
-5. **Generation:** send recent conversation context, applicable saved context, personality instructions, and other required instructions to NVIDIA. Temperature controls response variation, not participation frequency.
-6. **Pre-send reassessment:** before sending, check for stop or pause requests, newer high-priority messages, stale or redundant replies, and a valid destination. Discard or regenerate a proposal that no longer fits the current conversation state.
-7. **Composition and sending:** reuse the existing tested composer behavior. Track generation success, send attempts, and confirmed delivery as separate outcomes. A successful composer action is a send attempt, not proof of delivery.
-8. **Continuous operation:** return to observation after every processing cycle. Observe incoming activity while generation or sending is active, but do not start a second generation/send operation concurrently.
+## Context Store and Model Context
+
+The Context Store retains observed messages in observation order, deduplicates them by stable message ID (different IDs with identical text stay distinct), clones stored messages, and evicts oldest first at a capacity of 60. It is seeded once by Backread and appended by runtime polls; runtime polling never re-runs Backread.
+
+Mention packets take context from the store (newest 20) plus the rendered window. The packet builder removes duplicates, so no message is included twice and the trigger appears once as new work. RNG packets take the newest 10 stored messages. Capacity is not tied to the poll window.
+
+## Identity and Personality
+
+The configured puppet name is the bot's identity. It is retrieved from the Messenger profile during startup (falling back to the saved value) and combined with the narrowed Alias Engine output into a system-level identity instruction that states whose messages the assistant turns are, which `@`-mentions refer to the bot, and that literal requests must be reproduced as written. Identity is derived from configuration and is never hardcoded.
+
+Personality is a separate layer: the built-in default instruction, or a custom instruction composed with the fixed behavioral layer. `setpersonality` changes the personality layer at runtime; identity is re-composed around it, so a personality change cannot remove the bot's identity. Personality governs conversational style and never decides whether the bot participates.
+
+The bot temperament (`quiet`, `balanced`, or `talkative`) is stored in `config.json` and maps to RNG participation probabilities. It is independent of both identity and personality, and `setbottemp` updates a running engine without pausing, resuming, or restarting it.
+
+## RNG Participation
+
+Independently of mentions, the engine evaluates an RNG opportunity every 15 seconds. It skips when the main poll is in progress, when a mention packet is open or queued or active, when a generation is already in flight, or while a cooldown is active. It also skips when the newest stored message is `OUTGOING` and requires at least one usable `INCOMING` message in the newest 10. A successful roll builds a packet from those 10 messages and submits it like any other packet. Any successful reply (mention or RNG) starts a 35-second cooldown, so one conversation turn cannot produce two immediate replies.
 
 ## Lifecycle and Failure Behavior
 
-These are agreed M2 behaviors; they are not all implemented in the current one-shot path.
-
-- **Pause and resume:** continue observing while paused but suppress replies. On resume, reassess accumulated messages against the current conversation and decision rules rather than blindly replaying queued replies.
-- **Destination switching:** suspend reply processing, discard pending work for the old destination, navigate to and verify the new destination, establish a fresh baseline, and resume only after verification. If switching fails, remain paused and allow retry.
-- **Stop:** reject new work, suppress unsent replies, settle active work where practical without waiting indefinitely, clear pending work, gracefully close the bot-managed browser, release resources, and exit.
+- **Pause and resume:** observation and packet work are suspended; the current poll is allowed to finish. Resume restarts polling and RNG evaluation and re-arms the idle timer.
+- **Destination switching:** reject concurrent switches, pause, navigate and verify the new destination with a rendered-message baseline, persist the destination, discard queued work, reseed the Context Store from the new baseline, and resume only after verification. A failed switch returns to the previous destination and leaves the configuration unchanged.
+- **Stop:** reject new work, cancel pending packets and in-flight gating, detach the console listener and page observer, wait for the packet processor to settle, and close the managed browser.
 - **Browser or CDP failure:** stop the engine and report the failure; recovery requires another `start`.
-- **Temporary DOM or message-area failure:** suspend processing and retry verification. Recovery must not add duplicate listeners or duplicate message entries.
-- **NVIDIA failures:** use bounded retries and backoff for transient failures; do not blindly retry invalid requests. Retries must preserve a manual pause state.
-- **Uncertain send outcome:** do not blindly resend. Record send attempts separately from confirmed delivery because a composer action alone cannot prove delivery.
-
-## Personality and Saved Context
-
-`personality.txt` is the optional, editable default personality configuration. If it is missing or empty, use a short built-in fallback; loading personality must not block startup. Personality governs conversational style, not whether the bot participates.
-
-The configured bot temperament (`quiet`, `balanced`, or `talkative`) maps to RNG participation probabilities and is independent of personality. It is stored in `config.json` and can be changed with `setbottemp`; changing it updates a running engine without pausing, resuming, or restarting it.
-
-Saved conversation context is a future extension. Until it exists, recent messages are sufficient for initial operation. Historical messages provide context only; they are not reply triggers.
+- **NVIDIA failure:** the packet is recorded as failed and processing moves on. There is no automatic retry, and no reply is sent for a failed generation.
+- **Uncertain send outcome:** a composer click is reported as an attempt; the engine does not resend.
 
 ## Safety Invariants
 
 - Track ownership of the browser process launched by the application; never stop unrelated browser instances.
 - Keep CDP bound to loopback and connect only to the managed browser.
 - Do not silently change the active tab or destination; verify a destination switch before resuming replies.
-- Do not make reply decisions from unknown or stale message identity, direction, or conversation state.
-- Reassess proposals immediately before sending and discard stale or redundant work.
-- Do not automatically resend after an uncertain send outcome.
+- Only explicitly `INCOMING` messages may trigger mention-based replies; `OUTGOING` and `UNKNOWN` messages never can, and the guard does not depend on alias matching alone.
+- Deduplicate by stable message ID only, never by message text.
+- Keep each message's `messageId`, text, `sender`, and `direction` in observation order.
+- Do not make reply decisions from unknown or stale message identity or direction.
+- Never run a second generation or send concurrently with an active packet.
 - Keep credentials, recovery PINs, API keys, session data, and runtime state outside the repository.
 - Keep AI generation separate from participation decisions and browser actions.
 
@@ -72,10 +82,11 @@ M2 development stages, in order, are **fresh-message detection**, **batching/dec
 
 ## Implemented and Proven Boundaries
 
-- Production startup validates the configured NVIDIA API key, launches the managed browser, prepares the configured conversation, and handles login and Messenger startup challenges.
-- Production backread reads rendered messages and applies message identity and direction classification. It is bounded; it does not establish complete conversation history.
-- Production generation uses recent messages to create a reply proposal. The current start path generates once from the backread rather than applying the planned continuous participation policy.
-- The production composer checks that the composer and send control are usable before clicking. A click is reported as an attempt; delivery is not confirmed.
-- Scripts in `Tools/` are exploratory, independent experiments. They can provide evidence for the specific behaviors they exercise but do not establish managed-startup or continuous-engine behavior.
+- Production startup validates the configured NVIDIA API key, launches the managed browser, prepares the configured conversation, handles login and Messenger startup challenges, retrieves the puppet name, initializes the Alias Engine, and seeds the Context Store from Backread.
+- Production runtime observation, stable-ID deduplication, mention-triggered packet building, FIFO scheduling, generation, pre-send gating, and single-click composition are implemented and covered by offline tests.
+- Production generation builds an identity-plus-personality system instruction and a role-attributed, ID-deduplicated conversation request; the composer checks the composer and send control before clicking.
+- Backread is bounded (up to 30 messages) and runs only during initialization.
+- The RNG participation path, cooldown, pause/resume, destination switching, and shutdown are implemented and covered by offline tests.
+- Scripts in `Tools/` are exploratory, independent experiments. They can provide evidence for the specific behaviors they exercise but do not establish managed-startup, live-Messenger, or live-NVIDIA behavior.
 
-The planned polling, observer wake-up, batching, participation policy, personality loading, saved context, pause/resume, destination-switch recovery, and bounded NVIDIA retry policy still require implementation and end-to-end verification. Messenger's rendered structure can change, so verification should exercise the production path and preserve the send-outcome distinction.
+Messenger's rendered structure can change, so verification should exercise the production path and preserve the send-outcome distinction. Live smoke testing remains the repository owner's step for confirming real conversation quality, delivery behavior, and NVIDIA response characteristics.

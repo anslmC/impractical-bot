@@ -18,6 +18,11 @@ import type { BackreadMessage } from '../components/backread.js';
 const NVIDIA_CHAT_COMPLETIONS_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
 const NVIDIA_CHAT_COMPLETIONS_MODEL = 'nvidia/nemotron-3.5-lightning-30b-a3b';
 const DEFAULT_REQUEST_TIMEOUT_MS = 50_000;
+// A Messenger reply is a chat message, not an essay: cap the completion so a
+// runaway generation cannot ramble, and so a slow response cannot widen the
+// window in which another reply is generated for the same trigger.
+const REPLY_MAX_TOKENS = 256;
+const VALIDATION_MAX_TOKENS = 4096;
 const DEFAULT_SYSTEM_INSTRUCTION = 'Write a short, natural Messenger reply that matches the conversation\'s tone and directly addresses the latest incoming message. Aim for roughly 3–12 words when appropriate, but do not force an exact word count; use more words when needed for a natural answer. Avoid unsolicited email copy, calls to action, headings, labels, and unrelated prefixes such as "Verse 3.1". Return only the reply text. This reply is a proposal until the application sends it.';
 
 export type NvidiaApiKeyErrorKind = 'authentication' | 'network' | 'service';
@@ -188,7 +193,7 @@ export async function validateNvidiaApiKey(
         model: NVIDIA_CHAT_COMPLETIONS_MODEL,
         messages: [{ role: 'user', content: 'Reply with OK.' }],
         chat_template_kwargs: { enable_thinking: false  },
-        max_tokens: 4096,
+        max_tokens: VALIDATION_MAX_TOKENS,
         stream: false,
       }),
       signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS),
@@ -253,10 +258,13 @@ export async function generateNvidiaReply(
     throw new NvidiaApiKeyError('authentication', 'The NVIDIA API key is empty or malformed.');
   }
 
+  // One API turn per Messenger message keeps speaker attribution and turn
+  // boundaries intact: every incoming message is a user turn prefixed with its
+  // sender, and every outgoing message is an assistant turn (the bot's own post).
+  // Messages are never merged or repeated.
   const conversationMessages: { role: 'user' | 'assistant'; content: string }[] = [];
-  let latestIncomingMessage: string | undefined;
   for (const message of messages) {
-    if (message.direction === 'UNKNOWN') {
+    if (message.direction !== 'INCOMING' && message.direction !== 'OUTGOING') {
       continue;
     }
     const content = message.message.trim();
@@ -264,28 +272,31 @@ export async function generateNvidiaReply(
       continue;
     }
     const isIncoming = message.direction === 'INCOMING';
-    const sender = message.sender !== 'UNKNOWN' ? `${message.sender}: ` : '';
-    const formattedContent = isIncoming ? `${sender}${content}` : content;
-    const role = isIncoming ? 'user' : 'assistant';
-    const previousMessage = conversationMessages.at(-1);
-    if (previousMessage?.role === role) {
-      previousMessage.content += `\n${formattedContent}`;
-    } else {
-      conversationMessages.push({ role, content: formattedContent });
-    }
-    if (isIncoming) {
-      latestIncomingMessage = formattedContent;
-    }
+    const senderName = typeof message.sender === 'string' ? message.sender.trim() : '';
+    const sender = isIncoming && senderName && senderName !== 'UNKNOWN'
+      ? `${senderName}: `
+      : '';
+    conversationMessages.push({
+      role: isIncoming ? 'user' : 'assistant',
+      content: `${sender}${content}`,
+    });
   }
   if (conversationMessages.length === 0) {
     throw new Error('No usable Messenger messages are available to generate a reply.');
   }
-  if (!latestIncomingMessage) {
+  let latestIncomingIndex = -1;
+  for (let index = conversationMessages.length - 1; index >= 0; index -= 1) {
+    if (conversationMessages[index].role === 'user') {
+      latestIncomingIndex = index;
+      break;
+    }
+  }
+  if (latestIncomingIndex === -1) {
     throw new Error('No incoming Messenger messages are available to generate a reply.');
   }
-  if (conversationMessages.at(-1)?.role === 'assistant') {
-    conversationMessages.push({ role: 'user', content: latestIncomingMessage });
-  }
+  // Trailing assistant turns are replies that the current reply supersedes; the
+  // request must end with the message being answered, without restating it twice.
+  const requestMessages = conversationMessages.slice(0, latestIncomingIndex + 1);
 
   let response: Response;
   try {
@@ -302,10 +313,10 @@ export async function generateNvidiaReply(
             role: 'system',
             content: options.systemInstruction ?? DEFAULT_SYSTEM_INSTRUCTION,
           },
-          ...conversationMessages,
+          ...requestMessages,
         ],
         chat_template_kwargs: { enable_thinking: false },
-        max_tokens: 4096,
+        max_tokens: REPLY_MAX_TOKENS,
         stream: false,
       }),
       signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS),

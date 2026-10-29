@@ -1,16 +1,16 @@
 # impractical-bot
 
-A local Node.js CLI for a safety-conscious Facebook Messenger bot. The project has a working browser/CLI foundation and a proven one-shot message pipeline; its next milestone is a persistent, decision-driven conversation engine.
+A local Node.js CLI for a safety-conscious Facebook Messenger bot. The project has a working browser/CLI foundation and an implemented M2 conversation engine that observes messages, answers explicitly incoming mentions, and participates through a temperament-driven RNG path.
 
 ## Current Status
 
-Production code validates the NVIDIA API key, launches and prepares the configured browser, handles login and Messenger startup challenges, reads rendered conversation messages, generates a reply, and uses the tested composer to attempt a send. The current `start` flow runs that pipeline once and then waits for shutdown; it is not yet a continuous conversation engine. A composer click is not confirmation of delivery.
+Production code validates the NVIDIA API key, launches and prepares the configured browser, handles login and Messenger startup challenges, seeds context from Backread, and runs the continuous Combustion engine: it polls rendered messages, answers explicitly incoming mentions through FIFO packets, may participate through the RNG path, and uses the tested composer for one send attempt per reply. A composer click is not confirmation of delivery.
 
-JavaScript scripts in `Tools/` are independent experiments, not production modules or automated tests. Brave, Google Chrome, and Microsoft Edge are supported targets; Firefox is out of scope. See [ARCHITECTURE.md](ARCHITECTURE.md) for the implemented/proven boundary and the planned M2 behavior.
+JavaScript scripts in `Tools/` are independent experiments, not production modules or automated tests. Brave, Google Chrome, and Microsoft Edge are supported targets; Firefox is out of scope. See [ARCHITECTURE.md](ARCHITECTURE.md) for the implemented M2 pipeline and its proven boundary.
 
 ## Intended Operation
 
-The application is a local Node.js CLI that launches a dedicated profile and connects Playwright through a loopback-only CDP endpoint. It tracks ownership of the browser process it launches and must not terminate unrelated browser instances. These browser and lifecycle foundations are implemented; continuous observation and reply decisions remain planned.
+The application is a local Node.js CLI that launches a dedicated profile and connects Playwright through a loopback-only CDP endpoint. It tracks ownership of the browser process it launches and must not terminate unrelated browser instances. These browser and lifecycle foundations are implemented, as are continuous observation and the mention and RNG reply decisions.
 
 ## Prerequisites
 
@@ -38,6 +38,6 @@ The configuration is stored under `%LOCALAPPDATA%\Impractical Bot` on Windows by
 - **M2 — Ignition + Running:** transition from the proven one-shot pipeline to a persistent, decision-driven conversation engine.
 - **M3 — Hardening & Polishing**
 
-The M2 development stages are fresh-message detection, batching and decisions, the continuous loop, lifecycle and recovery, and end-to-end testing. These are implementation stages within M2, not additional official milestones. M2 target behavior is planned and not yet implemented or verified.
+The M2 development stages are fresh-message detection, batching and decisions, the continuous loop, lifecycle and recovery, and end-to-end testing. These are implementation stages within M2, not additional official milestones. M2 behavior is implemented and covered by offline tests; live Messenger conversation quality still requires smoke verification.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the M2 flow, lifecycle rules, and safety principles.
