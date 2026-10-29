@@ -1100,7 +1100,10 @@ export async function startCombustion({
     observerAttached = true;
 
     const baseline = await readLatestMessages();
-    seenMessageIds = new Set(baseline.map(message => message.messageId).filter(Boolean));
+    seenMessageIds = new Set([
+      ...contextStore.getState().messageIds,
+      ...baseline.map(message => message.messageId).filter(Boolean),
+    ]);
     console.log(
       `${styled('Baseline recorded:', 'cyan')} ` +
       `${styled(String(seenMessageIds.size), 'bold')} unique message IDs.`,

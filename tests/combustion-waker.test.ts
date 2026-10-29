@@ -428,6 +428,49 @@ test('A Sent status suffix does not stop polling or duplicate the message', asyn
   }
 });
 
+test('A seeded context message outside the baseline is not treated as new', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
+  const originalRandom = Math.random;
+  const originalLog = console.log;
+  const logs: string[] = [];
+  Math.random = () => 0.99;
+  console.log = (...values: unknown[]) => {
+    logs.push(values.map(String).join(' '));
+  };
+  const wakerPage = createWakerPage();
+  const contextStore = createContextStore();
+  contextStore.add([{ messageId: 'seeded-historical', message: 'hello' }]);
+  const controller = await startCombustion({
+    page: wakerPage.page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    wakerPage.appendMessage('seeded-historical', 'hello');
+    context.mock.timers.tick(3_000);
+    await flush();
+
+    assert.ok(logs.some(message =>
+      message.includes('[poll] Poll: 0 new messages checked; 0 mention detected.'),
+    ), logs.join('\n'));
+    assert.equal(
+      logs.some(message =>
+        message.includes('New message:') && message.includes('id=seeded-historical'),
+      ),
+      false,
+    );
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    console.log = originalLog;
+    context.mock.timers.reset();
+  }
+});
+
 test('A genuine same-ID content conflict still stops Combustion', async context => {
   context.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
   const originalRandom = Math.random;

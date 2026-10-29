@@ -188,7 +188,7 @@ const profileDialog = {
 };
 const stubPage = {
   getByRole: (role: string, options: { name: string }) => {
-    if (role === 'button' && options.name === 'Your profile') return profileButton;
+    if (role === 'button' && options.name === 'Account, your profile') return profileButton;
     if (role === 'dialog' && options.name === 'Your profile') return profileDialog;
     throw new Error(`Unexpected role lookup: ${role} ${options.name}`);
   },

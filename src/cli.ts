@@ -353,7 +353,7 @@ function isValidPuppetName(value: unknown): value is string {
 }
 
 async function retrievePuppetName(page: Page): Promise<string> {
-  const profileButton = page.getByRole('button', { name: 'Your profile', exact: true });
+  const profileButton = page.getByRole('button', { name: 'Account, your profile', exact: true });
   if (await profileButton.count() !== 1 || !await profileButton.isVisible() ||
       !await profileButton.isEnabled()) {
     throw new Error('The visible Your profile button was not uniquely available.');
