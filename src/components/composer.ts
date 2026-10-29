@@ -1,4 +1,16 @@
 import type { Page } from 'playwright';
+import { formatTerminalText, type TerminalStyle } from './terminal-formatting.js';
+
+const styled = formatTerminalText;
+
+function formatComposeLog(stage: string, style: TerminalStyle = 'dim', details = ''): string {
+  return `${styled('[compose]', 'cyan')} ${styled(`stage=${stage}`, style)}` +
+    (details ? ` ${details}` : '');
+}
+
+function formatComposeField(name: string, value: string | number, style: TerminalStyle = 'dim'): string {
+  return `${styled(`${name}=`, 'dim')}${styled(String(value), style)}`;
+}
 
 export type ReplyCompositionResult =
   | { status: 'sent' }
@@ -51,7 +63,7 @@ export async function composeMessengerReply(
 ): Promise<ReplyCompositionResult> {
   const pageIdentity = describePage(page);
   const documentState = await describeDocumentState(page);
-  console.log(`[compose] stage=start page=${pageIdentity} ${documentState}`);
+  console.log(`${formatComposeLog('start', 'bold')}\n  ${formatComposeField('page', pageIdentity)} ${styled(documentState, 'dim')}`);
   const visibleTextboxes = page.locator(
     '[role="textbox"][contenteditable="true"]:visible',
   );
@@ -71,7 +83,11 @@ export async function composeMessengerReply(
     strategy = 'lexical';
   } else if (textboxCount === 0) {
     console.log(
-      `[compose] stage=locator-failed textboxes=${textboxCount} lexical=${lexicalCount}`,
+      formatComposeLog(
+        'locator-failed',
+        'red',
+        `${formatComposeField('textboxes', textboxCount)} ${formatComposeField('lexical', lexicalCount)}`,
+      ),
     );
     throw new Error(
       'No visible Facebook Messages composer matched role="textbox" and ' +
@@ -79,7 +95,11 @@ export async function composeMessengerReply(
     );
   } else {
     console.log(
-      `[compose] stage=locator-failed textboxes=${textboxCount} lexical=${lexicalCount}`,
+      formatComposeLog(
+        'locator-failed',
+        'red',
+        `${formatComposeField('textboxes', textboxCount)} ${formatComposeField('lexical', lexicalCount)}`,
+      ),
     );
     throw new Error(
       `Composer locator is ambiguous: ${textboxCount} visible editable ` +
@@ -88,26 +108,36 @@ export async function composeMessengerReply(
   }
 
   console.log(
-    `[compose] stage=fill-start strategy=${strategy} textboxes=${textboxCount} ` +
-    `lexical=${lexicalCount} chars=${reply.length}`,
+    formatComposeLog(
+      'fill-start',
+      'dim',
+      `${formatComposeField('strategy', strategy)} ${formatComposeField('textboxes', textboxCount)} ` +
+      `${formatComposeField('lexical', lexicalCount)} ${formatComposeField('chars', reply.length, 'bold')}`,
+    ),
   );
   try {
     await composer.fill(reply);
   } catch (error) {
-    console.log(`[compose] stage=fill-failed error=${describeError(error)}`);
+    console.log(
+      `${formatComposeLog('fill-failed', 'red')}\n  ` +
+      `${formatComposeField('error', describeError(error), 'red')}`,
+    );
     throw error;
   }
-  console.log('[compose] stage=fill-complete');
+  console.log(formatComposeLog('fill-complete', 'green'));
   const composerRegions = page.locator('[aria-label="Thread composer"]');
   const composerRegionCount = await composerRegions.count();
   if (composerRegionCount === 0) {
-    console.log('[compose] stage=send-control-failed reason=composer-region-missing');
+    console.log(formatComposeLog('send-control-failed', 'red', 'reason=composer-region-missing'));
     return { status: 'send-blocked', reason: 'composer-region-missing' };
   }
   if (composerRegionCount !== 1) {
     console.log(
-      `[compose] stage=send-control-failed reason=composer-region-ambiguous ` +
-      `regions=${composerRegionCount}`,
+      formatComposeLog(
+        'send-control-failed',
+        'red',
+        `reason=composer-region-ambiguous ${formatComposeField('regions', composerRegionCount)}`,
+      ),
     );
     return { status: 'send-blocked', reason: 'composer-region-ambiguous' };
   }
@@ -116,40 +146,53 @@ export async function composeMessengerReply(
   );
   const sendButtonCount = await sendButtons.count();
   if (sendButtonCount === 0) {
-    console.log('[compose] stage=send-control-failed reason=send-control-missing');
+    console.log(formatComposeLog('send-control-failed', 'red', 'reason=send-control-missing'));
     return { status: 'send-blocked', reason: 'send-control-missing' };
   }
   if (sendButtonCount !== 1) {
     console.log(
-      `[compose] stage=send-control-failed reason=send-control-ambiguous ` +
-      `buttons=${sendButtonCount}`,
+      formatComposeLog(
+        'send-control-failed',
+        'red',
+        `reason=send-control-ambiguous ${formatComposeField('buttons', sendButtonCount)}`,
+      ),
     );
     return { status: 'send-blocked', reason: 'send-control-ambiguous' };
   }
   if (!await sendButtons.isVisible()) {
-    console.log('[compose] stage=send-control-failed reason=hidden');
+    console.log(formatComposeLog('send-control-failed', 'red', 'reason=hidden'));
     return { status: 'send-blocked', reason: 'hidden' };
   }
   if (!await sendButtons.isEnabled()) {
-    console.log('[compose] stage=send-control-failed reason=disabled');
+    console.log(formatComposeLog('send-control-failed', 'red', 'reason=disabled'));
     return { status: 'send-blocked', reason: 'disabled' };
   }
 
-  console.log('[compose] stage=send-control-ready reason=visible-and-enabled');
+  console.log(formatComposeLog('send-control-ready', 'green', 'reason=visible-and-enabled'));
   if (beforeSend) {
     try {
       await beforeSend();
     } catch (error) {
-      console.log(`[compose] stage=send-gate-failed error=${describeError(error)}`);
+      console.log(
+        `${formatComposeLog('send-gate-failed', 'red')}\n  ` +
+        `${formatComposeField('error', describeError(error), 'red')}`,
+      );
       throw error;
     }
   }
   try {
     await sendButtons.click();
   } catch (error) {
-    console.log(`[compose] stage=click-failed error=${describeError(error)}`);
+    console.log(
+      `${formatComposeLog('click-failed', 'red')}\n  ` +
+      `${formatComposeField('error', describeError(error), 'red')}`,
+    );
     throw error;
   }
-  console.log('[compose] stage=click-complete delivery=unconfirmed');
+  console.log(formatComposeLog(
+    'click-complete',
+    'green',
+    `delivery=${styled('unconfirmed', 'yellow')}`,
+  ));
   return { status: 'sent' };
 }

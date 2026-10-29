@@ -1,8 +1,25 @@
 import type { PauseGate } from './pause-gate.js';
+import { formatTerminalText, type TerminalStyle } from './terminal-formatting.js';
 
 const DEBUG_RELIABILITY_WARNING =
   'Packet processing failed. IMPRACTICAL_BOT_DEBUG=1 bypasses key validation; ' +
   'rerun without debug mode to verify real reliability.';
+
+const styled = formatTerminalText;
+
+function packetPrefix(packetId: string): string {
+  return `${styled('[packet ', 'cyan')}${styled(packetId, 'bold')}${styled(']', 'cyan')}`;
+}
+
+function formatPacketStage(
+  packetId: string,
+  stage: string,
+  details = '',
+  style: TerminalStyle = 'dim',
+): string {
+  return `${packetPrefix(packetId)} ${styled(`stage=${stage}`, style)}` +
+    (details ? ` ${details}` : '');
+}
 
 export interface ProcessablePacket<Message = unknown> {
   packetId?: string;
@@ -83,23 +100,32 @@ export function createPacketProcessor<
   return async packet => {
     const packetId = packet?.packetId ?? 'unknown';
     let stage = 'reply-generation';
-    console.log(`[packet ${packetId}] stage=start messages=${(packet.contextMessages?.length ?? 0) + (packet.newMessages?.length ?? 0)}`);
+    console.log(`\n${formatPacketStage(
+      packetId,
+      'start',
+      `messages=${(packet.contextMessages?.length ?? 0) + (packet.newMessages?.length ?? 0)}`,
+      'bold',
+    )}`);
     try {
       const messages = [
         ...(packet.contextMessages ?? []),
         ...(packet.newMessages ?? []),
       ];
-      console.log(`[packet ${packetId}] stage=reply-generation-start`);
+      console.log(formatPacketStage(packetId, 'reply-generation-start'));
       const reply = await generateReply(apiKey, messages);
       console.log(
-        `[packet ${packetId}] stage=reply-generation-complete ` +
-        `chars=${typeof reply === 'string' ? reply.length : 'unknown'}`,
+        formatPacketStage(
+          packetId,
+          'reply-generation-complete',
+          `chars=${styled(String(typeof reply === 'string' ? reply.length : 'unknown'), 'bold')}`,
+          'green',
+        ),
       );
       stage = 'composition';
       assertPacketCurrent(isCurrent, packet);
       await waitForPacketWork(pauseGate);
       assertPacketCurrent(isCurrent, packet);
-      console.log(`[packet ${packetId}] stage=composition-start`);
+      console.log(formatPacketStage(packetId, 'composition-start'));
       const composition = await composeReply(
         page,
         reply,
@@ -113,14 +139,23 @@ export function createPacketProcessor<
           : undefined,
       );
       console.log(
-        `[packet ${packetId}] stage=composition-returned ` +
-        `status=${String(composition?.status ?? 'unknown')}`,
+        formatPacketStage(
+          packetId,
+          'composition-returned',
+          `status=${styled(String(composition?.status ?? 'unknown'), composition?.status === 'sent' ? 'green' : 'yellow')}`,
+          composition?.status === 'sent' ? 'green' : 'yellow',
+        ),
       );
       if (composition?.status !== 'sent') {
         const reason = composition?.reason ?? composition?.status ?? 'unknown';
         throw new Error(`Composer send blocked: ${reason}.`);
       }
-      console.log(`[packet ${packetId}] stage=complete status=sent delivery=unconfirmed`);
+      console.log(formatPacketStage(
+        packetId,
+        'complete',
+        `status=${styled('sent', 'green')} delivery=${styled('unconfirmed', 'yellow')}`,
+        'green',
+      ));
       return composition;
     } catch (error) {
       const details = error instanceof Error
@@ -130,12 +165,12 @@ export function createPacketProcessor<
         ? details.replaceAll(apiKey, '[REDACTED]')
         : details;
       logError(
-        `[packet ${packetId}] stage=${stage}-failed ` +
-        `error=${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}`,
+        `${packetPrefix(packetId)} ${styled(`stage=${stage}-failed`, 'red')} ` +
+        `error=${styled(error instanceof Error ? `${error.name}: ${error.message}` : String(error), 'red')}`,
       );
-      logError(`[packet ${packetId}] Processing failed: ${safeDetails}`);
+      logError(`${packetPrefix(packetId)} ${styled('Processing failed:', 'red')} ${styled(safeDetails, 'red')}`);
       if (debugMode) {
-        logWarning(DEBUG_RELIABILITY_WARNING);
+        logWarning(styled(DEBUG_RELIABILITY_WARNING, 'yellow'));
       }
       throw error;
     }

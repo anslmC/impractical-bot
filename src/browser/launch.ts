@@ -4,6 +4,11 @@ import { mkdir } from 'node:fs/promises';
 import { win32 } from 'node:path';
 import { chromium, type Browser, type ConnectOverCDPOptions, type Locator, type Page } from 'playwright';
 import { validateConfiguration, type Configuration } from '../config/configuration.js';
+import {
+  formatTerminalDiagnostic,
+  formatTerminalMilestone,
+  formatTerminalText,
+} from '../components/terminal-formatting.js';
 
 export interface BrowserProcessHandle {
   readonly pid?: number;
@@ -313,6 +318,16 @@ const DEFAULT_LOGIN_TIMEOUT_MS = 1_800_000;
 const DEFAULT_PIN_PROMPT_TIMEOUT_MS = 8_000;
 const DEFAULT_READINESS_TIMEOUT_MS = 20_000;
 
+function startupStatus(message: string, style: 'dim' | 'green' | 'yellow' | 'cyan' = 'dim'): string {
+  return `  ${formatTerminalText(message, style)}`;
+}
+
+function logStartupDiagnostic(message: string): void {
+  if (process.env.IMPBOT_DEBUG === '1') {
+    console.log(formatTerminalDiagnostic(`DEBUG: ${message}`));
+  }
+}
+
 async function areLoginIndicatorsVisible(indicators: Locator[]): Promise<boolean> {
   return (await Promise.all(indicators.map(indicator => indicator.isVisible()))).every(Boolean);
 }
@@ -420,7 +435,7 @@ async function handlePinRestoration(
   pinPromptTimeoutMs: number,
 ): Promise<void> {
   if (configuration.skipPinRestoration) {
-    console.log('Challenge 1: PIN restoration is disabled; skipping restoration.');
+    console.log(startupStatus('Challenge 1: PIN restoration is disabled; skipping restoration.', 'yellow'));
     await closePinDialogForSkip(pinDialog);
     const confirmation = page.locator(PIN_CONFIRMATION_SELECTOR);
     await confirmation.waitFor({ state: 'visible', timeout: pinPromptTimeoutMs });
@@ -463,7 +478,7 @@ async function handlePinRestoration(
     }
 
     const pinInput = pinInputs.first();
-  console.log('Challenge 1: entering the configured PIN to restore chats.');
+    console.log(startupStatus('Challenge 1: entering the configured PIN to restore chats.', 'cyan'));
     await pinInput.fill(configuration.pin, { timeout: 5_000 });
     let outcome = await waitForPinOutcome(page, pinDialog, 2_000);
     if (outcome === 'rejected' || await page.getByText(PIN_REJECTION_MESSAGE, { exact: true }).isVisible()) {
@@ -495,10 +510,15 @@ async function dismissNotificationDialog(page: Page): Promise<void> {
     exact: true,
   });
   if (!await dialog.isVisible()) {
-    console.log(`Challenge 0: no visible "${NOTIFICATION_DIALOG_NAME}" dialog; continuing.`);
+    console.log(startupStatus(
+      `Challenge 0: no visible "${NOTIFICATION_DIALOG_NAME}" dialog; continuing.`,
+    ));
     return;
   }
-  console.log(`Challenge 0: visible alert dialog found: ${NOTIFICATION_DIALOG_NAME}.`);
+  console.log(startupStatus(
+    `Challenge 0: visible alert dialog found: ${NOTIFICATION_DIALOG_NAME}.`,
+    'yellow',
+  ));
 
   const closeButton = dialog.getByRole('button', { name: 'Close', exact: true });
   if (await closeButton.count() !== 1) {
@@ -517,7 +537,7 @@ async function dismissNotificationDialog(page: Page): Promise<void> {
   if (await dialog.isVisible()) {
     throw new Error('The push-notification dialog remains visible after clicking Close.');
   }
-  console.log('Challenge 0: notification dialog dismissed.');
+  console.log(startupStatus('Challenge 0: notification dialog dismissed.', 'green'));
 }
 
 async function waitForConfiguredConversation(
@@ -664,27 +684,31 @@ export async function prepareConfiguredBrowser(
     facebookPages = getFacebookPages(browser);
   }
   const page = selectFacebookPage(facebookPages, destinationUrl);
+  console.log(formatTerminalMilestone('CONVERSATION', 'Verifying configured conversation.'));
   const currentPageUrl = new URL(page.url());
   const alreadyAtConfiguredConversation = isFacebookUrl(currentPageUrl) &&
     currentPageUrl.origin === destinationUrl.origin &&
     conversationId(currentPageUrl) === expectedConversationId;
-  console.log(`DEBUG: alreadyAtConfiguredConversation=${alreadyAtConfiguredConversation}`);
+  logStartupDiagnostic(`alreadyAtConfiguredConversation=${alreadyAtConfiguredConversation}`);
   if (!alreadyAtConfiguredConversation) {
     await waitForSuccessLogin(facebookPages, options.loginTimeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS);
-    console.log(`DEBUG: navigating to ${destinationUrl.href}`);
+    logStartupDiagnostic(`navigating to ${destinationUrl.href}`);
     await page.goto(destinationUrl.href, {
       waitUntil: 'domcontentloaded',
       timeout: options.navigationTimeoutMs ?? 30_000,
     });
   } else {
-    console.log('DEBUG: skipping conversation navigation');
+    logStartupDiagnostic('skipping conversation navigation');
   }
   await waitForConfiguredConversation(
     page,
     expectedConversationId,
     options.readinessTimeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS,
   );
-  console.log(`Configured conversation ${expectedConversationId} verified after navigation.`);
+  console.log(startupStatus(
+    `Configured conversation ${expectedConversationId} verified after navigation.`,
+    'green',
+  ));
 
   const composers = page.locator('[role="textbox"][contenteditable="true"]:visible');
   try {
@@ -696,6 +720,7 @@ export async function prepareConfiguredBrowser(
     throw new Error('A visible conversation composer did not become available.');
   }
 
+  console.log(formatTerminalMilestone('CHALLENGES', 'Checking startup dialogs.'));
   await dismissNotificationDialog(page);
 
   const pinHeading = page.getByRole('heading', { name: PIN_DIALOG_HEADING, exact: true });
@@ -721,9 +746,12 @@ export async function prepareConfiguredBrowser(
   } else if (await pinHeading.filter({ visible: true }).count() > 0) {
     throw new Error('The PIN heading is visible but is not inside one identifiable modal dialog.');
   } else {
-    console.log(`Challenge 1: no visible PIN restoration dialog headed "${PIN_DIALOG_HEADING}"; continuing.`);
+    console.log(startupStatus(
+      `Challenge 1: no visible PIN restoration dialog headed "${PIN_DIALOG_HEADING}"; continuing.`,
+    ));
   }
 
+  console.log(formatTerminalMilestone('FINAL VERIFICATION', 'Confirming startup readiness.'));
   const notificationVisible = await page.getByRole('alertdialog', {
     name: NOTIFICATION_DIALOG_NAME,
     exact: true,
@@ -739,7 +767,10 @@ export async function prepareConfiguredBrowser(
       `PIN skip-confirmation dialog: ${confirmationVisible ? 'yes' : 'no'}).`,
     );
   }
-  console.log('Final verification: notification and PIN restoration dialogs are no longer visible.');
+  console.log(startupStatus(
+    'Final verification: notification and PIN restoration dialogs are no longer visible.',
+    'green',
+  ));
 
   if (await composers.count() === 0 || !await composers.first().isEnabled()) {
     throw new Error('The conversation composer is not ready.');
@@ -747,7 +778,10 @@ export async function prepareConfiguredBrowser(
   if (page.isClosed() || conversationId(new URL(page.url())) !== expectedConversationId) {
     throw new Error('The final page is not the configured Messenger conversation.');
   }
-  console.log(`Final verification: configured conversation ${expectedConversationId} is still selected.`);
+  console.log(startupStatus(
+    `Final verification: configured conversation ${expectedConversationId} is still selected.`,
+    'green',
+  ));
   return page;
 }
 

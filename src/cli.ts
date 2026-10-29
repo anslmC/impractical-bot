@@ -52,6 +52,11 @@ import {
 import { getPersonalityInstruction } from './components/personality.js';
 import { generateAliases } from './components/alias-engine.js';
 import {
+  formatTerminalDiagnostic,
+  formatTerminalMilestone,
+  formatTerminalText,
+} from './components/terminal-formatting.js';
+import {
   startCombustion,
   type CombustionController,
 } from './components/combustion.js';
@@ -108,7 +113,7 @@ Commands:
   init     Initialize impractical-bot
   config   Configure impractical-bot
   changebrowser  Change the configured browser
-  changegcUrl  Change the message destination
+  changemsgUrl  Change the message destination
   setbottemp  Set the bot temperament
   setpersonality  Set the bot personality
   updatekey  Replace the NVIDIA API key
@@ -195,9 +200,12 @@ function getSafeNvidiaError(error: unknown, fallback: string): string {
 
 function writeBackreadResult(result: BackreadResult, writeOutput: Output): void {
   for (const diagnostic of result.diagnostics) {
-    writeOutput(diagnostic);
+    writeOutput(formatTerminalDiagnostic(diagnostic));
   }
-  writeOutput(`Retrieved ${result.messages.length} messages; expected 30.`);
+  writeOutput(formatTerminalMilestone(
+    'BACKREAD',
+    `Retrieved ${result.messages.length} messages; expected 30.`,
+  ));
 }
 
 async function ensureNvidiaApiKey(
@@ -381,10 +389,11 @@ async function updatePuppetName(
   try {
     puppetName = await retrievePuppetName(page);
   } catch (error) {
-    writeOutput(
+    writeOutput(formatTerminalText(
       'Puppet account name retrieval failed; keeping the existing configured value. ' +
       `${error instanceof Error ? error.message : 'Unknown retrieval error.'}`,
-    );
+      'yellow',
+    ));
     return;
   }
 
@@ -678,7 +687,7 @@ async function handleChangeBrowser(
   return 0;
 }
 
-async function handleChangeGcUrl(
+async function handleChangeMsgUrl(
   writeOutput: Output,
   writeError: Output,
   configurationFilePath: string | undefined,
@@ -1022,6 +1031,7 @@ async function handleStart(
     writeError('NVIDIA API key is missing. Run `impbot init` or `impbot updatekey` first.');
     return 1;
   }
+  writeOutput(formatTerminalMilestone('STARTUP', 'Verifying browser configuration.'));
   try {
     await (runtime.checkBrowserStartup ?? assertConfiguredBrowserCanStart)(
       configurationResult.configuration,
@@ -1030,6 +1040,7 @@ async function handleStart(
     writeError(`Unable to start browser: ${error instanceof Error ? error.message : String(error)}`);
     return 1;
   }
+  writeOutput(formatTerminalMilestone('BROWSER', 'Browser configuration verified.'));
   if (!DEBUG_MODE || ENABLE_DEBUG_AUTO_RESPONSE) {
     try {
       await (runtime.validateNvidiaApiKey ?? validateNvidiaApiKey)(apiKey);
@@ -1037,9 +1048,12 @@ async function handleStart(
       writeError(getSafeNvidiaError(error, 'Unable to validate the NVIDIA API key.'));
       return 1;
     }
-    writeOutput('NVIDIA API key validated successfully.');
+    writeOutput(formatTerminalMilestone('STARTUP', 'NVIDIA API key validated successfully.'));
   } else {
-    writeOutput('Debug mode enabled; skipping NVIDIA API key validation.');
+    writeOutput(formatTerminalMilestone(
+      'STARTUP',
+      'Debug mode enabled; skipping NVIDIA API key validation.',
+    ));
   }
 
   type ShutdownSource = 'sigint' | 'runtime-control' | 'injected';
@@ -1285,6 +1299,7 @@ async function handleStart(
   let startupStage: 'launch' | 'prepare' | 'cranking' | 'combustion' = 'launch';
 
   try {
+    writeOutput(formatTerminalMilestone('BROWSER', 'Launching browser session.'));
     const launchPromise = (runtime.launchBrowser ?? launchConfiguredBrowser)(configurationResult.configuration);
     const launchResult = await Promise.race([
       launchPromise.then(
@@ -1303,10 +1318,11 @@ async function handleStart(
     } else {
       session = launchResult.session;
       startupStage = 'prepare';
-      writeOutput(
+      writeOutput(formatTerminalMilestone(
+        'BROWSER',
         `${session.reusedExistingBrowser ? 'Attached to existing browser' : 'Browser launched and connected'} ` +
         `(${session.browserVersion}).`,
-      );
+      ));
       const preparationResult = await Promise.race([
         session.prepare().then(page => ({ type: 'ready' as const, page })),
         shutdownPromise.then(source => ({ type: 'shutdown' as const, source })),
@@ -1318,6 +1334,7 @@ async function handleStart(
       } else if (preparationResult.type === 'disconnected') {
         throw new Error('The browser disconnected during startup preparation.');
       } else {
+        writeOutput(formatTerminalMilestone('CRANKING', 'Preparing Messenger context.'));
         await updatePuppetName(
           preparationResult.page,
           configurationResult.configuration,
@@ -1329,10 +1346,11 @@ async function handleStart(
           throw new Error('A configured puppet name is required to initialize the alias engine.');
         }
         aliasData = generateAliases(puppetName);
-        writeOutput(
+        writeOutput(formatTerminalMilestone(
+          'ALIASES',
           `DEBUG: Alias engine initialized for puppet name ${JSON.stringify(puppetName)} ` +
           `(${aliasData.valids.length} aliases).`,
-        );
+        ));
         try {
           if (await session.isWindowMinimized?.(preparationResult.page)) {
             writeOutput('WARNING: Browser is minimized. Backread may collect fewer messages than expected.');
@@ -1342,6 +1360,7 @@ async function handleStart(
         }
         startupStage = 'cranking';
         let backread: BackreadResult;
+        writeOutput(formatTerminalMilestone('BACKREAD', 'Reading historical Messenger messages.'));
         try {
           backread = await (runtime.readMessengerMessages ?? readMessengerMessages)(
             preparationResult.page,
@@ -1363,7 +1382,10 @@ async function handleStart(
           throw new Error('Unable to seed historical message context.');
         }
         writeBackreadResult(backread, writeOutput);
-        writeOutput(`Historical context seeded: ${contextStore.getState().size} messages.`);
+        writeOutput(formatTerminalMilestone(
+          'CONTEXT',
+          `Historical context seeded: ${contextStore.getState().size} messages.`,
+        ));
 
         if (ENABLE_DEBUG_AUTO_RESPONSE) {
           let reply: string | undefined;
@@ -1407,7 +1429,10 @@ async function handleStart(
           debugMode: DEBUG_MODE,
         });
         runtimeControl.setState('running');
-        writeOutput(`Engine ready at ${configurationResult.configuration.messageDestination}.`);
+        writeOutput(formatTerminalMilestone(
+          'READY',
+          `Engine ready at ${configurationResult.configuration.messageDestination}.`,
+        ));
         const runtimeResult = await Promise.race([
           shutdownPromise.then(source => ({ type: 'shutdown' as const, source })),
           session.disconnected.then(() => 'disconnected' as const),
@@ -1632,7 +1657,7 @@ export async function runCli(
       prompt,
       runtime,
     ),
-    changegcUrl: () => handleChangeGcUrl(
+    changemsgUrl: () => handleChangeMsgUrl(
       writeOutput,
       writeError,
       configurationFilePath,

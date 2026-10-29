@@ -362,6 +362,9 @@ test('RNG decisions use the configured temperament and update without restarting
   try {
     context.mock.timers.tick(15_000);
     await flush();
+    assert.ok(logs.some(message => message.includes('[poll] Poll: 0 new messages checked; 0 mention detected.')));
+    assert.ok(logs.some(message => message.includes('[rng] Evaluating cycle')));
+    assert.ok(logs.some(message => message.includes('[rng] Skipped: no usable incoming Messenger message')));
     assert.ok(logs.some(message => message.includes('Roll: YES (85% chance)')));
 
     controller.setTemperament('quiet');

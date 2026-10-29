@@ -8,6 +8,28 @@ import { createPacketScheduler } from '../src/components/packet-scheduler.js';
 import { createPauseGate } from '../src/components/pause-gate.js';
 import { getDefaultPersonalityInstruction, getDefaultBehavioralInstruction, getPersonalityInstruction } from '../src/components/personality.js';
 import { buildRngPacket } from '../src/components/rng-packet-builder.js';
+import { formatPollSummary, formatTerminalText } from '../src/components/terminal-formatting.js';
+
+test('terminal text formatting respects TTY, NO_COLOR, and TERM=dumb', () => {
+  assert.equal(formatTerminalText('poll', 'cyan', { isTTY: false }), 'poll');
+  assert.equal(formatTerminalText('poll', 'cyan', { isTTY: true, noColor: true }), 'poll');
+  assert.equal(formatTerminalText('poll', 'cyan', { isTTY: true, term: 'dumb' }), 'poll');
+  assert.equal(
+    formatTerminalText('poll', 'cyan', { isTTY: true, noColor: false, term: 'xterm' }),
+    '\u001b[36mpoll\u001b[0m',
+  );
+});
+
+test('poll summaries keep idle polls visible and emphasize activity', () => {
+  assert.equal(
+    formatPollSummary(0, 0, { isTTY: false }),
+    '  [poll] Poll: 0 new messages checked; 0 mention detected.',
+  );
+  assert.equal(
+    formatPollSummary(2, 1, { isTTY: false }),
+    '\n[poll] Poll: 2 new messages checked; 1 mention detected.',
+  );
+});
 
 test('context store keeps observation order and returns cloned messages', () => {
   const store = createContextStore({ maxMessages: 2 });

@@ -128,7 +128,7 @@ async function startTestEngine(
     startCombustion: async () => createController(),
     waitForShutdown: () => shutdown.promise,
   }, message => {
-    if (message.startsWith('Engine ready')) ready.resolve();
+    if (message.includes('Engine ready')) ready.resolve();
   });
 
   await ready.promise;
@@ -336,8 +336,8 @@ test('start prepares the destination, remains alive after readiness, and closes 
     runtime,
     message => {
       if (message.startsWith('Puppet account name updated')) events.push('puppet-name-saved');
-      if (message.startsWith('DEBUG: Alias engine initialized')) events.push('aliases-initialized');
-      if (message.startsWith('Engine ready')) events.push('engine-ready-logged');
+      if (message.includes('Alias engine initialized')) events.push('aliases-initialized');
+      if (message.includes('Engine ready')) events.push('engine-ready-logged');
     },
   );
   let settled = false;
@@ -375,14 +375,19 @@ test('start prepares the destination, remains alive after readiness, and closes 
     'browser-closed',
   ]);
   assert.deepEqual(result.output, [
-    'NVIDIA API key validated successfully.',
-    'Browser launched and connected (Brave Chromium test).',
+    '\n[STARTUP] Verifying browser configuration.',
+    '\n[BROWSER] Browser configuration verified.',
+    '\n[STARTUP] NVIDIA API key validated successfully.',
+    '\n[BROWSER] Launching browser session.',
+    '\n[BROWSER] Browser launched and connected (Brave Chromium test).',
+    '\n[CRANKING] Preparing Messenger context.',
     'Puppet account name updated: "Test Puppet".',
-    `DEBUG: Alias engine initialized for puppet name "Test Puppet" (${generateAliases('Test Puppet').valids.length} aliases).`,
+    `\n[ALIASES] DEBUG: Alias engine initialized for puppet name "Test Puppet" (${generateAliases('Test Puppet').valids.length} aliases).`,
     'WARNING: Browser is minimized. Backread may collect fewer messages than expected.',
-    'Retrieved 2 messages; expected 30.',
-    'Historical context seeded: 2 messages.',
-    `Engine ready at ${validConfiguration.messageDestination}.`,
+    '\n[BACKREAD] Reading historical Messenger messages.',
+    '\n[BACKREAD] Retrieved 2 messages; expected 30.',
+    '\n[CONTEXT] Historical context seeded: 2 messages.',
+    `\n[READY] Engine ready at ${validConfiguration.messageDestination}.`,
     'Shutdown requested; disconnecting Playwright.',
   ]);
   assert.deepEqual(result.errors, []);
@@ -425,7 +430,7 @@ test('start rejects a conflicting browser profile before NVIDIA validation', asy
   assert.equal(validationCalls, 0);
   assert.equal(launchCalls, 0);
   assert.deepEqual(result.errors, [`Unable to start browser: ${conflictMessage}`]);
-  assert.deepEqual(result.output, []);
+  assert.deepEqual(result.output, ['\n[STARTUP] Verifying browser configuration.']);
 });
 
 test('start preserves the saved puppet name and continues when profile retrieval fails', async context => {
@@ -461,7 +466,7 @@ test('start preserves the saved puppet name and continues when profile retrieval
       waitForShutdown: () => shutdown.promise,
     },
     message => {
-      if (message.startsWith('Engine ready')) shutdown.resolve();
+      if (message.includes('Engine ready')) shutdown.resolve();
     },
   );
 
@@ -469,7 +474,7 @@ test('start preserves the saved puppet name and continues when profile retrieval
   const retrievalFailureIndex = result.output.findIndex(message =>
     message.startsWith('Puppet account name retrieval failed')
   );
-  const readyIndex = result.output.findIndex(message => message.startsWith('Engine ready'));
+  const readyIndex = result.output.findIndex(message => message.includes('Engine ready'));
   assert.ok(retrievalFailureIndex >= 0);
   assert.ok(readyIndex > retrievalFailureIndex);
   assert.equal(disconnects, 1);
@@ -510,7 +515,7 @@ test('start preserves configuration persisted while the engine was starting', as
     readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
     waitForShutdown: () => shutdown.promise,
   }, message => {
-    if (message.startsWith('Engine ready')) ready.resolve();
+    if (message.includes('Engine ready')) ready.resolve();
   });
 
   await ready.promise;
@@ -578,8 +583,10 @@ test('start debug mode skips NVIDIA validation and keeps backread read-only', as
     assert.equal(generationCalls, 0);
     assert.equal(compositionCalls, 0);
     assert.equal(disconnects, 1);
-    assert.ok(result.output.includes('Debug mode enabled; skipping NVIDIA API key validation.'));
-    assert.ok(result.output.includes('debug backread diagnostic'));
+    assert.ok(result.output.some(message =>
+      message.includes('Debug mode enabled; skipping NVIDIA API key validation.'),
+    ));
+    assert.ok(result.output.some(message => message.includes('debug backread diagnostic')));
     assert.deepEqual(result.errors, []);
   } finally {
     if (originalDebugMode === undefined) {
@@ -819,7 +826,7 @@ test('start disconnects the session when shutdown is requested during launch', a
   assert.equal(result.exitCode, 130);
   assert.equal(prepareCalls, 0);
   assert.equal(disconnects, 1);
-  assert.ok(!result.output.some(message => message.startsWith('Engine ready')));
+  assert.ok(!result.output.some(message => message.includes('Engine ready')));
 });
 
 test('start disconnects Playwright and does not report readiness when preparation fails', async context => {
@@ -844,7 +851,7 @@ test('start disconnects Playwright and does not report readiness when preparatio
 
   assert.equal(result.exitCode, 1);
   assert.equal(disconnects, 1);
-  assert.ok(!result.output.some(message => message.startsWith('Engine ready')));
+  assert.ok(!result.output.some(message => message.includes('Engine ready')));
   assert.match(result.errors[0], /login detection timed out/);
 });
 
@@ -879,7 +886,7 @@ test('start exits with an error and disconnects when CDP disconnects unexpectedl
 
   assert.equal(result.exitCode, 1);
   assert.equal(disconnects, 1);
-  assert.ok(!result.output.some(message => message.startsWith('Engine ready')));
+  assert.ok(!result.output.some(message => message.includes('Engine ready')));
   assert.match(result.errors[0], /disconnected/);
 });
 
@@ -1444,7 +1451,7 @@ test('changebrowser gracefully stops a running engine before switching browsers'
     },
     readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
   }, message => {
-    if (message.startsWith('Engine ready')) ready.resolve();
+    if (message.includes('Engine ready')) ready.resolve();
   });
   await ready.promise;
 
@@ -2003,7 +2010,7 @@ test('pause and resume commands control the running Combustion engine', async co
       () => events.push('resumed'),
     ),
   }, message => {
-    if (message.startsWith('Engine ready')) ready.resolve();
+    if (message.includes('Engine ready')) ready.resolve();
   });
 
   await ready.promise;
@@ -2019,7 +2026,7 @@ test('pause and resume commands control the running Combustion engine', async co
   assert.deepEqual(events, ['paused', 'resumed', 'stopped', 'disconnected', 'browser-closed']);
 });
 
-test('changegcUrl updates a running engine through runtime control', async context => {
+test('changemsgUrl updates a running engine through runtime control', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
   saveApplicationApiKey(configurationFilePath);
@@ -2062,12 +2069,12 @@ test('changegcUrl updates a running engine through runtime control', async conte
       },
     ),
   }, message => {
-    if (message.startsWith('Engine ready')) ready.resolve();
+    if (message.includes('Engine ready')) ready.resolve();
   });
 
   await ready.promise;
   const change = await captureCli(
-    ['changegcUrl'],
+    ['changemsgUrl'],
     configurationFilePath,
     async () => destination,
   );
@@ -2090,7 +2097,7 @@ test('changegcUrl updates a running engine through runtime control', async conte
   assert.equal((await start).exitCode, 0);
 });
 
-test('changegcUrl preserves unrelated configuration persisted after the engine loaded', async context => {
+test('changemsgUrl preserves unrelated configuration persisted after the engine loaded', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
   saveApplicationApiKey(configurationFilePath);
@@ -2102,7 +2109,7 @@ test('changegcUrl preserves unrelated configuration persisted after the engine l
   );
 
   const destination = 'https://www.facebook.com/messages/t/987654321';
-  const change = await captureCli(['changegcUrl'], configurationFilePath, async () => destination);
+  const change = await captureCli(['changemsgUrl'], configurationFilePath, async () => destination);
 
   assert.equal(change.exitCode, 0);
   const saved = loadConfiguration(configurationFilePath);
@@ -2114,7 +2121,7 @@ test('changegcUrl preserves unrelated configuration persisted after the engine l
   assert.equal((await engine.stop()).exitCode, 0);
 });
 
-test('changegcUrl rejection preserves a running engine destination and requires resume', async context => {
+test('changemsgUrl rejection preserves a running engine destination and requires resume', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
   saveApplicationApiKey(configurationFilePath);
@@ -2148,12 +2155,12 @@ test('changegcUrl rejection preserves a running engine destination and requires 
       },
     ),
   }, message => {
-    if (message.startsWith('Engine ready')) ready.resolve();
+    if (message.includes('Engine ready')) ready.resolve();
   });
 
   await ready.promise;
   const change = await captureCli(
-    ['changegcUrl'],
+    ['changemsgUrl'],
     configurationFilePath,
     async () => destination,
   );
@@ -2215,18 +2222,18 @@ test('a second destination change is rejected while the first is in progress', a
       },
     ),
   }, message => {
-    if (message.startsWith('Engine ready')) ready.resolve();
+    if (message.includes('Engine ready')) ready.resolve();
   });
 
   await ready.promise;
   const firstChange = captureCli(
-    ['changegcUrl'],
+    ['changemsgUrl'],
     configurationFilePath,
     async () => destination,
   );
   await changeEntered.promise;
   const secondChange = await captureCli(
-    ['changegcUrl'],
+    ['changemsgUrl'],
     configurationFilePath,
     async () => 'https://www.facebook.com/messages/t/111111111',
   );
@@ -2296,7 +2303,7 @@ test('stop waits for Combustion cleanup before disconnecting Playwright and clos
       },
     }),
   }, message => {
-    if (message.startsWith('Engine ready')) ready.resolve();
+    if (message.includes('Engine ready')) ready.resolve();
   });
 
   await ready.promise;
@@ -2350,7 +2357,7 @@ test('stop reports failure when graceful browser closure fails', async context =
     },
     readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
   }, message => {
-    if (message.startsWith('Engine ready')) ready.resolve();
+    if (message.includes('Engine ready')) ready.resolve();
   });
 
   await ready.promise;
@@ -2393,7 +2400,7 @@ test('duplicate start is rejected before a second browser launch', async context
     undefined,
     runtime,
     message => {
-      if (message.startsWith('Engine ready')) ready.resolve();
+      if (message.includes('Engine ready')) ready.resolve();
     },
   );
   await ready.promise;
@@ -2439,7 +2446,7 @@ test('SIGINT still performs owner cleanup and releases runtime ownership', async
     },
     readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
   }, message => {
-    if (message.startsWith('Engine ready')) ready.resolve();
+    if (message.includes('Engine ready')) ready.resolve();
   });
 
   await ready.promise;
@@ -2468,7 +2475,7 @@ test('init dispatches to its injected initialization workflow', async () => {
   assert.match(result.errors[0], /browser discovery is unavailable/);
 });
 
-test('changegcUrl validates before saving a pre-start destination', async context => {
+test('changemsgUrl validates before saving a pre-start destination', async context => {
   const filePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, filePath);
   const destination = 'https://www.facebook.com/messages/t/987654321';
@@ -2477,7 +2484,7 @@ test('changegcUrl validates before saving a pre-start destination', async contex
   const runtimeChecks: string[] = [];
 
   const result = await captureCli(
-    ['changegcUrl'],
+    ['changemsgUrl'],
     filePath,
     async question => {
       promptCalls.push(question);
@@ -2507,13 +2514,13 @@ test('changegcUrl validates before saving a pre-start destination', async contex
   });
 });
 
-test('changegcUrl cancellation and invalid input retain the configured destination', async context => {
+test('changemsgUrl cancellation and invalid input retain the configured destination', async context => {
   const filePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, filePath);
   let runtimeChecks = 0;
 
   const cancelled = await captureCli(
-    ['changegcUrl'],
+    ['changemsgUrl'],
     filePath,
     async () => null,
     undefined,
@@ -2533,7 +2540,7 @@ test('changegcUrl cancellation and invalid input retain the configured destinati
 
   const invalidAnswers = ['not-a-url', null];
   const failed = await captureCli(
-    ['changegcUrl'],
+    ['changemsgUrl'],
     filePath,
     async () => invalidAnswers.shift() ?? null,
     undefined,
@@ -2553,7 +2560,7 @@ test('changegcUrl cancellation and invalid input retain the configured destinati
   });
 });
 
-test('changegcUrl preserves configuration persisted while the destination prompt is open', async context => {
+test('changemsgUrl preserves configuration persisted while the destination prompt is open', async context => {
   const filePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, filePath);
   const destination = 'https://www.facebook.com/messages/t/987654321';
@@ -2565,7 +2572,7 @@ test('changegcUrl preserves configuration persisted while the destination prompt
   let promptCalls = 0;
 
   const result = await captureCli(
-    ['changegcUrl'],
+    ['changemsgUrl'],
     filePath,
     async () => {
       promptCalls += 1;
@@ -2667,7 +2674,7 @@ test('setpersonality preserves configuration persisted while the personality pro
 test('stale-write commands abort without writing when the configuration cannot be reloaded', async context => {
   const cases: { command: string; answer: string; runtime: CliRuntimeOptions }[] = [
     {
-      command: 'changegcUrl',
+      command: 'changemsgUrl',
       answer: 'https://www.facebook.com/messages/t/987654321',
       runtime: {
         requestRuntimeChangeDestination: async () => ({ status: 'not-running' }),
@@ -2818,7 +2825,7 @@ test('setbottemp updates a running engine and persists the selection', async con
       },
     ),
   }, message => {
-    if (message.startsWith('Engine ready')) ready.resolve();
+    if (message.includes('Engine ready')) ready.resolve();
   });
 
   await ready.promise;
@@ -2871,7 +2878,7 @@ test('setbottemp rolls back persisted configuration when the runtime update fail
       },
     ),
   }, message => {
-    if (message.startsWith('Engine ready')) ready.resolve();
+    if (message.includes('Engine ready')) ready.resolve();
   });
 
   await ready.promise;
@@ -2976,7 +2983,7 @@ test('setbottemp reports persistence failure without applying the runtime update
       },
     ),
   }, message => {
-    if (message.startsWith('Engine ready')) ready.resolve();
+    if (message.includes('Engine ready')) ready.resolve();
   });
 
   await ready.promise;
@@ -3161,7 +3168,7 @@ test('setpersonality updates a running engine and persists without restarting it
       },
     ),
   }, message => {
-    if (message.startsWith('Engine ready')) ready.resolve();
+    if (message.includes('Engine ready')) ready.resolve();
   });
 
   await ready.promise;
@@ -3223,7 +3230,7 @@ test('setpersonality rolls back persisted configuration when the runtime update 
       },
     ),
   }, message => {
-    if (message.startsWith('Engine ready')) ready.resolve();
+    if (message.includes('Engine ready')) ready.resolve();
   });
 
   await ready.promise;
@@ -3344,7 +3351,7 @@ test('setpersonality reports persistence failure without applying the runtime up
       },
     ),
   }, message => {
-    if (message.startsWith('Engine ready')) ready.resolve();
+    if (message.includes('Engine ready')) ready.resolve();
   });
 
   await ready.promise;
@@ -3436,7 +3443,7 @@ test('help options and no command display usage', async () => {
     assert.match(result.output[0], /init\s+Initialize impractical-bot/);
     assert.match(result.output[0], /config\s+Configure impractical-bot/);
     assert.match(result.output[0], /changebrowser\s+Change the configured browser/);
-    assert.match(result.output[0], /changegcUrl\s+Change the message destination/);
+    assert.match(result.output[0], /changemsgUrl\s+Change the message destination/);
     assert.match(result.output[0], /setbottemp\s+Set the bot temperament/);
     assert.match(result.output[0], /setpersonality\s+Set the bot personality/);
     assert.doesNotMatch(result.output[0], /changemsgdestination/);

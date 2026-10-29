@@ -664,7 +664,11 @@ test('startup follows the configured skip-restoration flow without entering a PI
   assert.equal(page.clickedCloseIndex, 0);
   assert.equal(page.skipClicked, true);
   assert.equal(page.composerReady, true);
-  assert.ok(logs.includes('Challenge 1: PIN restoration is disabled; skipping restoration.'));
+  assert.ok(logs.some(log => log.includes('Challenge 1: PIN restoration is disabled; skipping restoration.')));
+  assert.ok(logs.some(log => log.includes('[CONVERSATION]')));
+  assert.ok(logs.some(log => log.includes('[CHALLENGES]')));
+  assert.ok(logs.some(log => log.includes('[FINAL VERIFICATION]')));
+  assert.equal(logs.some(log => log.includes('DEBUG:')), false);
 });
 
 test('startup restores chats with the configured PIN when skipping is disabled', async () => {
@@ -685,7 +689,7 @@ test('startup restores chats with the configured PIN when skipping is disabled',
   assert.ok(page.events.includes('pin-enter-pressed'));
   assert.equal(page.skipClicked, false);
   assert.equal(page.events.includes('pin-close-clicked'), false);
-  assert.ok(logs.includes('Challenge 1: entering the configured PIN to restore chats.'));
+  assert.ok(logs.some(log => log.includes('Challenge 1: entering the configured PIN to restore chats.')));
 });
 
 test('startup fails when the configured PIN is rejected or restoration remains unresolved', async () => {

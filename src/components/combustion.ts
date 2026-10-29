@@ -32,6 +32,7 @@ import { createPacketScheduler } from './packet-scheduler.js';
 import { createPauseGate } from './pause-gate.js';
 import { getPersonalityInstruction } from './personality.js';
 import { buildRngPacket, type RngPacket } from './rng-packet-builder.js';
+import { formatPollSummary, formatTerminalText } from './terminal-formatting.js';
 
 const MESSAGE_SELECTOR =
   '[data-scope="messages_table"][aria-roledescription="message"][data-message-id]';
@@ -47,34 +48,14 @@ const IDLE_THRESHOLD_MS = 120000;
 const LOG_PREFIX = '__MESSENGER_WAKER__:';
 const DEBUG_ENGINE = true;
 
-const ANSI_RESET = '\u001b[0m';
-
-// Colors are decorative only: when stdout is not an interactive terminal,
-// NO_COLOR is set, or TERM=dumb, every helper below returns plain text.
-const DEBUG_COLORS_ENABLED =
-  process.stdout.isTTY === true &&
-  process.env.NO_COLOR === undefined &&
-  process.env.TERM !== 'dumb';
-
-type DebugStyle = 'bold' | 'dim' | 'cyan' | 'green' | 'yellow';
-
-const DEBUG_STYLE_CODES: Record<DebugStyle, string> = {
-  bold: '\u001b[1m',
-  dim: '\u001b[2m',
-  cyan: '\u001b[36m',
-  green: '\u001b[32m',
-  yellow: '\u001b[33m',
-};
-
-function styled(text: string, style: DebugStyle): string {
-  if (!DEBUG_COLORS_ENABLED) {
-    return text;
-  }
-  return `${DEBUG_STYLE_CODES[style]}${text}${ANSI_RESET}`;
-}
+const styled = formatTerminalText;
 
 function styledLabel(text: string): string {
   return styled(text.padEnd(20), 'dim');
+}
+
+function formatSubsystemStatus(label: string, message: string): string {
+  return `  ${styled(`[${label}]`.padStart(8), 'cyan')} ${message}`;
 }
 
 function debugBorder(): string {
@@ -394,8 +375,9 @@ function appendContextMessages(
 
 function printPacketBoundary(label: string, packetId: string): void {
   const border = debugBorder();
+  const labelStyle = label === 'PACKET FINALIZED' ? 'green' : 'cyan';
   console.log(
-    `\n${border}\n${styled(`${label}:`, 'bold')} ${styled(packetId, 'cyan')}\n${border}`,
+    `\n${border}\n${styled(`${label}:`, labelStyle)} ${styled(packetId, 'bold')}\n${border}`,
   );
 }
 
@@ -486,15 +468,19 @@ export async function startCombustion({
     clearInterval(rngPollTimer);
     rngPollTimer = undefined;
     if (message) {
-      console.log(message);
+      console.log(formatSubsystemStatus('rng', message.replace(/^\[rng\]\s*/, '')));
     }
   };
-  const startRngPolling = (message = '[rng] Polling resumed: main poller active'): void => {
+  const startRngPolling = (
+    message = '[rng] Polling resumed: main poller active',
+    leadingNewline = false,
+  ): void => {
     if (rngPollTimer !== undefined || !pollRng || stopRequested || pauseGate.isPaused()) {
       return;
     }
     rngPollTimer = setInterval(pollRng, RNG_POLL_INTERVAL_MS);
-    console.log(message);
+    const details = message.replace(/^\[rng\]\s*/, '');
+    console.log(`${leadingNewline ? '\n' : ''}${formatSubsystemStatus('rng', details)}`);
   };
   const completeRngPacket = (packetId: string, succeeded: boolean, error?: unknown): void => {
     if (packetId !== rngPacketInFlightId) {
@@ -507,16 +493,23 @@ export async function startCombustion({
     const outcome = succeeded
       ? 'success'
       : `failure: ${error instanceof Error ? error.message : String(error)}`;
-    console.log(`[rng] Processing completed: ${packetId} (${outcome})`);
+    console.log(formatSubsystemStatus(
+      'rng',
+      `Processing completed: ${styled(packetId, 'bold')} ` +
+      `(${styled(outcome, succeeded ? 'green' : 'red')})`,
+    ));
     if (stopRequested || completedEpoch !== destinationEpoch) {
       return;
     }
     rngCooldownActive = true;
-    console.log(`[rng] Cooldown started: ${RNG_COOLDOWN_MS / 1000}s`);
+    console.log(formatSubsystemStatus(
+      'rng',
+      `Cooldown started: ${styled(`${RNG_COOLDOWN_MS / 1000}s`, 'bold')}`,
+    ));
     rngCooldownTimer = setTimeout(() => {
       rngCooldownTimer = undefined;
       rngCooldownActive = false;
-      console.log('[rng] Cooldown ended');
+      console.log(formatSubsystemStatus('rng', 'Cooldown ended'));
     }, RNG_COOLDOWN_MS);
   };
   const requestStop = (): void => {
@@ -563,7 +556,10 @@ export async function startCombustion({
     }
     mode = 'idle';
     stopRngPolling('[rng] Polling paused: main poller idle');
-    console.log('[poller] Idle; no genuinely new message was detected before the threshold.');
+    console.log(formatSubsystemStatus(
+      'poller',
+      styled('Idle; no genuinely new message was detected before the threshold.', 'dim'),
+    ));
     await setWakerActive(true);
     pollDelayResolve?.();
   };
@@ -573,13 +569,19 @@ export async function startCombustion({
     }
     if (mode === 'idle') {
       mode = 'polling';
-      console.log('[poller] Confirmed new message while idle; resuming periodic polling.');
+      console.log(formatSubsystemStatus(
+        'poller',
+        styled('Confirmed new message while idle; resuming periodic polling.', 'green'),
+      ));
       await setWakerActive(false);
     }
     clearTimeout(idleTimer);
     idleDeadline = Date.now() + IDLE_THRESHOLD_MS;
     if (DEBUG_ENGINE) {
-      console.log(`[idle] Timer reset (${IDLE_THRESHOLD_MS / 1000}s).`);
+      console.log(formatSubsystemStatus(
+        'idle',
+        `Timer reset (${styled(`${IDLE_THRESHOLD_MS / 1000}s`, 'bold')}).`,
+      ));
     }
     idleTimer = setTimeout(() => {
       idleTimer = undefined;
@@ -593,7 +595,10 @@ export async function startCombustion({
     mode = 'polling';
     startRngPolling();
     wakePending = true;
-    console.log('[poller] Wake-up signal received; verifying rendered messages now.');
+    console.log(formatSubsystemStatus(
+      'poller',
+      styled('Wake-up signal received; verifying rendered messages now.', 'cyan'),
+    ));
     void setWakerActive(false);
     wakeSignal.resolve();
   };
@@ -652,7 +657,10 @@ export async function startCombustion({
     if (mode === 'idle') {
       mode = 'polling';
       wakePending = true;
-      console.log('[poller] Resuming after pause; verifying rendered messages now.');
+      console.log(formatSubsystemStatus(
+        'poller',
+        styled('Resuming after pause; verifying rendered messages now.', 'cyan'),
+      ));
       await setWakerActive(false);
       wakeSignal.resolve();
     }
@@ -770,12 +778,13 @@ export async function startCombustion({
           mention: containsMention(message.message, aliases),
         }));
         const mentionCount = newMessagesWithMentions.filter(message => message.mention).length;
-        console.log(
-          `Poll: ${newMessages.length} new messages checked; ${mentionCount} mention detected.`
-        );
+        console.log(formatPollSummary(newMessages.length, mentionCount));
         for (const message of newMessagesWithMentions) {
           console.log(
-            ` New message: id=${message.messageId}; mention=${message.mention}; ` +
+            `  ${styled('New message:', 'green')} id=${message.messageId}; ` +
+            `${styled('mention=', 'dim')}${message.mention
+              ? styled(String(message.mention), 'yellow')
+              : styled(String(message.mention), 'dim')}; ` +
             `text=${JSON.stringify(message.message.replace(/\s+/g, ' ') || '(no text content)')}`
           );
         }
@@ -804,14 +813,23 @@ export async function startCombustion({
 
         if (result.pendingPacket && !hadPendingPacket) {
           printPacketBoundary('PACKET OPENED', result.pendingPacket.packetId);
-          console.log(`Packet opened this poll: ${result.pendingPacket.packetId}`);
+          console.log(
+            `${styled('Packet opened this poll:', 'cyan')} ` +
+            `${styled(result.pendingPacket.packetId, 'bold')}`,
+          );
           logPacket('Initial packet contents', result.pendingPacket);
         } else if (result.pendingPacket) {
-          console.log(`Packet ${result.pendingPacket.packetId} is pending (still pending).`);
+          console.log(
+            `${styled(`Packet ${result.pendingPacket.packetId}`, 'cyan')} ` +
+            styled('is pending (still pending).', 'dim'),
+          );
         }
         if (result.packet) {
           printPacketBoundary('PACKET FINALIZED', result.packet.packetId);
-          console.log(`Closure reason: ${describePacketClosureReason(newMessagesWithMentions.length)}`);
+          console.log(
+            `${styled('Closure reason:', 'dim')} ` +
+            `${styled(describePacketClosureReason(newMessagesWithMentions.length), 'dim')}`,
+          );
           logPacket('Final packet contents', result.packet);
           if (packetScheduler!.submit(result.packet)) {
             printQueueSnapshot(packetScheduler!);
@@ -974,7 +992,10 @@ export async function startCombustion({
   };
 
   try {
-    console.log(`[engine] Starting Combustion for ${configuration.messageDestination}.`);
+    console.log(
+      `\n${styled('[COMBUSTION]', 'cyan')} ` +
+      styled(`Starting Combustion for ${configuration.messageDestination}.`, 'bold'),
+    );
     let systemInstruction = getPersonalityInstruction(
       resolveBotPersonalityMode(configuration),
       configuration.customPersonalityInstruction,
@@ -1001,7 +1022,10 @@ export async function startCombustion({
     packetScheduler = createPacketScheduler<ScheduledPacket>(async packet => {
       packetEpochs.set(packet, destinationEpoch);
       if (packet.packetId === rngPacketInFlightId) {
-        console.log(`[rng] Processing started: ${packet.packetId}`);
+        console.log(formatSubsystemStatus(
+          'rng',
+          `${styled('Processing started:', 'green')} ${styled(packet.packetId, 'bold')}`,
+        ));
       }
       let succeeded = false;
       let processingError: unknown;
@@ -1077,7 +1101,10 @@ export async function startCombustion({
 
     const baseline = await readLatestMessages();
     seenMessageIds = new Set(baseline.map(message => message.messageId).filter(Boolean));
-    console.log(`Baseline recorded: ${seenMessageIds.size} unique message IDs.`);
+    console.log(
+      `${styled('Baseline recorded:', 'cyan')} ` +
+      `${styled(String(seenMessageIds.size), 'bold')} unique message IDs.`,
+    );
     packetBuilderState = createPacketBuilderState();
     appendContextMessages(contextStore, baseline, packetScheduler, packetBuilderState);
     packetBuilderState = buildPacketTurn({
@@ -1092,7 +1119,7 @@ export async function startCombustion({
     }).state;
 
     pollRng = () => {
-      console.log('[rng] Evaluating cycle');
+      console.log(formatSubsystemStatus('rng', styled('Evaluating cycle', 'dim')));
       const skipReason = getRngSkipReason({
         mainPollInProgress,
         packetScheduler: packetScheduler!,
@@ -1102,7 +1129,10 @@ export async function startCombustion({
       });
       if (skipReason) {
         if (skipReason !== lastRngSkipReason) {
-          console.log(`[rng] Skipped: ${skipReason}`);
+          console.log(formatSubsystemStatus(
+            'rng',
+            `${styled('Skipped:', 'yellow')} ${skipReason}`,
+          ));
         }
         lastRngSkipReason = skipReason;
         return;
@@ -1110,55 +1140,84 @@ export async function startCombustion({
       lastRngSkipReason = null;
       const latestMessage = contextStore.getRecent(1)[0];
       if (latestMessage?.sender === 'You' && latestMessage.direction === 'OUTGOING') {
-        console.log('[rng] Skipping dice roll: latest Context Store message is OUTGOING.');
+        console.log(formatSubsystemStatus(
+          'rng',
+          `${styled('Skipping dice roll:', 'yellow')} ` +
+          'latest Context Store message is OUTGOING.',
+        ));
         return;
       }
       if (!shouldRngRespond(botTemperament)) {
         const noProbability = Math.round(
           (1 - getBotTemperamentYesProbability(botTemperament)) * 100,
         );
-        console.log(`[rng] Roll: NO (${noProbability}% chance)`);
+        console.log(formatSubsystemStatus(
+          'rng',
+          `${styled('Roll: NO', 'dim')} (${styled(`${noProbability}%`, 'dim')} chance)`,
+        ));
         return;
       }
       const yesProbability = Math.round(getBotTemperamentYesProbability(botTemperament) * 100);
-      console.log(`[rng] Roll: YES (${yesProbability}% chance)`);
+      console.log(formatSubsystemStatus(
+        'rng',
+        `${styled('Roll: YES', 'green')} (${styled(`${yesProbability}%`, 'bold')} chance)`,
+      ));
 
       rngOperationActive = true;
       try {
         const recentMessages = contextStore.getRecent(RNG_CONTEXT_MESSAGE_LIMIT);
-        console.log(`[rng] Context snapshot: ${recentMessages.length} messages`);
+        console.log(formatSubsystemStatus(
+          'rng',
+          `Context snapshot: ${styled(String(recentMessages.length), 'bold')} messages`,
+        ));
         const hasUsableIncomingMessage = recentMessages.some(message =>
           message.direction === 'INCOMING' && message.message.trim().length > 0
         );
         if (!hasUsableIncomingMessage) {
           rngOperationActive = false;
-          console.log('[rng] Skipped: no usable incoming Messenger message');
-          console.log('[rng] No cooldown; normal polling resumes');
+          console.log(formatSubsystemStatus(
+            'rng',
+            `${styled('Skipped:', 'yellow')} no usable incoming Messenger message`,
+          ));
+          console.log(formatSubsystemStatus('rng', 'No cooldown; normal polling resumes'));
           return;
         }
 
         const packet = buildRngPacket(recentMessages);
         rngPacketInFlightId = packet.packetId;
         rngPacketEpoch = destinationEpoch;
-        console.log(`[rng] Packet created: ${packet.packetId} (${packet.contextMessages.length} context messages)`);
+        console.log(formatSubsystemStatus(
+          'rng',
+          `${styled('Packet created:', 'cyan')} ${styled(packet.packetId, 'bold')} ` +
+          `(${styled(String(packet.contextMessages.length), 'bold')} context messages)`,
+        ));
         if (!packetScheduler!.submit(packet)) {
           rngPacketInFlightId = null;
           rngOperationActive = false;
-          console.log(`[rng] Scheduler rejected packet: ${packet.packetId}`);
+          console.log(formatSubsystemStatus(
+            'rng',
+            `${styled('Scheduler rejected packet:', 'yellow')} ${styled(packet.packetId, 'bold')}`,
+          ));
           return;
         }
-        console.log('[rng] Submitted to scheduler');
+        console.log(formatSubsystemStatus('rng', styled('Submitted to scheduler', 'green')));
       } catch (error) {
         rngPacketInFlightId = null;
         rngOperationActive = false;
         const details = error instanceof Error ? error.message : String(error);
-        console.error(`[rng] Could not submit an RNG packet: ${details}`);
+        console.error(formatSubsystemStatus(
+          'rng',
+          styled(`Could not submit an RNG packet: ${details}`, 'red'),
+        ));
       }
     };
-    startRngPolling('[rng] Polling started');
+    startRngPolling('[rng] Polling started', true);
     console.log(DEBUG_ENGINE
-      ? `[poller] Active; sampling every ${POLL_INTERVAL_MS} ms.`
-      : '[poller] Active.');
+      ? formatSubsystemStatus(
+        'poller',
+        `Active; sampling every ${styled(String(POLL_INTERVAL_MS), 'bold')} ms.`,
+      )
+      : formatSubsystemStatus('poller', 'Active.'));
 
     const stopped = runPollLoop().then(
       async () => {
