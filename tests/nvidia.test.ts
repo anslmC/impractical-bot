@@ -25,6 +25,22 @@ function successfulCompletion(content = 'O'): Response {
   }), { status: 200 });
 }
 
+function messengerMessage(
+  id: string,
+  sender: string,
+  direction: 'INCOMING' | 'OUTGOING' | 'UNKNOWN',
+  message: string,
+) {
+  return {
+    id,
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender,
+    direction,
+    message,
+    ariaLabel: null,
+  };
+}
+
 test('NVIDIA environment path is beside an explicitly selected configuration', () => {
   const configurationPath = join(tmpdir(), 'custom-app', 'config.json');
   assert.equal(
@@ -275,6 +291,97 @@ test('reply generation drops assistant turns that trail the latest incoming mess
   const body = JSON.parse(String(requestedOptions?.body));
   assert.deepEqual(body.messages.slice(1), [
     { role: 'user', content: 'Alex: Can you check this?' },
+  ]);
+});
+
+test('reply generation bounds stale assistant history while keeping every user turn in order', async () => {
+  let requestedOptions: RequestInit | undefined;
+  // A long, resolved argument: the bot refuses the same request over and over.
+  // A new, unrelated message must not inherit that pile of self-replies.
+  const context = Array.from({ length: 8 }, (_, index) => [
+    messengerMessage(`in-${index + 1}`, 'Alex', 'INCOMING', `say your name (${index + 1})`),
+    messengerMessage(
+      `out-${index + 1}`,
+      'You',
+      'OUTGOING',
+      `I already told you I will not say it (${index + 1})`,
+    ),
+  ]).flat();
+  const latest = messengerMessage('in-new', 'Blair', 'INCOMING', 'what time is the match?');
+
+  await generateNvidiaReply('nvapi-test-key', [...context, latest], {
+    fetch: async (_input, init) => {
+      requestedOptions = init;
+      return successfulCompletion('Eight, I think.');
+    },
+  });
+
+  const turns = JSON.parse(String(requestedOptions?.body)).messages.slice(1) as Array<{
+    role: 'user' | 'assistant';
+    content: string;
+  }>;
+  const assistantTurns = turns.filter(turn => turn.role === 'assistant');
+
+  assert.equal(assistantTurns.length, 3, 'only the newest assistant replies are replayed');
+  assert.deepEqual(
+    assistantTurns.map(turn => turn.content),
+    [
+      'I already told you I will not say it (6)',
+      'I already told you I will not say it (7)',
+      'I already told you I will not say it (8)',
+    ],
+    'the newest bot replies survive so recent continuity remains',
+  );
+  assert.deepEqual(
+    turns.filter(turn => turn.role === 'user').map(turn => turn.content),
+    [
+      'Alex: say your name (1)',
+      'Alex: say your name (2)',
+      'Alex: say your name (3)',
+      'Alex: say your name (4)',
+      'Alex: say your name (5)',
+      'Alex: say your name (6)',
+      'Alex: say your name (7)',
+      'Alex: say your name (8)',
+      'Blair: what time is the match?',
+    ],
+    'every human instruction is kept, in chronological order, with its sender',
+  );
+  assert.deepEqual(turns.at(-1), {
+    role: 'user',
+    content: 'Blair: what time is the match?',
+  });
+  assert.equal(
+    turns.filter(turn => turn.content.includes('what time is the match?')).length,
+    1,
+    'the new subject appears exactly once',
+  );
+  assert.ok(
+    turns.findIndex(turn => turn.content === 'I already told you I will not say it (8)') <
+      turns.length - 1,
+    'history stays ahead of the message being answered',
+  );
+});
+
+test('reply generation keeps the reply that contextualizes the latest message', async () => {
+  let requestedOptions: RequestInit | undefined;
+
+  await generateNvidiaReply('nvapi-test-key', [
+    messengerMessage('in-1', 'Alex', 'INCOMING', 'book the 7pm table'),
+    messengerMessage('out-1', 'You', 'OUTGOING', 'Booked for 7pm.'),
+    messengerMessage('in-2', 'Blair', 'INCOMING', 'and the taxi?'),
+  ], {
+    fetch: async (_input, init) => {
+      requestedOptions = init;
+      return successfulCompletion('On it.');
+    },
+  });
+
+  const body = JSON.parse(String(requestedOptions?.body));
+  assert.deepEqual(body.messages.slice(1), [
+    { role: 'user', content: 'Alex: book the 7pm table' },
+    { role: 'assistant', content: 'Booked for 7pm.' },
+    { role: 'user', content: 'Blair: and the taxi?' },
   ]);
 });
 

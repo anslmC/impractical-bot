@@ -111,6 +111,56 @@ function createMockPage({ failObserverSetup = false, messageCount = 1 } = {}) {
   };
 }
 
+// A page whose rendered messages are controlled per test. Sender, direction and
+// message id are all supplied by the injected record, so one logical message can
+// be rendered under two `data-message-id` values exactly as observed live.
+function createInjectedMessengerPage() {
+  const mockPage = createMockPage({ messageCount: 0 });
+  const basePage = mockPage.page;
+  const originalLocator = basePage.locator.bind(basePage);
+  const injectedMessages: Array<{ messageId: string; sender: string; message: string }> = [];
+
+  (basePage as { locator: (selector: string) => unknown }).locator = (selector: string) => {
+    if (selector !== MESSAGE_SELECTOR) {
+      return originalLocator(selector);
+    }
+    return {
+      evaluateAll: async (
+        callback: (items: unknown[], limit: number) => unknown[],
+        limit: number,
+      ): Promise<unknown[]> => {
+        const elements = injectedMessages.map(message => ({
+          getAttribute(name: string) {
+            if (name === 'data-message-id') {
+              return message.messageId;
+            }
+            return name === 'aria-label'
+              ? `At October 18, 2026, 1:15 PM, ${message.sender}: ${message.message}`
+              : null;
+          },
+          cloneNode() {
+            return {
+              innerText: message.message,
+              querySelectorAll: () => [],
+            };
+          },
+        }));
+        return runInNewContext(
+          `(${callback.toString()})(items, limit)`,
+          { items: elements, limit },
+        ) as unknown[];
+      },
+    };
+  };
+
+  return {
+    page: basePage,
+    inject(messages: Array<{ messageId: string; sender: string; message: string }>) {
+      injectedMessages.push(...messages);
+    },
+  };
+}
+
 test('Combustion uses the supplied seeded store and cleans up before stop resolves', async () => {
   const mockPage = createMockPage();
   const contextStore = createContextStore();
@@ -1082,6 +1132,192 @@ test('Combustion strips a self-identifying prefix before composing and keeps a r
     await advancePoll();
     await advancePoll();
     assert.deepEqual(composedReplies, ['Oh, nice? That is it?', '@PleaseGetout Daily']);
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('one reply rendered under two ids becomes one Context Store message and one assistant turn', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+
+  const generatedRequests: Array<readonly {
+    messageId: string;
+    message: string;
+    sender: string;
+    direction: string;
+  }[]> = [];
+  const composedReplies: string[] = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    generatedRequests.push(messages as typeof generatedRequests[number]);
+    return 'mocked reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async (_page, reply) => {
+    composedReplies.push(reply);
+    return { status: 'sent' };
+  };
+
+  const flush = async (): Promise<void> => {
+    for (let turn = 0; turn < 8; turn += 1) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+  };
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3000);
+    await flush();
+  };
+
+  const reply =
+    'I literally just said it. Like, one message ago. Are you testing my memory? ' +
+    'I am definitely going to start ignoring this request any second now.';
+  const numericId = '7521591905785117407';
+  const midId = 'mid.$gAAW_kanMS16nuYVAE2hiD_y5xnrf';
+  const { page, inject } = createInjectedMessengerPage();
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([
+      { messageId: numericId, sender: 'You', message: reply },
+      { messageId: midId, sender: 'You', message: reply },
+      { messageId: 'mid.$mention-1', sender: 'Alex', message: '@Bot what now?' },
+    ]);
+    await advancePoll();
+    await advancePoll();
+
+    assert.equal(generatedRequests.length, 1, 'one packet generates one reply');
+    assert.equal(composedReplies.length, 1, 'one packet submits one composer send');
+    assert.deepEqual(
+      contextStore.getState().messageIds,
+      [numericId, 'mid.$mention-1'],
+      'the duplicate rendering is stored once, with the first rendered id',
+    );
+    const request = generatedRequests[0];
+    assert.equal(
+      request.filter(message => message.message === reply).length,
+      1,
+      'the duplicate reply is one assistant turn, not two',
+    );
+    assert.equal(request.at(-1)?.messageId, 'mid.$mention-1');
+
+    // The other namespace's copy still resolves to the canonical id on later
+    // polls: it must never become new work or a second reply.
+    const afterSecondPoll = generatedRequests.length;
+    assert.equal(afterSecondPoll, 1);
+
+    // A legitimate identical request with a new server id is still processed.
+    inject([{ messageId: 'mid.$mention-2', sender: 'Alex', message: '@Bot what now?' }]);
+    await advancePoll();
+    await advancePoll();
+    assert.equal(generatedRequests.length, 2, 'a repeated user request is not suppressed');
+    assert.equal(composedReplies.length, 2);
+    assert.equal(
+      generatedRequests[1].filter(message => message.messageId === 'mid.$mention-2').length,
+      1,
+    );
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('a duplicated incoming mention opens one packet and sends once', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+
+  const generatedRequests: Array<readonly { messageId: string; message: string }[]> = [];
+  let composeCalls = 0;
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    generatedRequests.push(messages as readonly { messageId: string; message: string }[]);
+    return 'mocked reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => {
+    composeCalls += 1;
+    return { status: 'sent' };
+  };
+
+  const flush = async (): Promise<void> => {
+    for (let turn = 0; turn < 8; turn += 1) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+  };
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3000);
+    await flush();
+  };
+
+  const mention = '@Bot are you there?';
+  const { page, inject } = createInjectedMessengerPage();
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([
+      { messageId: '7521592070141142020', sender: 'Alex', message: mention },
+      { messageId: 'mid.$gAAW_kanMS16nuYXZFGhiECL-KGQE', sender: 'Alex', message: mention },
+    ]);
+    await advancePoll();
+    await advancePoll();
+    await advancePoll();
+
+    assert.equal(generatedRequests.length, 1, 'one mention generates one reply');
+    assert.equal(composeCalls, 1, 'one mention submits one composer send');
+    assert.deepEqual(contextStore.getState().messageIds, ['7521592070141142020']);
+    assert.equal(
+      generatedRequests[0].filter(message => message.message === mention).length,
+      1,
+      'the trigger appears exactly once in the request',
+    );
+    assert.equal(generatedRequests[0].at(-1)?.messageId, '7521592070141142020');
   } finally {
     await controller.stop();
     Math.random = originalRandom;

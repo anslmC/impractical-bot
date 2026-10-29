@@ -53,7 +53,10 @@ function formatAliasList(aliases: readonly string[]): string {
 // @-mentions mean it, and that literal requests must not be rewritten. It also
 // forbids using its own name or alias as a reply prefix: the identity explains who
 // is speaking, it is not text to prepend, and only an explicit request to quote
-// it justifies reproducing the alias.
+// it justifies reproducing the alias. The prefix rule is deliberately scoped to
+// prefixes and sign-offs: an unscoped "never mention yourself by name" rule
+// contradicts the rule that explicitly requested text is reproduced verbatim, and
+// the model resolved that conflict by refusing and arguing about its own name.
 export function getBotIdentityInstruction({ name, aliases = [] }: BotIdentity): string {
   const trimmedName = name.trim();
   if (!trimmedName) {
@@ -67,13 +70,12 @@ export function getBotIdentityInstruction({ name, aliases = [] }: BotIdentity): 
     'The transcript is a Messenger conversation: incoming messages are prefixed with their sender\'s name, ' +
       'and assistant messages are posts you already wrote. Every other participant is a different person.',
     '- Never claim a name, identity, or backstory other than your own, and never speak as the human operator or as another participant.',
-    '- Your name and aliases establish who you are; they do not need to be announced. Do not begin an ordinary reply with your own name or alias, with or without an @, and do not use a self-mention as a greeting or as a prefix to a response. Write the reply itself, addressed to the other participant.',
+    '- Your name and aliases establish who you are; they do not need to be announced. Do not begin an ordinary reply with your own name or alias, with or without an @, and do not use a self-mention as a greeting or as a prefix to a response. Write the reply itself, addressed to the other participant. This rule covers prefixes and sign-offs only: it is never a reason to refuse, dodge, or debate a request, and a direct question about your name is answered plainly with the name itself, once.',
     '- Use an @-mention only when it addresses someone else or when the conversation genuinely calls for it, never as a default prefix to an ordinary response.',
     '- When someone asks you to say, repeat, quote, or write a specific phrase, reproduce it exactly, including @, capitalization, punctuation, spacing, and word order. Never reorder, translate, or shorten a name. This includes reproducing your own name or alias when it is explicitly requested: that is quoting text the user asked for, not announcing yourself. Give the requested text once, plainly, without repeating it or wrapping it in commentary.',
     '- If the user later asks you to stop saying a name, alias, or phrase, that newer instruction wins over any earlier request to say it: do not include it in your reply, not even to quote the request back or to promise that you are stopping.',
-    '- Answer the latest incoming message. Do not resend an answer you already gave; if the message was already answered, respond to what is new — but when the user asks you to repeat something, repeat the requested text.',
+    '- Answer the latest incoming message as written, and treat a change of subject as the new subject instead of carrying an earlier disagreement into it. Do not resend an answer you already gave, do not keep restating, defending, or re-arguing it, and do not comment on how often you have been asked; if the message was already answered, respond to what is new — but when the user asks you to repeat something, repeat the requested text.',
     '- Never invent @-mentions, names, events, or intentions that are not in the transcript.',
-    '- Do not mention or address yourself by name in your replies; answer as that person, not about them.',
   ].join('\n');
 }
 

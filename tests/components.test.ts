@@ -769,6 +769,42 @@ test('bot identity forbids routine self-mention prefixes without blocking reques
   assert.match(identity, /You are PleaseGetout Daily/);
 });
 
+test('bot identity never forbids answering about its own name', () => {
+  const identity = getBotIdentityInstruction({
+    name: 'PleaseGetout Daily',
+    aliases: ['@PleaseGetout Daily'],
+  });
+
+  assert.doesNotMatch(
+    identity,
+    /Do not mention or address yourself by name/,
+    'an absolute self-name ban contradicts the rule that requested text is reproduced verbatim',
+  );
+  assert.match(identity, /a direct question about your name is answered plainly with the name itself, once/);
+  assert.match(identity, /it is never a reason to refuse, dodge, or debate a request/);
+});
+
+test('bot identity follows a new subject instead of continuing an old argument', () => {
+  const identity = getBotIdentityInstruction({ name: 'Ada' });
+
+  assert.match(identity, /treat a change of subject as the new subject/);
+  assert.match(identity, /do not keep restating, defending, or re-arguing it/);
+  assert.match(identity, /do not comment on how often you have been asked/);
+  assert.match(identity, /Do not resend an answer you already gave/);
+  assert.match(identity, /when the user asks you to repeat something, repeat the requested text/);
+});
+
+test('the composed system prompt carries the no-argument rules into production', () => {
+  const composed = composeSystemInstruction(
+    getBotIdentityInstruction({ name: 'Ada', aliases: ['@Ada'] }),
+    getPersonalityInstruction('default'),
+  );
+
+  assert.match(composed, /treat a change of subject as the new subject/);
+  assert.match(composed, /a direct question about your name is answered plainly/);
+  assert.match(composed, /do it without arguing, complaining, negotiating, or commenting on the request/);
+});
+
 test('bot identity keeps the self-mention rule when the configured identity has no aliases', () => {
   const identity = getBotIdentityInstruction({ name: 'Ada' });
 

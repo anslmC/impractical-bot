@@ -1,4 +1,8 @@
 import type { ElementHandle, Page } from 'playwright';
+import {
+  createMessageIdentityTracker,
+  fingerprintMessageText,
+} from './message-identity.js';
 
 const MESSAGE_SELECTOR =
   '[data-scope="messages_table"][aria-roledescription="message"][data-message-id]';
@@ -427,7 +431,7 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
     diagnostics.push('No messages with usable data-message-id values were collected.');
   }
 
-  const messages = collectedMessages.map(message => {
+  const collectedBackreadMessages = collectedMessages.map(message => {
     const classification = classifyMessageLabel(message.ariaLabel);
     return {
       id: message.messageId!,
@@ -438,6 +442,25 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
       ariaLabel: message.ariaLabel,
     };
   });
+  // One logical message can be rendered under two `data-message-id` namespaces;
+  // seeding both would put one message in the Context Store twice.
+  const identity = createMessageIdentityTracker();
+  const reconciled = identity.reconcile(collectedBackreadMessages.map(message => ({
+    ...message,
+    messageId: message.id,
+  })));
+  for (const duplicate of reconciled.duplicates) {
+    diagnostics.push(
+      `Merged duplicate rendered record: observed ${duplicate.observedMessageId}, ` +
+      `canonical ${duplicate.canonicalMessageId}, ${duplicate.direction}, ` +
+      `sender ${JSON.stringify(duplicate.sender)}, ` +
+      `fingerprint ${fingerprintMessageText(duplicate.message)}.`,
+    );
+  }
+  const messages = reconciled.messages.map(({ messageId, ...message }) => ({
+    ...message,
+    id: messageId,
+  }));
 
   const aggregateMessages = messages.flatMap(message => {
     const lines: string[] = [];

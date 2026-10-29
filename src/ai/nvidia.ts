@@ -22,6 +22,11 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 50_000;
 // runaway generation cannot ramble, and so a slow response cannot widen the
 // window in which another reply is generated for the same trigger.
 const REPLY_MAX_TOKENS = 256;
+// Every incoming message is kept because it carries the human's instructions,
+// but only the newest few assistant turns are sent: a long run of the bot's own
+// earlier replies makes the model continue an obsolete exchange (for example,
+// re-arguing about its own alias) instead of answering the newest message.
+const MAX_ASSISTANT_HISTORY_TURNS = 3;
 const VALIDATION_MAX_TOKENS = 4096;
 const DEFAULT_SYSTEM_INSTRUCTION = 'Write a short, natural Messenger reply that matches the conversation\'s tone and directly addresses the latest incoming message. Aim for roughly 3–12 words when appropriate, but do not force an exact word count; use more words when needed for a natural answer. Avoid unsolicited email copy, calls to action, headings, labels, and unrelated prefixes such as "Verse 3.1". Return only the reply text. This reply is a proposal until the application sends it.';
 
@@ -249,6 +254,33 @@ export async function validateNvidiaApiKey(
   }
 }
 
+interface ConversationTurn {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+// Keeps every incoming turn (they carry the human's instructions and the current
+// topic) and only the newest assistant turns, so recent continuity survives while
+// stale self-replies cannot dominate the request. Order is never changed and the
+// latest incoming message stays last because it is the newest turn.
+function limitAssistantHistory(
+  turns: readonly ConversationTurn[],
+): ConversationTurn[] {
+  let assistantTurns = 0;
+  const kept: ConversationTurn[] = [];
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    const turn = turns[index];
+    if (turn.role === 'assistant') {
+      if (assistantTurns >= MAX_ASSISTANT_HISTORY_TURNS) {
+        continue;
+      }
+      assistantTurns += 1;
+    }
+    kept.push(turn);
+  }
+  return kept.reverse();
+}
+
 export async function generateNvidiaReply(
   apiKey: string,
   messages: readonly BackreadMessage[],
@@ -262,7 +294,7 @@ export async function generateNvidiaReply(
   // boundaries intact: every incoming message is a user turn prefixed with its
   // sender, and every outgoing message is an assistant turn (the bot's own post).
   // Messages are never merged or repeated.
-  const conversationMessages: { role: 'user' | 'assistant'; content: string }[] = [];
+  const conversationMessages: ConversationTurn[] = [];
   for (const message of messages) {
     if (message.direction !== 'INCOMING' && message.direction !== 'OUTGOING') {
       continue;
@@ -296,7 +328,9 @@ export async function generateNvidiaReply(
   }
   // Trailing assistant turns are replies that the current reply supersedes; the
   // request must end with the message being answered, without restating it twice.
-  const requestMessages = conversationMessages.slice(0, latestIncomingIndex + 1);
+  const requestMessages = limitAssistantHistory(
+    conversationMessages.slice(0, latestIncomingIndex + 1),
+  );
 
   let response: Response;
   try {

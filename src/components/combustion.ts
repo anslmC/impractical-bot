@@ -27,6 +27,11 @@ import {
   type PacketBuilderPacket,
   type PacketBuilderState,
 } from './mention-packet-builder.js';
+import {
+  createMessageIdentityTracker,
+  fingerprintMessageText,
+  type DuplicateMessageRecord,
+} from './message-identity.js';
 import { createPacketProcessor } from './packet-processor.js';
 import { stripSelfIdentifyingPrefix } from './reply-normalization.js';
 import { createPacketScheduler } from './packet-scheduler.js';
@@ -470,6 +475,10 @@ export async function startCombustion({
   let packetBuilderState: PacketBuilderState | undefined;
   let pollRng: (() => void) | undefined;
   let listenerAttached = false;
+  // Messenger can render one logical message under two `data-message-id`
+  // namespaces. Reconciling at read time keeps one observation, one Context
+  // Store record, one packet and one reply for that message.
+  const messageIdentity = createMessageIdentityTracker();
 
   const stopRngPolling = (message?: string): void => {
     if (rngPollTimer === undefined) {
@@ -871,6 +880,20 @@ export async function startCombustion({
   };
 
   const messageLocator = page.locator(MESSAGE_SELECTOR);
+  const reportMergedDuplicates = (duplicates: DuplicateMessageRecord[]): void => {
+    for (const duplicate of duplicates) {
+      console.log(
+        `${styled('[identity]', 'cyan')} merged duplicate rendered record: ` +
+        `observed=${styled(duplicate.observedMessageId, 'dim')} ` +
+        `canonical=${styled(duplicate.canonicalMessageId, 'dim')} ` +
+        `direction=${duplicate.direction} ` +
+        `sender=${JSON.stringify(duplicate.sender)} ` +
+        `chars=${duplicate.message.length} ` +
+        `fingerprint=${fingerprintMessageText(duplicate.message)} ` +
+        `text=${JSON.stringify(duplicate.message.replace(/\s+/g, ' ').slice(0, 60))}`,
+      );
+    }
+  };
   const readLatestMessages = async (): Promise<MessageDetails[]> => {
     const elements = await messageLocator.evaluateAll((items, limit) =>
       items.slice(-limit).map(element => {
@@ -885,7 +908,9 @@ export async function startCombustion({
       }),
     MESSAGE_LIMIT,
     );
-    return elements.map(extractMessageDetails);
+    const reconciled = messageIdentity.reconcile(elements.map(extractMessageDetails));
+    reportMergedDuplicates(reconciled.duplicates);
+    return reconciled.messages;
   };
   let seenMessageIds = new Set<string>();
 
@@ -964,6 +989,9 @@ export async function startCombustion({
             reason: 'The engine stopped during destination navigation.',
           };
         }
+        // A new conversation starts with its own message identities; the
+        // baseline is read with a clean identity map.
+        messageIdentity.clear();
         baseline = await readLatestMessages();
       } catch (error) {
         const reason = describeError(error);

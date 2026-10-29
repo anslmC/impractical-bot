@@ -287,6 +287,57 @@ test('continues past eight upward scroll attempts when each finds a new ID', asy
   );
 });
 
+test('backread returns one logical message when a reply has two rendered ids', async () => {
+  const reply = 'I literally just said it. Like, one message ago.';
+  const renderedMessages: TestMessage[] = [
+    {
+      messageId: '7521591905785117407',
+      ariaLabel: `At October 18, 2026, 1:15 PM, You: ${reply}`,
+      message: reply,
+    },
+    {
+      messageId: 'mid.$gAAW_kanMS16nuYVAE2hiD_y5xnrf',
+      ariaLabel: `At October 18, 2026, 1:15 PM, You: ${reply}`,
+      message: reply,
+    },
+  ];
+  const { page } = createPage([renderedMessages]);
+
+  const result = await readMessengerMessages(page);
+
+  assert.deepEqual(
+    result.messages.map(message => message.id),
+    ['7521591905785117407'],
+    'the numeric id and its mid$ copy seed the Context Store once',
+  );
+  assert.match(result.diagnostics.join('\n'), /Merged duplicate rendered record/);
+});
+
+test('backread keeps legitimate repeated messages that share one id namespace', async () => {
+  const renderedMessages: TestMessage[] = [
+    {
+      messageId: 'mid.$first',
+      ariaLabel: 'At October 18, 2026, 1:15 PM, Alex: say it again',
+      message: 'say it again',
+    },
+    {
+      messageId: 'mid.$second',
+      ariaLabel: 'At October 18, 2026, 1:16 PM, Alex: say it again',
+      message: 'say it again',
+    },
+  ];
+  const { page } = createPage([renderedMessages]);
+
+  const result = await readMessengerMessages(page);
+
+  assert.deepEqual(
+    result.messages.map(message => message.id),
+    ['mid.$first', 'mid.$second'],
+    'a repeated request is not mistaken for a duplicate rendering',
+  );
+  assert.doesNotMatch(result.diagnostics.join('\n'), /Merged duplicate rendered record/);
+});
+
 test('keeps only the latest 30 rendered messages when already over target', async () => {
   const renderedMessages = Array.from({ length: 70 }, (_, index) => createMessage(index));
   const { page, scrollPositions } = createPage([renderedMessages]);
