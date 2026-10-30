@@ -10,6 +10,7 @@ import {
 } from './composer.js';
 import type { Configuration } from '../config/configuration.js';
 import {
+  getBotTemperamentCooldownMs,
   getBotTemperamentYesProbability,
   resolveBotTemperament,
   resolveBotPersonalityMode,
@@ -49,17 +50,37 @@ const MESSAGE_SELECTOR =
 const LOG_SELECTOR = '[role="log"][aria-live="polite"]';
 const WAKER_MESSAGE_SELECTOR = '[data-message-id]';
 // Per-poll DOM window. Applied to the rendered message list before stable-ID
-// deduplication, so a burst larger than this would lose its oldest messages
-// permanently (they never enter the Context Store). It is independent of
-// CONTEXT_STORE_CAPACITY, which remains 60.
+// deduplication and identity reconciliation, so every message in the window is
+// examined; a burst larger than this within one poll interval would lose its
+// oldest messages permanently (they never enter the Context Store). It is not a
+// latency lever: the window bounds the number of small DOM nodes read, which is
+// negligible next to the poll interval, while shrinking it can silently skip a
+// mention that is the oldest message of a burst (tests/combustion.test.ts pins
+// that case with a ten-message burst). Independent of CONTEXT_STORE_CAPACITY.
 const MESSAGE_LIMIT = 20;
 const CONTEXT_STORE_CAPACITY = 60;
-const POLL_INTERVAL_MS = 3000;
-const RNG_POLL_INTERVAL_MS = 15000;
+// Runtime poll cadence. A mention is detected by the first poll after it is
+// rendered, and its packet is finalized on the next poll so a short burst becomes
+// one reply. Both waits are bounded by this interval, which makes it the largest
+// controllable latency in the pipeline (the model request is the other one).
+const POLL_INTERVAL_MS = 1500;
+// RNG opportunity cadence: every actual dice roll is spaced at least this far
+// apart. The deadline is checked at the end of each runtime poll, which already
+// runs every POLL_INTERVAL_MS, so an opportunity that becomes available is
+// evaluated within one poll interval instead of waiting for a separate
+// 15-second timer phase. The cadence itself is unchanged: at most one roll per
+// window, and skips do not consume a roll.
+const RNG_ROLL_INTERVAL_MS = 15000;
 const RNG_CONTEXT_MESSAGE_LIMIT = 10;
 const PACKET_CONTEXT_MESSAGE_LIMIT = 20;
-const RNG_COOLDOWN_MS = 35000;
+// The cooldown length is per temperament (src/config/configuration.ts): Quiet
+// waits 25 seconds, Balanced 15 seconds, and Talkative 6 seconds. Probability
+// and cooldown are separate levers; neither modifies the poll interval above.
 const IDLE_THRESHOLD_MS = 120000;
+// Bound for the per-engine message history maps (detection timestamps and the
+// content watch). Nothing on the reply path depends on entries older than the
+// current poll window, and a long session must not grow them without limit.
+const MESSAGE_HISTORY_LIMIT = 200;
 const LOG_PREFIX = '__MESSENGER_WAKER__:';
 const DEBUG_ENGINE = true;
 
@@ -81,6 +102,35 @@ type EngineMessage = MessageDetails & { mention?: boolean };
 type ScheduledPacket = (PacketBuilderPacket | RngPacket) & {
   mentionMessages?: PacketBuilderMessage[];
 };
+
+// Per-packet stage timing. Monotonic (performance.now) so mocked wall clocks in
+// tests and real clock changes cannot distort a measurement.
+interface PacketTiming {
+  detectedAt?: number;
+  submittedAt?: number;
+  startedAt?: number;
+  generateMs?: number;
+  composeMs?: number;
+}
+
+function formatElapsed(milliseconds: number): string {
+  return `${Math.max(0, Math.round(milliseconds))}ms`;
+}
+
+// One line per processed packet, so a real smoke-test log shows where the time
+// between a rendered mention and a sent reply went: the packet batching hold,
+// scheduler queue wait, NVIDIA request, and composer interaction.
+function formatPacketTiming(packet: ScheduledPacket, timing: PacketTiming, finishedAt: number): string {
+  const startedAt = timing.startedAt ?? finishedAt;
+  const submittedAt = timing.submittedAt ?? startedAt;
+  const detectedAt = timing.detectedAt ?? submittedAt;
+  return `${styled('[timing]', 'cyan')} packet=${styled(packet.packetId, 'bold')} ` +
+    `hold=${formatElapsed(submittedAt - detectedAt)} ` +
+    `queue=${formatElapsed(startedAt - submittedAt)} ` +
+    `generate=${formatElapsed(timing.generateMs ?? 0)} ` +
+    `compose=${formatElapsed(timing.composeMs ?? 0)} ` +
+    `total=${formatElapsed(finishedAt - detectedAt)}`;
+}
 type PacketScheduler = ReturnType<typeof createPacketScheduler<ScheduledPacket>>;
 type ContextStoreState = ReturnType<ContextStore['getState']>;
 type MessageText = Pick<ContextMessage, 'messageId' | 'message' | 'mention'>;
@@ -137,16 +187,22 @@ function createWakeSignal(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
-function containsMention(message: string, aliases: readonly string[]): boolean {
-  for (const alias of aliases) {
-    const escapedAlias = alias.trim().split(/\s+/)
+// One case-insensitive pattern is compiled per engine instead of building a
+// RegExp for every alias of every message on every poll. The alternation is
+// equivalent to "any alias matches": a configured name is matched literally, and
+// internal whitespace in an alias may be any run of whitespace.
+function createMentionMatcher(aliases: readonly string[]): (message: string) => boolean {
+  const patterns = aliases
+    .map(alias => alias.trim())
+    .filter(Boolean)
+    .map(alias => alias.split(/\s+/)
       .map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-      .join('\\s+');
-    if (message.match(new RegExp(escapedAlias, 'iu'))) {
-      return true;
-    }
+      .join('\\s+'));
+  if (patterns.length === 0) {
+    return () => false;
   }
-  return false;
+  const matcher = new RegExp(patterns.join('|'), 'iu');
+  return message => matcher.test(message);
 }
 
 function formatPacketMessages(messages: PacketBuilderMessage[]): string {
@@ -230,22 +286,16 @@ function canReadContextStore(
     !packetBuilderState.pendingPacket;
 }
 
-function getRngSkipReason({
-  mainPollInProgress,
+// RNG is opportunistic: it yields to any mention work that is open, queued or
+// active. Cooldown and in-flight RNG state are checked by the caller before this
+// point because those are cheap flag reads and resolve on their own.
+function getRngBlockReason({
   packetScheduler,
   packetBuilderState,
-  rngOperationActive,
-  rngCooldownActive,
 }: {
-  mainPollInProgress: boolean;
   packetScheduler: PacketScheduler;
   packetBuilderState: PacketBuilderState;
-  rngOperationActive: boolean;
-  rngCooldownActive: boolean;
 }): string | null {
-  if (mainPollInProgress) {
-    return 'main poll in progress';
-  }
   if (packetBuilderState.pendingPacket) {
     return 'mention packet open or awaiting submission';
   }
@@ -255,12 +305,6 @@ function getRngSkipReason({
   }
   if (pendingPackets.some(packet => (packet.mentionMessages?.length ?? 0) > 0)) {
     return 'mention packet queued';
-  }
-  if (rngOperationActive) {
-    return 'RNG operation already active';
-  }
-  if (rngCooldownActive) {
-    return 'RNG cooldown active';
   }
   return null;
 }
@@ -464,8 +508,11 @@ export async function startCombustion({
   let rngPacketInFlightId: string | null = null;
   let rngPacketEpoch: number | null = null;
   let lastRngSkipReason: string | null = null;
-  let rngPollTimer: ReturnType<typeof setInterval> | undefined;
   let rngCooldownTimer: ReturnType<typeof setTimeout> | undefined;
+  // Wall clock (not monotonic) so a mocked Date in tests advances the deadline
+  // together with the mocked poll timers. It only gates a 15-second cadence, so
+  // clock adjustments are harmless.
+  let nextRngRollAt = Date.now() + RNG_ROLL_INTERVAL_MS;
   let pollDelayResolve: (() => void) | undefined;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
   let idleDeadline = 0;
@@ -479,41 +526,48 @@ export async function startCombustion({
   // namespaces. Reconciling at read time keeps one observation, one Context
   // Store record, one packet and one reply for that message.
   const messageIdentity = createMessageIdentityTracker();
-
-  const stopRngPolling = (message?: string): void => {
-    if (rngPollTimer === undefined) {
-      return;
+  const mentionsConfiguredAlias = createMentionMatcher(aliases);
+  // First observation time per message, used to report a packet's end-to-end
+  // latency from detection to send.
+  const detectedAtByMessageId = new Map<string, number>();
+  // Content per stable message id, so a message whose id keeps its identity but
+  // whose text changes is still rejected even on polls that do no packet work.
+  // This replaces the content comparison that used to run only because every poll
+  // rebuilt the packet-builder context.
+  const observedTextByMessageId = new Map<string, string>();
+  const packetTimings = new WeakMap<object, PacketTiming>();
+  // Only one packet is ever active (single-active-packet guarantee), so the
+  // processor callbacks can attribute their durations to the active packet.
+  let activePacketTiming: PacketTiming | undefined;
+  const timingForPacket = (packet: object): PacketTiming => {
+    let timing = packetTimings.get(packet);
+    if (!timing) {
+      timing = {};
+      packetTimings.set(packet, timing);
     }
-    clearInterval(rngPollTimer);
-    rngPollTimer = undefined;
-    if (message) {
-      console.log(formatSubsystemStatus('rng', message.replace(/^\[rng\]\s*/, '')));
-    }
+    return timing;
   };
-  const startRngPolling = (
-    message = '[rng] Polling resumed: main poller active',
-    leadingNewline = false,
-  ): void => {
-    if (rngPollTimer !== undefined || !pollRng || stopRequested || pauseGate.isPaused()) {
-      return;
-    }
-    rngPollTimer = setInterval(pollRng, RNG_POLL_INTERVAL_MS);
-    const details = message.replace(/^\[rng\]\s*/, '');
-    console.log(`${leadingNewline ? '\n' : ''}${formatSubsystemStatus('rng', details)}`);
+
+  const scheduleNextRngRoll = (): void => {
+    nextRngRollAt = Date.now() + RNG_ROLL_INTERVAL_MS;
   };
   const startRngCooldown = (details = ''): void => {
+    // The duration is captured when the cooldown starts, so a temperament change
+    // during a cooldown cannot shorten or remove it: the new temperament only
+    // applies from the next cooldown onwards.
+    const cooldownMs = getBotTemperamentCooldownMs(botTemperament);
     rngCooldownActive = true;
     clearTimeout(rngCooldownTimer);
     console.log(formatSubsystemStatus(
       'rng',
-      `Cooldown started: ${styled(`${RNG_COOLDOWN_MS / 1000}s`, 'bold')}` +
+      `Cooldown started: ${styled(`${cooldownMs / 1000}s`, 'bold')}` +
       (details ? ` (${details})` : ''),
     ));
     rngCooldownTimer = setTimeout(() => {
       rngCooldownTimer = undefined;
       rngCooldownActive = false;
       console.log(formatSubsystemStatus('rng', 'Cooldown ended'));
-    }, RNG_COOLDOWN_MS);
+    }, cooldownMs);
   };
   const completeRngPacket = (packetId: string, succeeded: boolean, error?: unknown): void => {
     if (packetId !== rngPacketInFlightId) {
@@ -579,7 +633,6 @@ export async function startCombustion({
       return;
     }
     mode = 'idle';
-    stopRngPolling('[rng] Polling paused: main poller idle');
     console.log(formatSubsystemStatus(
       'poller',
       styled('Idle; no genuinely new message was detected before the threshold.', 'dim'),
@@ -617,7 +670,6 @@ export async function startCombustion({
       return;
     }
     mode = 'polling';
-    startRngPolling();
     wakePending = true;
     console.log(formatSubsystemStatus(
       'poller',
@@ -662,7 +714,6 @@ export async function startCombustion({
       return;
     }
     pauseGate.pause();
-    stopRngPolling('[rng] Polling paused: engine paused');
     clearTimeout(idleTimer);
     idleTimer = undefined;
     pollDelayResolve?.();
@@ -688,7 +739,6 @@ export async function startCombustion({
       await setWakerActive(false);
       wakeSignal.resolve();
     }
-    startRngPolling('[rng] Polling resumed: engine resumed');
     await resetIdleTimer();
     console.log('[engine] Combustion resumed.');
   };
@@ -696,7 +746,6 @@ export async function startCombustion({
   let cleanupPromise: Promise<void> | undefined;
   const cleanup = (): Promise<void> => {
     cleanupPromise ??= (async () => {
-      stopRngPolling();
       clearTimeout(rngCooldownTimer);
       clearTimeout(idleTimer);
       if (packetScheduler) {
@@ -783,26 +832,49 @@ export async function startCombustion({
       }
 
       mainPollInProgress = true;
+      // An RNG opportunity is rated at the end of the poll, but never on the poll
+      // that just handed a mention packet to the scheduler: the scheduler may not
+      // have marked that packet active yet, and a mention must never share a poll
+      // with an opportunistic generation.
+      let mentionPacketSubmittedThisPoll = false;
       try {
+        const pollStartedAt = performance.now();
         const messages = await readLatestMessages();
         if (stopRequested) {
           break;
         }
-
+        const observedAt = performance.now();
         const newMessages: MessageDetails[] = [];
         for (const message of messages) {
           if (message.messageId && !seenMessageIds.has(message.messageId)) {
             seenMessageIds.add(message.messageId);
             newMessages.push(message);
+            detectedAtByMessageId.set(message.messageId, observedAt);
+            if (detectedAtByMessageId.size > MESSAGE_HISTORY_LIMIT) {
+              const oldestMessageId = detectedAtByMessageId.keys().next().value;
+              if (oldestMessageId !== undefined) {
+                detectedAtByMessageId.delete(oldestMessageId);
+              }
+            }
           }
         }
 
         const newMessagesWithMentions = newMessages.map(message => ({
           ...message,
-          mention: containsMention(message.message, aliases),
+          mention: mentionsConfiguredAlias(message.message),
         }));
         const mentionCount = newMessagesWithMentions.filter(message => message.mention).length;
         console.log(formatPollSummary(newMessages.length, mentionCount));
+        if (newMessagesWithMentions.length > 0) {
+          // Detection cost for this batch: how long reading and reconciling the
+          // rendered window took, next to the poll cadence that bounds how long a
+          // message can sit unseen.
+          console.log(
+            `  ${styled('[poll]', 'cyan')} detected ${newMessagesWithMentions.length} ` +
+            `message(s) in ${formatElapsed(observedAt - pollStartedAt)} ` +
+            `(cadence ${formatElapsed(POLL_INTERVAL_MS)}, window ${messages.length})`,
+          );
+        }
         for (const message of newMessagesWithMentions) {
           console.log(
             `  ${styled('New message:', 'green')} id=${message.messageId}; ` +
@@ -813,56 +885,82 @@ export async function startCombustion({
           );
         }
 
-        const newMessageIds = new Set(newMessagesWithMentions.map(message => message.messageId));
-        // Backread-seeded history from the Context Store plus the rendered window
-        // gives the model real conversational context; the packet builder removes
-        // duplicates and anything already in newMessages.
-        const recentContext = [
-          ...contextStore.getRecent(PACKET_CONTEXT_MESSAGE_LIMIT),
-          ...messages,
-        ]
-          .filter(message => message.messageId && !newMessageIds.has(message.messageId))
-          .map(message => ({
-            ...message,
-            mention: containsMention(message.message, aliases),
-          }));
-        const hadPendingPacket = packetBuilderState!.pendingPacket !== null;
-        const result = buildPacketTurn({
-          newMessages: newMessagesWithMentions,
-          recentContext,
-          state: packetBuilderState,
-        });
-        packetBuilderState = result.state;
-        appendContextMessages(
-          contextStore,
-          newMessages,
-          packetScheduler,
-          packetBuilderState,
-          result.packet !== null,
-        );
+        // A poll has packet work only when it observed something new or must
+        // finalize the packet opened by the previous poll. A quiet poll with no
+        // pending packet would otherwise clone the whole Context Store and rebuild
+        // the packet-builder state for no observable change.
+        const hasPacketWork = newMessagesWithMentions.length > 0 ||
+          packetBuilderState!.pendingPacket !== null;
+        if (hasPacketWork) {
+          const newMessageIds = new Set(newMessagesWithMentions.map(message => message.messageId));
+          // Context is consumed only by a packet that opens now; a pending packet
+          // already captured its context and the builder ignores context when the
+          // poll only registers new messages. Assembling it on the trigger poll
+          // instead of on every poll removes a store read plus a full-window copy
+          // from the common quiet poll without changing what the model receives:
+          // the rendered window is the newest view and the store supplies the
+          // older history the window no longer shows.
+          const triggersNewPacket = newMessagesWithMentions.some(message =>
+            message.direction === 'INCOMING' && message.mention);
+          const recentContext = triggersNewPacket
+            ? [
+                ...contextStore.getRecent(PACKET_CONTEXT_MESSAGE_LIMIT),
+                ...messages,
+              ]
+                .filter(message => message.messageId && !newMessageIds.has(message.messageId))
+                .map(message => ({
+                  ...message,
+                  mention: mentionsConfiguredAlias(message.message),
+                }))
+            : [];
+          const hadPendingPacket = packetBuilderState!.pendingPacket !== null;
+          const result = buildPacketTurn({
+            newMessages: newMessagesWithMentions,
+            recentContext,
+            state: packetBuilderState,
+          });
+          packetBuilderState = result.state;
+          appendContextMessages(
+            contextStore,
+            newMessages,
+            packetScheduler,
+            packetBuilderState,
+            result.packet !== null,
+          );
 
-        if (result.pendingPacket && !hadPendingPacket) {
-          printPacketBoundary('PACKET OPENED', result.pendingPacket.packetId);
-          console.log(
-            `${styled('Packet opened this poll:', 'cyan')} ` +
-            `${styled(result.pendingPacket.packetId, 'bold')}`,
-          );
-          logPacket('Initial packet contents', result.pendingPacket);
-        } else if (result.pendingPacket) {
-          console.log(
-            `${styled(`Packet ${result.pendingPacket.packetId}`, 'cyan')} ` +
-            styled('is pending (still pending).', 'dim'),
-          );
-        }
-        if (result.packet) {
-          printPacketBoundary('PACKET FINALIZED', result.packet.packetId);
-          console.log(
-            `${styled('Closure reason:', 'dim')} ` +
-            `${styled(describePacketClosureReason(newMessagesWithMentions.length), 'dim')}`,
-          );
-          logPacket('Final packet contents', result.packet);
-          if (packetScheduler!.submit(result.packet)) {
-            printQueueSnapshot(packetScheduler!);
+          if (result.pendingPacket && !hadPendingPacket) {
+            printPacketBoundary('PACKET OPENED', result.pendingPacket.packetId);
+            console.log(
+              `${styled('Packet opened this poll:', 'cyan')} ` +
+              `${styled(result.pendingPacket.packetId, 'bold')}`,
+            );
+            logPacket('Initial packet contents', result.pendingPacket);
+          } else if (result.pendingPacket) {
+            console.log(
+              `${styled(`Packet ${result.pendingPacket.packetId}`, 'cyan')} ` +
+              styled('is pending (still pending).', 'dim'),
+            );
+          }
+          if (result.packet) {
+            printPacketBoundary('PACKET FINALIZED', result.packet.packetId);
+            console.log(
+              `${styled('Closure reason:', 'dim')} ` +
+              `${styled(describePacketClosureReason(newMessagesWithMentions.length), 'dim')}`,
+            );
+            logPacket('Final packet contents', result.packet);
+            const timing = timingForPacket(result.packet);
+            timing.detectedAt = result.packet.newMessages
+              .map(message => detectedAtByMessageId.get(message.messageId))
+              .filter((value): value is number => typeof value === 'number')
+              .reduce<number | undefined>(
+                (earliest, value) => earliest === undefined ? value : Math.min(earliest, value),
+                undefined,
+              ) ?? observedAt;
+            timing.submittedAt = performance.now();
+            if (packetScheduler!.submit(result.packet)) {
+              mentionPacketSubmittedThisPoll = true;
+              printQueueSnapshot(packetScheduler!);
+            }
           }
         }
 
@@ -871,6 +969,21 @@ export async function startCombustion({
           await resetIdleTimer();
         } else if (idleDeadline <= Date.now() && !wakePending) {
           await enterIdle();
+        }
+
+        // RNG opportunities ride the poller instead of a separate timer: an
+        // opportunity that becomes available (deadline reached, cooldown expired,
+        // mention work released) is evaluated on the next poll, within one poll
+        // interval, and never while a mention poll is still running.
+        try {
+          if (!mentionPacketSubmittedThisPoll) {
+            pollRng?.();
+          }
+        } catch (error) {
+          console.error(formatSubsystemStatus(
+            'rng',
+            styled(`Could not evaluate an RNG opportunity: ${describeError(error)}`, 'red'),
+          ));
         }
       } finally {
         mainPollInProgress = false;
@@ -910,6 +1023,22 @@ export async function startCombustion({
     );
     const reconciled = messageIdentity.reconcile(elements.map(extractMessageDetails));
     reportMergedDuplicates(reconciled.duplicates);
+    for (const message of reconciled.messages) {
+      const previousText = observedTextByMessageId.get(message.messageId);
+      if (previousText === undefined) {
+        observedTextByMessageId.set(message.messageId, message.message);
+        if (observedTextByMessageId.size > MESSAGE_HISTORY_LIMIT) {
+          const oldestMessageId = observedTextByMessageId.keys().next().value;
+          if (oldestMessageId !== undefined) {
+            observedTextByMessageId.delete(oldestMessageId);
+          }
+        }
+      } else if (previousText !== message.message) {
+        throw new Error(
+          `Message ID ${message.messageId} was observed with different content.`,
+        );
+      }
+    }
     return reconciled.messages;
   };
   let seenMessageIds = new Set<string>();
@@ -922,6 +1051,8 @@ export async function startCombustion({
     packetBuilderState.nextPacketNumber = nextPacketNumber;
     contextStore.clear();
     seenMessageIds = new Set(baseline.map(message => message.messageId).filter(Boolean));
+    // Message content is tracked per conversation, but the baseline for the new
+    // destination is read before this reset, so the maps are cleared there.
     appendContextMessages(contextStore, baseline, packetScheduler, packetBuilderState);
     packetBuilderState = buildPacketTurn({
       newMessages: [],
@@ -929,7 +1060,7 @@ export async function startCombustion({
         .filter(message => message.messageId)
         .map(message => ({
           ...message,
-          mention: containsMention(message.message, aliases),
+          mention: mentionsConfiguredAlias(message.message),
         })),
       state: packetBuilderState,
     }).state;
@@ -990,8 +1121,12 @@ export async function startCombustion({
           };
         }
         // A new conversation starts with its own message identities; the
-        // baseline is read with a clean identity map.
+        // baseline is read with a clean identity map. The content and detection
+        // records belong to the previous conversation too: a reused id with
+        // different text is a different message, not a content change.
         messageIdentity.clear();
+        detectedAtByMessageId.clear();
+        observedTextByMessageId.clear();
         baseline = await readLatestMessages();
       } catch (error) {
         const reason = describeError(error);
@@ -1064,38 +1199,57 @@ export async function startCombustion({
       page,
       apiKey,
       generateReply: async (requestApiKey, messages) => {
-        // The model can echo its own alias from earlier assistant turns. The
-        // prompt forbids it, so this only guards the boundary where the raw
-        // reply becomes the message we send.
-        const reply = await generateNvidiaReply(
-          requestApiKey,
-          messages as unknown as readonly BackreadMessage[],
-          { systemInstruction },
-        );
-        const normalizedReply = stripSelfIdentifyingPrefix(
-          reply,
-          { name: configuration.puppetName ?? '', aliases },
-          messages,
-        );
-        if (normalizedReply !== reply) {
-          const trimmedReply = reply.trim();
-          const removedPrefix = trimmedReply
-            .slice(0, Math.max(0, trimmedReply.length - normalizedReply.length))
-            .trim();
-          console.log(
-            `${styled('[reply]', 'cyan')} removed self-identifying prefix: ` +
-            `${JSON.stringify(removedPrefix)}`,
+        const startedAt = performance.now();
+        try {
+          // The model can echo its own alias from earlier assistant turns. The
+          // prompt forbids it, so this only guards the boundary where the raw
+          // reply becomes the message we send.
+          const reply = await generateNvidiaReply(
+            requestApiKey,
+            messages as unknown as readonly BackreadMessage[],
+            { systemInstruction },
           );
+          const normalizedReply = stripSelfIdentifyingPrefix(
+            reply,
+            { name: configuration.puppetName ?? '', aliases },
+            messages,
+          );
+          if (normalizedReply !== reply) {
+            const trimmedReply = reply.trim();
+            const removedPrefix = trimmedReply
+              .slice(0, Math.max(0, trimmedReply.length - normalizedReply.length))
+              .trim();
+            console.log(
+              `${styled('[reply]', 'cyan')} removed self-identifying prefix: ` +
+              `${JSON.stringify(removedPrefix)}`,
+            );
+          }
+          return normalizedReply;
+        } finally {
+          if (activePacketTiming) {
+            activePacketTiming.generateMs = performance.now() - startedAt;
+          }
         }
-        return normalizedReply;
       },
-      composeReply: composeMessengerReply,
+      composeReply: async (packetPage, reply, options) => {
+        const startedAt = performance.now();
+        try {
+          return await composeMessengerReply(packetPage, reply, options);
+        } finally {
+          if (activePacketTiming) {
+            activePacketTiming.composeMs = performance.now() - startedAt;
+          }
+        }
+      },
       pauseGate,
       isCurrent: packet => packetEpochs.get(packet) === destinationEpoch,
       debugMode,
     });
     packetScheduler = createPacketScheduler<ScheduledPacket>(async packet => {
       packetEpochs.set(packet, destinationEpoch);
+      const timing = timingForPacket(packet);
+      timing.startedAt = performance.now();
+      activePacketTiming = timing;
       const isRngPacket = packet.packetId === rngPacketInFlightId;
       if (isRngPacket) {
         console.log(formatSubsystemStatus(
@@ -1114,6 +1268,8 @@ export async function startCombustion({
         throw error;
       } finally {
         completeRngPacket(packet.packetId, succeeded, processingError);
+        console.log(formatPacketTiming(packet, timing, performance.now()));
+        activePacketTiming = undefined;
         // A completed mention reply also starts the RNG cooldown, so a second
         // generation cannot fire for the same turn while the sent message is
         // still travelling back into the poller as an incoming DOM update.
@@ -1198,31 +1354,52 @@ export async function startCombustion({
         .filter(message => message.messageId)
         .map(message => ({
           ...message,
-          mention: containsMention(message.message, aliases),
+          mention: mentionsConfiguredAlias(message.message),
         })),
       state: packetBuilderState,
     }).state;
 
+    // Evaluated at the end of every runtime poll. The 15-second cadence is kept
+    // intact (one roll per window, skips do not consume a roll); what changes is
+    // that the deadline is checked by the poller, so the engine never waits for a
+    // second timer's phase on top of its own poll interval.
     pollRng = () => {
-      console.log(formatSubsystemStatus('rng', styled('Evaluating cycle', 'dim')));
-      const skipReason = getRngSkipReason({
-        mainPollInProgress,
+      if (stopRequested || pauseGate.isPaused() || mode !== 'polling') {
+        return;
+      }
+      // These two clear on their own (cooldown timer, in-flight RNG operation).
+      // They do not consume the deadline, so the roll happens on the first poll
+      // after they clear instead of up to a full cadence later.
+      if (rngCooldownActive || rngOperationActive) {
+        return;
+      }
+      const evaluatedAt = Date.now();
+      if (evaluatedAt < nextRngRollAt) {
+        return;
+      }
+      const blockReason = getRngBlockReason({
         packetScheduler: packetScheduler!,
         packetBuilderState: packetBuilderState!,
-        rngOperationActive,
-        rngCooldownActive,
       });
-      if (skipReason) {
-        if (skipReason !== lastRngSkipReason) {
+      if (blockReason) {
+        // Mention work outranks an opportunistic reply. The deadline stays where
+        // it is, so RNG rolls as soon as the mention path releases.
+        if (blockReason !== lastRngSkipReason) {
           console.log(formatSubsystemStatus(
             'rng',
-            `${styled('Skipped:', 'yellow')} ${skipReason}`,
+            `${styled('Skipped:', 'yellow')} ${blockReason}`,
           ));
         }
-        lastRngSkipReason = skipReason;
+        lastRngSkipReason = blockReason;
         return;
       }
       lastRngSkipReason = null;
+      const overdueMs = evaluatedAt - nextRngRollAt;
+      scheduleNextRngRoll();
+      console.log(formatSubsystemStatus(
+        'rng',
+        `${styled('Evaluating cycle', 'dim')} (due ${formatElapsed(overdueMs)} ago)`,
+      ));
       const latestMessage = contextStore.getRecent(1)[0];
       if (latestMessage?.direction === 'OUTGOING') {
         console.log(formatSubsystemStatus(
@@ -1271,6 +1448,18 @@ export async function startCombustion({
         const packet = buildRngPacket(recentMessages);
         rngPacketInFlightId = packet.packetId;
         rngPacketEpoch = destinationEpoch;
+        // End-to-end timing runs from when the newest message that made the bot
+        // eligible was first observed, so hold time is measured from the
+        // opportunity rather than from the dice roll.
+        const timing = timingForPacket(packet);
+        timing.detectedAt = recentMessages
+          .map(message => detectedAtByMessageId.get(message.messageId))
+          .filter((value): value is number => typeof value === 'number')
+          .reduce<number | undefined>(
+            (latest, value) => latest === undefined ? value : Math.max(latest, value),
+            undefined,
+          );
+        timing.submittedAt = performance.now();
         console.log(formatSubsystemStatus(
           'rng',
           `${styled('Packet created:', 'cyan')} ${styled(packet.packetId, 'bold')} ` +
@@ -1295,8 +1484,17 @@ export async function startCombustion({
           styled(`Could not submit an RNG packet: ${details}`, 'red'),
         ));
       }
-    };
-    startRngPolling('[rng] Polling started', true);
+    }
+    console.log(DEBUG_ENGINE
+      ? formatSubsystemStatus(
+        'rng',
+        `Opportunities evaluated with the poller; at most one roll every ` +
+        `${styled(String(RNG_ROLL_INTERVAL_MS), 'bold')} ms. ` +
+        `Temperament ${styled(botTemperament, 'bold')}: ` +
+        `${styled(String(Math.round(getBotTemperamentYesProbability(botTemperament) * 100)), 'bold')}% yes, ` +
+        `${styled(`${getBotTemperamentCooldownMs(botTemperament) / 1000}s`, 'bold')} cooldown.`,
+      )
+      : formatSubsystemStatus('rng', 'Opportunities evaluated with the poller.'));
     console.log(DEBUG_ENGINE
       ? formatSubsystemStatus(
         'poller',
@@ -1318,6 +1516,10 @@ export async function startCombustion({
       pause: pauseEngine,
       resume: resumeEngine,
       setTemperament(temperament) {
+        // Applies from the next RNG decision onwards: the probability is read at
+        // roll time, and the cooldown length is read when a cooldown starts. A
+        // cooldown already running keeps the duration it started with, so
+        // switching temperament can neither bypass it nor queue a second reply.
         botTemperament = temperament;
       },
       setPersonality(instruction) {

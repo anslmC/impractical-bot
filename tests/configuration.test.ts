@@ -10,8 +10,10 @@ import { tmpdir } from 'node:os';
 import { dirname, join, win32 } from 'node:path';
 import { test, type TestContext } from 'node:test';
 import {
+  BOT_TEMPERAMENT_COOLDOWNS_MS,
   BOT_TEMPERAMENT_YES_PROBABILITIES,
   MAX_PERSONALITY_INSTRUCTION_CHARS,
+  getBotTemperamentCooldownMs,
   getBotTemperamentYesProbability,
   isBotPersonalityMode,
   loadConfiguration,
@@ -317,11 +319,22 @@ test('bot temperaments map deterministically to RNG YES probabilities', () => {
   assert.deepEqual(BOT_TEMPERAMENT_YES_PROBABILITIES, {
     quiet: 0.1,
     balanced: 0.5,
-    talkative: 0.85,
+    talkative: 0.95,
   });
   assert.equal(getBotTemperamentYesProbability('quiet'), 0.1);
   assert.equal(getBotTemperamentYesProbability('balanced'), 0.5);
-  assert.equal(getBotTemperamentYesProbability('talkative'), 0.85);
+  assert.equal(getBotTemperamentYesProbability('talkative'), 0.95);
+});
+
+test('bot temperaments map deterministically to RNG cooldowns', () => {
+  assert.deepEqual(BOT_TEMPERAMENT_COOLDOWNS_MS, {
+    quiet: 25_000,
+    balanced: 15_000,
+    talkative: 6_000,
+  });
+  assert.equal(getBotTemperamentCooldownMs('quiet'), 25_000);
+  assert.equal(getBotTemperamentCooldownMs('balanced'), 15_000);
+  assert.equal(getBotTemperamentCooldownMs('talkative'), 6_000);
 });
 
 test('missing temperament defaults to Balanced and invalid values are rejected', context => {

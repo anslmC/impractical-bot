@@ -29,10 +29,21 @@ export type BrowserId = typeof BROWSER_IDS[number];
 export type BotTemperament = typeof BOT_TEMPERAMENTS[number];
 export type BotPersonalityMode = typeof BOT_PERSONALITY_MODES[number];
 
+// RNG participation settings per temperament. The two settings are independent:
+// probability decides whether an eligible opportunity actually replies, and the
+// cooldown decides how long the engine waits after a reply before another one is
+// possible. Neither changes the runtime poll interval, which is the same for
+// every temperament.
 export const BOT_TEMPERAMENT_YES_PROBABILITIES: Readonly<Record<BotTemperament, number>> = {
   quiet: 0.1,
   balanced: 0.5,
-  talkative: 0.85,
+  talkative: 0.95,
+};
+
+export const BOT_TEMPERAMENT_COOLDOWNS_MS: Readonly<Record<BotTemperament, number>> = {
+  quiet: 25000,
+  balanced: 15000,
+  talkative: 6000,
 };
 
 export interface Configuration {
@@ -63,6 +74,10 @@ export function resolveBotTemperament(
 
 export function getBotTemperamentYesProbability(temperament: BotTemperament): number {
   return BOT_TEMPERAMENT_YES_PROBABILITIES[temperament];
+}
+
+export function getBotTemperamentCooldownMs(temperament: BotTemperament): number {
+  return BOT_TEMPERAMENT_COOLDOWNS_MS[temperament];
 }
 
 export function isBotPersonalityMode(value: unknown): value is BotPersonalityMode {
