@@ -195,7 +195,6 @@ export async function discoverBrowsers(
         addCandidate(browser, path);
       }
     } catch {
-      // Registry failures should not prevent the remaining discovery methods.
     }
   }
 
@@ -206,7 +205,6 @@ export async function discoverBrowsers(
         addCandidate(browser, path);
       }
     } catch {
-      // PATH failures should not prevent the remaining browsers from being checked.
     }
   }
 

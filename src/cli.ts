@@ -161,7 +161,6 @@ function promptSecretTerminal(question: string): Promise<string | null> {
       try {
         stdin.setRawMode(wasRaw ?? false);
       } catch {
-        // The prompt result must not include or expose the submitted value.
       }
       if (wasPaused) {
         stdin.pause();
@@ -416,8 +415,6 @@ async function updatePuppetName(
   }
 }
 
-// Re-reads the configuration immediately before a write so that values persisted
-// while a prompt or runtime call was in flight are not replaced by a stale snapshot.
 function loadLatestConfiguration(
   configurationFilePath: string | undefined,
   writeError: Output,
@@ -454,9 +451,6 @@ type OwnedWriteConfiguration =
   | { status: 'valid'; configuration: Configuration }
   | { status: 'invalid'; reason: string };
 
-// Runtime persistence handlers and the startup puppet-name write reload the file
-// immediately before saving so a value persisted after the engine snapshot is not
-// replaced by stale data. Only the fields owned by the operation are overlaid.
 function readConfigurationForOwnedWrite(
   configurationFilePath: string | undefined,
 ): OwnedWriteConfiguration {
@@ -548,8 +542,6 @@ async function handleChangeBrowser(
     return 1;
   }
 
-  // The graceful engine shutdown closes the configured browser, so the browser must
-  // not be closed a second time after shutdown has been confirmed.
   let browserClosedByEngineShutdown = false;
   if (runtimeStatus.status === 'running') {
     let stopResult: RuntimeStopResult;
@@ -599,8 +591,6 @@ async function handleChangeBrowser(
         );
         return 1;
       }
-      // Configuration may have been persisted while the engine shut down, so the
-      // reloaded values replace the stale in-memory snapshot for every later step.
       currentConfiguration = reloadedConfiguration;
       browserClosedByEngineShutdown = true;
     }

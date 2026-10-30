@@ -463,7 +463,6 @@ async function handlePinRestoration(
       await confirmation.waitFor({ state: 'hidden', timeout: pinPromptTimeoutMs });
       confirmationDisappeared = !await confirmation.isVisible();
     } catch {
-      // Report unsuccessful dismissal below.
     }
     if (!confirmationDisappeared) {
       throw new Error('The PIN skip confirmation dialog did not disappear.');
@@ -605,7 +604,6 @@ export async function navigatePageToMessengerDestination(
   try {
     await page.waitForLoadState('networkidle', { timeout: 5_000 });
   } catch {
-    // Messenger may keep network activity open; the checks below validate the settled page.
   }
 
   await waitForConfiguredConversation(page, expectedConversationId, readinessTimeoutMs);
@@ -730,7 +728,6 @@ export async function prepareConfiguredBrowser(
       timeout: options.pinPromptTimeoutMs ?? DEFAULT_PIN_PROMPT_TIMEOUT_MS,
     });
   } catch {
-    // No restoration prompt is a valid path; final readiness checks still apply.
   }
   const pinDialogs = await findVisiblePinDialogs(page);
   if (pinDialogs.length > 1) {
@@ -904,7 +901,6 @@ export async function navigateConfiguredBrowserToMessageDestination(
     try {
       await page.waitForLoadState('networkidle', { timeout: 5_000 });
     } catch {
-      // Messenger may keep network activity open; verification below checks the settled page.
     }
 
     if (page.isClosed()) {
@@ -1199,9 +1195,6 @@ export async function assertConfiguredBrowserCanStart(
   });
 }
 
-// A browser spawned by this launch attempt is owned by it even when no Playwright
-// session was created, so a failed attachment must still close it. The process id
-// check keeps cleanup limited to the browser this attempt actually spawned.
 async function closeOwnedBrowserAfterFailedLaunch(
   configuration: Configuration,
   options: BrowserLaunchOptions,

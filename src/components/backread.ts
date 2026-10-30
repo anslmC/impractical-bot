@@ -442,8 +442,6 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
       ariaLabel: message.ariaLabel,
     };
   });
-  // One logical message can be rendered under two `data-message-id` namespaces;
-  // seeding both would put one message in the Context Store twice.
   const identity = createMessageIdentityTracker();
   const reconciled = identity.reconcile(collectedBackreadMessages.map(message => ({
     ...message,

@@ -769,8 +769,6 @@ export type RuntimeStatusResult =
   | { status: 'running'; instanceId: string }
   | { status: 'not-running' };
 
-// Reads the owner greeting without sending a command, so a running engine can be
-// detected without pausing, stopping, or otherwise changing its state.
 export async function requestRuntimeStatus(
   configurationFilePath?: string,
 ): Promise<RuntimeStatusResult> {
@@ -898,9 +896,6 @@ export interface RuntimeShutdownWaitOptions {
   delay?: (milliseconds: number) => Promise<void>;
 }
 
-// A successful stop response is written before the owner releases its endpoint, so
-// shutdown is confirmed by observing that the endpoint is no longer owned rather
-// than assuming it from the stop request alone.
 export async function waitForRuntimeShutdown(
   configurationFilePath?: string,
   options: RuntimeShutdownWaitOptions = {},
@@ -928,7 +923,6 @@ export async function waitForRuntimeShutdown(
       }
       lastError = undefined;
     } catch (error) {
-      // Endpoint teardown can interrupt an individual probe; keep waiting to the deadline.
       lastError = error instanceof Error ? error.message : String(error);
     }
 

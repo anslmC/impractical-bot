@@ -18,14 +18,7 @@ import type { BackreadMessage } from '../components/backread.js';
 const NVIDIA_CHAT_COMPLETIONS_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
 const NVIDIA_CHAT_COMPLETIONS_MODEL = 'nvidia/nemotron-3.5-lightning-30b-a3b';
 const DEFAULT_REQUEST_TIMEOUT_MS = 50_000;
-// A Messenger reply is a chat message, not an essay: cap the completion so a
-// runaway generation cannot ramble, and so a slow response cannot widen the
-// window in which another reply is generated for the same trigger.
 const REPLY_MAX_TOKENS = 256;
-// Every incoming message is kept because it carries the human's instructions,
-// but only the newest few assistant turns are sent: a long run of the bot's own
-// earlier replies makes the model continue an obsolete exchange (for example,
-// re-arguing about its own alias) instead of answering the newest message.
 const MAX_ASSISTANT_HISTORY_TURNS = 3;
 const VALIDATION_MAX_TOKENS = 4096;
 const DEFAULT_SYSTEM_INSTRUCTION = 'Write a short, natural Messenger reply that matches the conversation\'s tone and directly addresses the latest incoming message. Aim for roughly 3–12 words when appropriate, but do not force an exact word count; use more words when needed for a natural answer. Avoid unsolicited email copy, calls to action, headings, labels, and unrelated prefixes such as "Verse 3.1". Return only the reply text. This reply is a proposal until the application sends it.';
@@ -147,7 +140,6 @@ export function saveNvidiaApiKey(environmentFilePath: string, apiKey: string): v
       try {
         closeSync(descriptor);
       } catch {
-        // Keep the original persistence failure.
       }
     }
     try {
@@ -155,7 +147,6 @@ export function saveNvidiaApiKey(environmentFilePath: string, apiKey: string): v
         unlinkSync(temporaryPath);
       }
     } catch {
-      // Keep the original persistence failure.
     }
     throw new Error('Unable to save the application NVIDIA API key.');
   }
@@ -259,10 +250,6 @@ interface ConversationTurn {
   content: string;
 }
 
-// Keeps every incoming turn (they carry the human's instructions and the current
-// topic) and only the newest assistant turns, so recent continuity survives while
-// stale self-replies cannot dominate the request. Order is never changed and the
-// latest incoming message stays last because it is the newest turn.
 function limitAssistantHistory(
   turns: readonly ConversationTurn[],
 ): ConversationTurn[] {
@@ -290,10 +277,6 @@ export async function generateNvidiaReply(
     throw new NvidiaApiKeyError('authentication', 'The NVIDIA API key is empty or malformed.');
   }
 
-  // One API turn per Messenger message keeps speaker attribution and turn
-  // boundaries intact: every incoming message is a user turn prefixed with its
-  // sender, and every outgoing message is an assistant turn (the bot's own post).
-  // Messages are never merged or repeated.
   const conversationMessages: ConversationTurn[] = [];
   for (const message of messages) {
     if (message.direction !== 'INCOMING' && message.direction !== 'OUTGOING') {
@@ -326,8 +309,6 @@ export async function generateNvidiaReply(
   if (latestIncomingIndex === -1) {
     throw new Error('No incoming Messenger messages are available to generate a reply.');
   }
-  // Trailing assistant turns are replies that the current reply supersedes; the
-  // request must end with the message being answered, without restating it twice.
   const requestMessages = limitAssistantHistory(
     conversationMessages.slice(0, latestIncomingIndex + 1),
   );

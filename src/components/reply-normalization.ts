@@ -53,10 +53,6 @@ function prohibitsSelfReference(text: string): boolean {
   return PROHIBITION_CUE.test(text);
 }
 
-// The model occasionally echoes its own alias from earlier assistant turns even
-// though the identity layer forbids it. Only an explicit request to reproduce
-// the alias (or a short "again" continuation of one) justifies keeping a reply
-// that starts with it.
 function isRequestedSelfReference(
   identity: SelfIdentity,
   messages: readonly ReplyContextMessage[],
@@ -81,9 +77,6 @@ function isRequestedSelfReference(
   return false;
 }
 
-// Removes a leading self-identifying name or alias from an ordinary reply. It
-// never touches the rest of the message, never strips a mention of someone else,
-// and never rewrites occurrences beyond the start of the reply.
 export function stripSelfIdentifyingPrefix(
   reply: string,
   identity: SelfIdentity,
@@ -105,7 +98,6 @@ export function stripSelfIdentifyingPrefix(
     }
     const remainder = trimmedReply.slice(match[0].length).trim();
     if (!remainder) {
-      // The whole reply is the alias; sending nothing is worse than sending it.
       return reply;
     }
     return remainder;

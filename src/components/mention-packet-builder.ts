@@ -46,9 +46,6 @@ function normalizeMessage(message: PacketBuilderMessage): PacketBuilderMessage {
   };
 }
 
-// A new message may open or extend a mention packet only when Messenger reported
-// it as INCOMING. Outgoing replies can echo the bot's own alias, so direction is
-// enforced here independently of how the mention flag was computed.
 function isMentionTrigger(message: PacketBuilderMessage): boolean {
   return message.direction === 'INCOMING' && message.mention === true;
 }
@@ -146,9 +143,6 @@ export function buildPacketTurn({
     pendingPacket.mentionMessages.push(
       ...uniqueNewMessages.filter(isMentionTrigger).map(message => ({ ...message })),
     );
-    // Context supplied for the trigger may already contain the trigger itself
-    // (for example when it comes from the Context Store). A packet must never
-    // send the same message twice: once as context and once as new work.
     const newMessageIds = new Set(pendingPacket.newMessages.map(message => message.messageId));
     pendingPacket.contextMessages = pendingPacket.contextMessages
       .filter(message => !newMessageIds.has(message.messageId));

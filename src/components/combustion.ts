@@ -49,37 +49,13 @@ const MESSAGE_SELECTOR =
   '[data-scope="messages_table"][aria-roledescription="message"][data-message-id]';
 const LOG_SELECTOR = '[role="log"][aria-live="polite"]';
 const WAKER_MESSAGE_SELECTOR = '[data-message-id]';
-// Per-poll DOM window. Applied to the rendered message list before stable-ID
-// deduplication and identity reconciliation, so every message in the window is
-// examined; a burst larger than this within one poll interval would lose its
-// oldest messages permanently (they never enter the Context Store). It is not a
-// latency lever: the window bounds the number of small DOM nodes read, which is
-// negligible next to the poll interval, while shrinking it can silently skip a
-// mention that is the oldest message of a burst (tests/combustion.test.ts pins
-// that case with a ten-message burst). Independent of CONTEXT_STORE_CAPACITY.
 const MESSAGE_LIMIT = 20;
 const CONTEXT_STORE_CAPACITY = 60;
-// Runtime poll cadence. A mention is detected by the first poll after it is
-// rendered, and its packet is finalized on the next poll so a short burst becomes
-// one reply. Both waits are bounded by this interval, which makes it the largest
-// controllable latency in the pipeline (the model request is the other one).
 const POLL_INTERVAL_MS = 1500;
-// RNG opportunity cadence: every actual dice roll is spaced at least this far
-// apart. The deadline is checked at the end of each runtime poll, which already
-// runs every POLL_INTERVAL_MS, so an opportunity that becomes available is
-// evaluated within one poll interval instead of waiting for a separate
-// 15-second timer phase. The cadence itself is unchanged: at most one roll per
-// window, and skips do not consume a roll.
-const RNG_ROLL_INTERVAL_MS = 15000;
+const RNG_ROLL_INTERVAL_MS = 7000;
 const RNG_CONTEXT_MESSAGE_LIMIT = 10;
 const PACKET_CONTEXT_MESSAGE_LIMIT = 20;
-// The cooldown length is per temperament (src/config/configuration.ts): Quiet
-// waits 25 seconds, Balanced 15 seconds, and Talkative 6 seconds. Probability
-// and cooldown are separate levers; neither modifies the poll interval above.
 const IDLE_THRESHOLD_MS = 120000;
-// Bound for the per-engine message history maps (detection timestamps and the
-// content watch). Nothing on the reply path depends on entries older than the
-// current poll window, and a long session must not grow them without limit.
 const MESSAGE_HISTORY_LIMIT = 200;
 const LOG_PREFIX = '__MESSENGER_WAKER__:';
 const DEBUG_ENGINE = true;
@@ -103,8 +79,6 @@ type ScheduledPacket = (PacketBuilderPacket | RngPacket) & {
   mentionMessages?: PacketBuilderMessage[];
 };
 
-// Per-packet stage timing. Monotonic (performance.now) so mocked wall clocks in
-// tests and real clock changes cannot distort a measurement.
 interface PacketTiming {
   detectedAt?: number;
   submittedAt?: number;
@@ -117,9 +91,6 @@ function formatElapsed(milliseconds: number): string {
   return `${Math.max(0, Math.round(milliseconds))}ms`;
 }
 
-// One line per processed packet, so a real smoke-test log shows where the time
-// between a rendered mention and a sent reply went: the packet batching hold,
-// scheduler queue wait, NVIDIA request, and composer interaction.
 function formatPacketTiming(packet: ScheduledPacket, timing: PacketTiming, finishedAt: number): string {
   const startedAt = timing.startedAt ?? finishedAt;
   const submittedAt = timing.submittedAt ?? startedAt;
@@ -187,10 +158,6 @@ function createWakeSignal(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
-// One case-insensitive pattern is compiled per engine instead of building a
-// RegExp for every alias of every message on every poll. The alternation is
-// equivalent to "any alias matches": a configured name is matched literally, and
-// internal whitespace in an alias may be any run of whitespace.
 function createMentionMatcher(aliases: readonly string[]): (message: string) => boolean {
   const patterns = aliases
     .map(alias => alias.trim())
@@ -286,9 +253,6 @@ function canReadContextStore(
     !packetBuilderState.pendingPacket;
 }
 
-// RNG is opportunistic: it yields to any mention work that is open, queued or
-// active. Cooldown and in-flight RNG state are checked by the caller before this
-// point because those are cheap flag reads and resolve on their own.
 function getRngBlockReason({
   packetScheduler,
   packetBuilderState,
@@ -509,9 +473,6 @@ export async function startCombustion({
   let rngPacketEpoch: number | null = null;
   let lastRngSkipReason: string | null = null;
   let rngCooldownTimer: ReturnType<typeof setTimeout> | undefined;
-  // Wall clock (not monotonic) so a mocked Date in tests advances the deadline
-  // together with the mocked poll timers. It only gates a 15-second cadence, so
-  // clock adjustments are harmless.
   let nextRngRollAt = Date.now() + RNG_ROLL_INTERVAL_MS;
   let pollDelayResolve: (() => void) | undefined;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -522,22 +483,11 @@ export async function startCombustion({
   let packetBuilderState: PacketBuilderState | undefined;
   let pollRng: (() => void) | undefined;
   let listenerAttached = false;
-  // Messenger can render one logical message under two `data-message-id`
-  // namespaces. Reconciling at read time keeps one observation, one Context
-  // Store record, one packet and one reply for that message.
   const messageIdentity = createMessageIdentityTracker();
   const mentionsConfiguredAlias = createMentionMatcher(aliases);
-  // First observation time per message, used to report a packet's end-to-end
-  // latency from detection to send.
   const detectedAtByMessageId = new Map<string, number>();
-  // Content per stable message id, so a message whose id keeps its identity but
-  // whose text changes is still rejected even on polls that do no packet work.
-  // This replaces the content comparison that used to run only because every poll
-  // rebuilt the packet-builder context.
   const observedTextByMessageId = new Map<string, string>();
   const packetTimings = new WeakMap<object, PacketTiming>();
-  // Only one packet is ever active (single-active-packet guarantee), so the
-  // processor callbacks can attribute their durations to the active packet.
   let activePacketTiming: PacketTiming | undefined;
   const timingForPacket = (packet: object): PacketTiming => {
     let timing = packetTimings.get(packet);
@@ -552,9 +502,6 @@ export async function startCombustion({
     nextRngRollAt = Date.now() + RNG_ROLL_INTERVAL_MS;
   };
   const startRngCooldown = (details = ''): void => {
-    // The duration is captured when the cooldown starts, so a temperament change
-    // during a cooldown cannot shorten or remove it: the new temperament only
-    // applies from the next cooldown onwards.
     const cooldownMs = getBotTemperamentCooldownMs(botTemperament);
     rngCooldownActive = true;
     clearTimeout(rngCooldownTimer);
@@ -769,7 +716,6 @@ export async function startCombustion({
             }
           });
         } catch {
-          // The page may have closed before observer cleanup.
         }
         observerAttached = false;
       }
@@ -832,10 +778,6 @@ export async function startCombustion({
       }
 
       mainPollInProgress = true;
-      // An RNG opportunity is rated at the end of the poll, but never on the poll
-      // that just handed a mention packet to the scheduler: the scheduler may not
-      // have marked that packet active yet, and a mention must never share a poll
-      // with an opportunistic generation.
       let mentionPacketSubmittedThisPoll = false;
       try {
         const pollStartedAt = performance.now();
@@ -866,9 +808,6 @@ export async function startCombustion({
         const mentionCount = newMessagesWithMentions.filter(message => message.mention).length;
         console.log(formatPollSummary(newMessages.length, mentionCount));
         if (newMessagesWithMentions.length > 0) {
-          // Detection cost for this batch: how long reading and reconciling the
-          // rendered window took, next to the poll cadence that bounds how long a
-          // message can sit unseen.
           console.log(
             `  ${styled('[poll]', 'cyan')} detected ${newMessagesWithMentions.length} ` +
             `message(s) in ${formatElapsed(observedAt - pollStartedAt)} ` +
@@ -885,21 +824,10 @@ export async function startCombustion({
           );
         }
 
-        // A poll has packet work only when it observed something new or must
-        // finalize the packet opened by the previous poll. A quiet poll with no
-        // pending packet would otherwise clone the whole Context Store and rebuild
-        // the packet-builder state for no observable change.
         const hasPacketWork = newMessagesWithMentions.length > 0 ||
           packetBuilderState!.pendingPacket !== null;
         if (hasPacketWork) {
           const newMessageIds = new Set(newMessagesWithMentions.map(message => message.messageId));
-          // Context is consumed only by a packet that opens now; a pending packet
-          // already captured its context and the builder ignores context when the
-          // poll only registers new messages. Assembling it on the trigger poll
-          // instead of on every poll removes a store read plus a full-window copy
-          // from the common quiet poll without changing what the model receives:
-          // the rendered window is the newest view and the store supplies the
-          // older history the window no longer shows.
           const triggersNewPacket = newMessagesWithMentions.some(message =>
             message.direction === 'INCOMING' && message.mention);
           const recentContext = triggersNewPacket
@@ -971,10 +899,6 @@ export async function startCombustion({
           await enterIdle();
         }
 
-        // RNG opportunities ride the poller instead of a separate timer: an
-        // opportunity that becomes available (deadline reached, cooldown expired,
-        // mention work released) is evaluated on the next poll, within one poll
-        // interval, and never while a mention poll is still running.
         try {
           if (!mentionPacketSubmittedThisPoll) {
             pollRng?.();
@@ -1051,8 +975,6 @@ export async function startCombustion({
     packetBuilderState.nextPacketNumber = nextPacketNumber;
     contextStore.clear();
     seenMessageIds = new Set(baseline.map(message => message.messageId).filter(Boolean));
-    // Message content is tracked per conversation, but the baseline for the new
-    // destination is read before this reset, so the maps are cleared there.
     appendContextMessages(contextStore, baseline, packetScheduler, packetBuilderState);
     packetBuilderState = buildPacketTurn({
       newMessages: [],
@@ -1120,10 +1042,6 @@ export async function startCombustion({
             reason: 'The engine stopped during destination navigation.',
           };
         }
-        // A new conversation starts with its own message identities; the
-        // baseline is read with a clean identity map. The content and detection
-        // records belong to the previous conversation too: a reused id with
-        // different text is a different message, not a content change.
         messageIdentity.clear();
         detectedAtByMessageId.clear();
         observedTextByMessageId.clear();
@@ -1201,9 +1119,6 @@ export async function startCombustion({
       generateReply: async (requestApiKey, messages) => {
         const startedAt = performance.now();
         try {
-          // The model can echo its own alias from earlier assistant turns. The
-          // prompt forbids it, so this only guards the boundary where the raw
-          // reply becomes the message we send.
           const reply = await generateNvidiaReply(
             requestApiKey,
             messages as unknown as readonly BackreadMessage[],
@@ -1270,9 +1185,6 @@ export async function startCombustion({
         completeRngPacket(packet.packetId, succeeded, processingError);
         console.log(formatPacketTiming(packet, timing, performance.now()));
         activePacketTiming = undefined;
-        // A completed mention reply also starts the RNG cooldown, so a second
-        // generation cannot fire for the same turn while the sent message is
-        // still travelling back into the poller as an incoming DOM update.
         if (succeeded && !isRngPacket && !stopRequested) {
           startRngCooldown('reply sent');
         }
@@ -1359,17 +1271,10 @@ export async function startCombustion({
       state: packetBuilderState,
     }).state;
 
-    // Evaluated at the end of every runtime poll. The 15-second cadence is kept
-    // intact (one roll per window, skips do not consume a roll); what changes is
-    // that the deadline is checked by the poller, so the engine never waits for a
-    // second timer's phase on top of its own poll interval.
     pollRng = () => {
       if (stopRequested || pauseGate.isPaused() || mode !== 'polling') {
         return;
       }
-      // These two clear on their own (cooldown timer, in-flight RNG operation).
-      // They do not consume the deadline, so the roll happens on the first poll
-      // after they clear instead of up to a full cadence later.
       if (rngCooldownActive || rngOperationActive) {
         return;
       }
@@ -1382,8 +1287,6 @@ export async function startCombustion({
         packetBuilderState: packetBuilderState!,
       });
       if (blockReason) {
-        // Mention work outranks an opportunistic reply. The deadline stays where
-        // it is, so RNG rolls as soon as the mention path releases.
         if (blockReason !== lastRngSkipReason) {
           console.log(formatSubsystemStatus(
             'rng',
@@ -1448,9 +1351,6 @@ export async function startCombustion({
         const packet = buildRngPacket(recentMessages);
         rngPacketInFlightId = packet.packetId;
         rngPacketEpoch = destinationEpoch;
-        // End-to-end timing runs from when the newest message that made the bot
-        // eligible was first observed, so hold time is measured from the
-        // opportunity rather than from the dice roll.
         const timing = timingForPacket(packet);
         timing.detectedAt = recentMessages
           .map(message => detectedAtByMessageId.get(message.messageId))
@@ -1516,10 +1416,6 @@ export async function startCombustion({
       pause: pauseEngine,
       resume: resumeEngine,
       setTemperament(temperament) {
-        // Applies from the next RNG decision onwards: the probability is read at
-        // roll time, and the cooldown length is read when a cooldown starts. A
-        // cooldown already running keeps the duration it started with, so
-        // switching temperament can neither bypass it nor queue a second reply.
         botTemperament = temperament;
       },
       setPersonality(instruction) {

@@ -1616,14 +1616,14 @@ test('RNG decision boundaries follow each temperament without sampling randomnes
   assert.equal(shouldRngRespond('talkative', 0.95), false);
 });
 
-// The RNG cadence is a 15-second roll deadline checked at the end of each poll,
+// The RNG cadence is a 7-second roll deadline checked at the end of each poll,
 // not a second interval timer. These tests use the mocked Date so the deadline
 // advances with the poll timers and each tick plus flush is exactly one poll.
 function countRngRolls(logs: readonly string[]): number {
   return logs.filter(line => line.includes('[rng] Evaluating cycle')).length;
 }
 
-test('RNG rolls are evaluated by the poller at the 15-second deadline, once per window', async context => {
+test('RNG rolls are evaluated by the poller at the 7-second deadline, once per window', async context => {
   context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
   const originalRandom = Math.random;
   const originalLog = console.log;
@@ -1662,9 +1662,9 @@ test('RNG rolls are evaluated by the poller at the 15-second deadline, once per 
     inject([{ messageId: 'chat-1', sender: 'Alex', message: 'just chatting' }]);
     await pollsTo(1_500);
     assert.deepEqual(contextStore.getState().messageIds, ['chat-1'], 'the opportunity is observed');
-    assert.equal(countRngRolls(logs), 0, 'no roll happens before the 15-second deadline');
+    assert.equal(countRngRolls(logs), 0, 'no roll happens before the 7-second deadline');
 
-    await pollsTo(13_500);
+    await pollsTo(6_000);
     assert.equal(countRngRolls(logs), 1, 'the deadline is evaluated on the poll that reaches it');
     const evaluation = logs.find(line => line.includes('[rng] Evaluating cycle'));
     assert.ok(evaluation);
@@ -1678,7 +1678,7 @@ test('RNG rolls are evaluated by the poller at the 15-second deadline, once per 
     await pollsTo(1_500);
     assert.equal(countRngRolls(logs), 1, 'later polls inside the window never roll again');
 
-    await pollsTo(15_000);
+    await pollsTo(6_000);
     assert.equal(countRngRolls(logs), 2, 'the next window rolls at its own deadline');
   } finally {
     await controller.stop();
@@ -1824,11 +1824,12 @@ test('a mention keeps priority over an RNG opportunity without consuming it', as
   });
 
   try {
+    await pollsTo(4_500);
     inject([{ messageId: 'mention-1', sender: 'Alex', message: 'hey @Bot are you around?' }]);
     await pollsTo(1_500);
-    await pollsTo(15_000);
-    // The mention packet is submitted on this poll; the RNG deadline passed on the
-    // same poll, so RNG must not ride along.
+    await pollsTo(1_500);
+    // The mention packet is submitted on the poll that reaches the 7-second
+    // deadline, so RNG must not ride along.
     assert.equal(generations.length, 1, 'the mention is answered');
     assert.equal(countRngRolls(logs), 0, 'no RNG roll on the poll that submitted the mention');
 

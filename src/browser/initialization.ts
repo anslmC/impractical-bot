@@ -680,9 +680,6 @@ export async function initializeConfiguration(
     customPersonalityInstruction,
   );
 
-  // Prompts and browser discovery can leave the file changed by another process.
-  // Reload before writing, require the same configuration state, and overlay only
-  // the fields this run selected onto the fresh validated values.
   const latest = reloadConfigurationForSave(configurationFilePath, writeError);
   if (latest === undefined) {
     return 'failed';

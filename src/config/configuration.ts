@@ -20,20 +20,12 @@ export const DEFAULT_BOT_TEMPERAMENT = 'balanced' as const;
 export const BOT_PERSONALITY_MODES = ['default', 'custom'] as const;
 export const DEFAULT_BOT_PERSONALITY_MODE = 'default' as const;
 
-// Bounded so a custom instruction can always be transported over the runtime
-// control protocol (see MAX_LINE_LENGTH in runtime-control.ts) without
-// truncation or fragmentation.
 export const MAX_PERSONALITY_INSTRUCTION_CHARS = 4000;
 
 export type BrowserId = typeof BROWSER_IDS[number];
 export type BotTemperament = typeof BOT_TEMPERAMENTS[number];
 export type BotPersonalityMode = typeof BOT_PERSONALITY_MODES[number];
 
-// RNG participation settings per temperament. The two settings are independent:
-// probability decides whether an eligible opportunity actually replies, and the
-// cooldown decides how long the engine waits after a reply before another one is
-// possible. Neither changes the runtime poll interval, which is the same for
-// every temperament.
 export const BOT_TEMPERAMENT_YES_PROBABILITIES: Readonly<Record<BotTemperament, number>> = {
   quiet: 0.1,
   balanced: 0.5,
@@ -437,7 +429,6 @@ export function saveConfiguration(value: unknown, filePath?: string): Configurat
       try {
         closeSync(descriptor);
       } catch {
-        // Preserve the original persistence error.
       }
     }
     try {
@@ -445,7 +436,6 @@ export function saveConfiguration(value: unknown, filePath?: string): Configurat
         unlinkSync(temporaryPath);
       }
     } catch {
-      // Preserve the original persistence error.
     }
     throw error;
   }
