@@ -102,17 +102,18 @@ export async function promptBotTemperament(
     talkative: 'Talkative',
   };
   writeOutput('Bot temperament:');
-  for (const temperament of BOT_TEMPERAMENTS) {
+  BOT_TEMPERAMENTS.forEach((temperament, index) => {
     const yesProbability = Math.round(getBotTemperamentYesProbability(temperament) * 100);
     writeOutput(
-      `  ${temperament === currentTemperament ? '*' : ' '} ${labels[temperament]}: ` +
-      `${yesProbability}% yes / ${100 - yesProbability}% no`,
+      `  [${index + 1}] ${labels[temperament]}: ` +
+      `${yesProbability}% yes / ${100 - yesProbability}% no` +
+      (temperament === currentTemperament ? ' (current)' : ''),
     );
-  }
+  });
 
   while (true) {
     const answer = await prompt(
-      `Select bot temperament [quiet, balanced, talkative] (default: ${labels[currentTemperament]}): `,
+      `Select temperament [1-${BOT_TEMPERAMENTS.length}] (default: ${labels[currentTemperament]}): `,
     );
     if (answer === null) {
       return null;
@@ -131,7 +132,7 @@ export async function promptBotTemperament(
     if (normalized === '3' || normalized === 't' || normalized === 'talkative') {
       return 'talkative';
     }
-    writeError('Choose Quiet, Balanced, or Talkative. The bot temperament was not changed.');
+    writeError('Choose 1 (Quiet), 2 (Balanced), or 3 (Talkative). The bot temperament was not changed.');
   }
 }
 
@@ -178,18 +179,19 @@ export async function promptBotPersonality(
     custom: 'Custom',
   };
   writeOutput('Bot personality:');
-  for (const mode of BOT_PERSONALITY_MODES) {
+  BOT_PERSONALITY_MODES.forEach((mode, index) => {
     writeOutput(
-      `  ${mode === currentMode ? '*' : ' '} ${labels[mode]}: ` +
+      `  [${index + 1}] ${labels[mode]}: ` +
         (mode === 'default'
           ? 'Existing personality behavior'
-          : 'Your own custom instruction block'),
+          : 'Your own custom instruction block') +
+        (mode === currentMode ? ' (current)' : ''),
     );
-  }
+  });
 
   while (true) {
     const answer = await prompt(
-      `Select personality [default, custom] (default: ${labels[currentMode]}): `,
+      `Select personality [1-${BOT_PERSONALITY_MODES.length}] (default: ${labels[currentMode]}): `,
     );
     if (answer === null) {
       return null;
@@ -202,17 +204,17 @@ export async function promptBotPersonality(
       }
       return { mode: 'default' };
     }
-    if (normalized === 'default') {
+    if (normalized === '1' || normalized === 'default') {
       return { mode: 'default' };
     }
-    if (normalized === 'custom') {
+    if (normalized === '2' || normalized === 'custom') {
       const instruction = await promptMultilinePersonality(prompt, writeOutput, writeError);
       if (instruction === null) {
         return null;
       }
       return { mode: 'custom', instruction };
     }
-    writeError('Choose Default or Custom. The personality was not changed.');
+    writeError('Choose 1 (Default) or 2 (Custom). The personality was not changed.');
   }
 }
 

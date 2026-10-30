@@ -61,8 +61,8 @@ const MESSAGE_LIMIT = 20;
 const CONTEXT_STORE_CAPACITY = 60;
 const POLL_INTERVAL_MS = 1500;
 const RNG_ROLL_INTERVAL_MS = 7000;
-const RNG_CONTEXT_MESSAGE_LIMIT = 10;
-const PACKET_CONTEXT_MESSAGE_LIMIT = 20;
+const RNG_CONTEXT_MESSAGE_LIMIT = 6;
+const PACKET_CONTEXT_MESSAGE_LIMIT = 5;
 const IDLE_THRESHOLD_MS = 120000;
 const MESSAGE_HISTORY_LIMIT = 200;
 const LOG_PREFIX = '__MESSENGER_WAKER__:';
@@ -846,6 +846,7 @@ export async function startCombustion({
                 ...messages,
               ]
                 .filter(message => message.messageId && !newMessageIds.has(message.messageId))
+                .slice(-PACKET_CONTEXT_MESSAGE_LIMIT)
                 .map(message => ({
                   ...message,
                   mention: mentionsConfiguredAlias(message.message),

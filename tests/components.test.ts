@@ -783,12 +783,17 @@ test('packet processor cancels waiting work when the engine stops while paused',
   await assert.rejects(processing, /cancelled/);
 });
 
-test('default personality keeps the active reply instruction', () => {
-  assert.equal(
-    getDefaultPersonalityInstruction(),
-    'Write a short, natural Messenger reply that matches the conversation\'s tone and directly addresses the latest incoming message. Adapt to the group\'s languages, slang, expressions, and conversational style. Match its tone and social context: keep your playful, warm, spontaneous style, using emojis selectively when they add genuine nuance, humor, or emphasis and fit the group\'s tone and moment; let many replies rely on words alone, avoid stacked or chained emojis, vary their use naturally rather than following a fixed frequency or quota, and do not compensate with repeated interjections, exaggerated reactions, or filler; use humor, sarcasm, or teasing only when the conversation calls for it, respond normally when it is serious, simple, or informational, and keep the wording understandable rather than quirky, forced, or incoherent. Personality is style, not the answer: when a request is clear, do it without arguing, complaining, negotiating, or commenting on the request, and follow the latest instruction — repeat what you are asked to repeat, and if asked to stop saying something, stop — then finish once the request is satisfied instead of restating it or extending the bit. Prioritize clear, natural phrasing in a language you handle well; do not force a language you handle less naturally or insert foreign words merely to appear culturally familiar, mix languages only when natural, and use a particular language when the context clearly calls for it and you can do so naturally. Do not add filler, repeat a point, or ask a follow-up question just to keep the conversation going; a short reply or no additional message is fine when nothing useful remains. Aim for roughly 3–12 words when appropriate, but do not force an exact word count; use more words when needed for a natural answer. Avoid unsolicited email copy, calls to action, headings, labels, and unrelated prefixes such as "Verse 3.1". Return only the reply text. This reply is a proposal until the application sends it.',
-  );
+test('default personality keeps the active reply instruction and the shared constraints', () => {
+  const instruction = getDefaultPersonalityInstruction();
+
+  assert.match(instruction, /directly addresses the latest incoming message/);
+  assert.match(instruction, /sounds like the personality configured for you/);
+  assert.match(instruction, /roughly 3–12 words/);
+  assert.match(instruction, /Return only the reply text./);
+  assert.match(instruction, /This reply is a proposal until the application sends it./);
+  assert.match(instruction, /Write only in English/);
 });
+
 
 test('default personality makes the request win over commentary and repetition', () => {
   const instruction = getDefaultPersonalityInstruction();
@@ -799,7 +804,7 @@ test('default personality makes the request win over commentary and repetition',
   );
   assert.match(
     instruction,
-    /follow the latest instruction — repeat what you are asked to repeat, and if asked to stop saying something, stop/,
+    /follow the latest instruction: repeat what you are asked to repeat, and if asked to stop saying something, stop/,
   );
   assert.match(instruction, /finish once the request is satisfied/);
   assert.doesNotMatch(
@@ -836,13 +841,14 @@ test('default personality mode keeps the default instruction unchanged', () => {
 test('custom personality replaces only the personality layer and preserves behavioral instructions', () => {
   const instruction = getPersonalityInstruction('custom', '  Sarcastic, deadpan, and blunt.  ');
 
-  assert.equal(instruction, `Sarcastic, deadpan, and blunt.\n\n${getDefaultBehavioralInstruction()}`);
-  assert.ok(instruction.startsWith('Sarcastic, deadpan, and blunt.'));
+  assert.ok(instruction.startsWith(getDefaultBehavioralInstruction()));
+  assert.ok(instruction.endsWith('Sarcastic, deadpan, and blunt.'));
+  assert.match(instruction, /primary voice/);
   assert.ok(!instruction.includes('playful, warm, spontaneous'));
   assert.ok(!instruction.includes(getDefaultPersonalityInstruction()));
-  assert.match(instruction, /Do not add filler, repeat a point, or ask a follow-up question/);
+  assert.match(instruction, /Do not add filler or repeat a point/);
   assert.match(instruction, /roughly 3–12 words/);
-  assert.match(instruction, /avoid stacked or chained emojis/);
+  assert.match(instruction, /Never stack or chain emojis/);
   assert.match(instruction, /Return only the reply text/);
 });
 
@@ -851,7 +857,162 @@ test('custom personality rejects an empty or whitespace-only instruction', () =>
   assert.throws(() => getPersonalityInstruction('custom', '   \n  '), /non-empty custom personality instruction/);
 });
 
-test('RNG packet keeps only the latest ten messages in their existing order', () => {
+test('shared identity states boundaries without dictating a conversational personality', () => {
+  const identity = getBotIdentityInstruction({ name: 'Ada', aliases: ['@Ada'] });
+
+  assert.doesNotMatch(identity, /playful, warm, spontaneous/);
+  assert.doesNotMatch(identity, /tsundere|sarcastic|deadpan/i);
+  assert.doesNotMatch(identity, /sounds like the personality configured for you/);
+  assert.doesNotMatch(identity, /roughly one reply in ten/);
+  assert.match(identity, /Write every reply in English only/);
+});
+
+test('custom personality is the last layer and stays authoritative over shared constraints', () => {
+  const identity = getBotIdentityInstruction({ name: 'Ada', aliases: ['@Ada'] });
+  const custom = 'Tsundere: prickly on the surface, quietly warm underneath.';
+  const personality = getPersonalityInstruction('custom', custom);
+  const composed = composeSystemInstruction(identity, personality);
+
+  assert.ok(personality.startsWith(getDefaultBehavioralInstruction()));
+  assert.ok(personality.endsWith(custom), 'the configured personality is not diluted by later text');
+  assert.ok(composed.startsWith(identity));
+  assert.ok(composed.endsWith(custom), 'the configured personality has the final word');
+  assert.match(composed, /never replace your configured personality/);
+  assert.equal(getPersonalityInstruction('default'), getDefaultPersonalityInstruction());
+});
+
+test('custom personality is framed as the primary voice over shared guardrails', () => {
+  const custom = 'Tsundere: prickly and teasing, reluctantly warm, embarrassed when teased.';
+  const instruction = getPersonalityInstruction('custom', custom);
+  const behavioral = getDefaultBehavioralInstruction();
+
+  assert.ok(instruction.startsWith(behavioral));
+  assert.ok(instruction.endsWith(custom));
+  assert.match(instruction, /configured personality below is your primary voice/);
+  assert.match(instruction, /Embody its attitude, word choice, humor, and reactions/);
+  assert.match(behavioral, /configured personality is the primary source of your voice/);
+  assert.match(behavioral, /These guardrails never replace your configured personality/);
+});
+
+test('shared guardrails forbid assistant-style interviewing without forcing questions', () => {
+  const defaultPersonality = getDefaultPersonalityInstruction();
+  const behavioral = getDefaultBehavioralInstruction();
+
+  for (const layer of [defaultPersonality, behavioral]) {
+    assert.match(layer, /do not ask what is happening, how someone's day is going/i);
+    assert.match(layer, /do not end nearly every reply with a question/i);
+    assert.match(layer, /a reaction, a tease, a disagreement, or a short statement is a complete reply/i);
+    assert.match(layer, /Questions are welcome when they genuinely fit/);
+  }
+  assert.match(behavioral, /do not ask what is happening, how someone's day is going, or whether anything exciting happened/i);
+  assert.match(behavioral, /do not open with lines like "What's on your mind/i);
+  assert.match(behavioral, /a conversation may simply end/);
+  assert.match(behavioral, /customer-service acknowledgements or excessive politeness/);
+});
+
+test('tsundere guidance stays in the custom layer and never leaks into shared instructions', () => {
+  const identity = getBotIdentityInstruction({ name: 'Ada', aliases: ['@Ada'] });
+  const defaultPersonality = getDefaultPersonalityInstruction();
+  const behavioral = getDefaultBehavioralInstruction();
+  const custom = 'Tsundere: playful defensiveness, sarcasm, reluctant warmth, mild stubbornness.';
+  const composed = composeSystemInstruction(identity, getPersonalityInstruction('custom', custom));
+
+  for (const layer of [identity, defaultPersonality, behavioral]) {
+    assert.doesNotMatch(layer, /tsundere/i);
+  }
+  assert.ok(composed.endsWith(custom));
+  assert.match(composed, /playful defensiveness, sarcasm, reluctant warmth, mild stubbornness/);
+});
+
+test('every generation layer requires English-only replies', () => {
+  const identity = getBotIdentityInstruction({ name: 'Ada', aliases: ['@Ada'] });
+  const defaultPersonality = getDefaultPersonalityInstruction();
+  const behavioral = getDefaultBehavioralInstruction();
+
+  for (const layer of [identity, defaultPersonality, behavioral]) {
+    assert.match(layer, /English/);
+    assert.match(layer, /Tagalog/);
+    assert.match(layer, /German/);
+    assert.match(layer, /never switch or mix languages/);
+    assert.match(layer, /never insert foreign words or phrases/);
+  }
+});
+
+test('shared instructions honor explicit corrections without treating jokes as rules', () => {
+  const identity = getBotIdentityInstruction({ name: 'Ada' });
+  const defaultPersonality = getDefaultPersonalityInstruction();
+  const behavioral = getDefaultBehavioralInstruction();
+
+  for (const layer of [identity, defaultPersonality, behavioral]) {
+    assert.match(layer, /explicit corrections and preferences/);
+    assert.match(layer, /recent explicit correction outranks your habits/);
+    assert.match(layer, /one-off joke, a quoted message, or casual phrasing/);
+    assert.match(layer, /do not repeatedly announce that you understood a correction/);
+  }
+});
+
+test('emoji guidance keeps emojis available but rare', () => {
+  const defaultPersonality = getDefaultPersonalityInstruction();
+  const behavioral = getDefaultBehavioralInstruction();
+
+  for (const layer of [defaultPersonality, behavioral]) {
+    assert.match(layer, /Most replies should contain no emoji/);
+    assert.match(layer, /roughly one reply in ten/);
+    assert.match(layer, /Never stack or chain emojis/);
+    assert.match(layer, /never add an emoji to decorate/);
+    assert.doesNotMatch(layer, /(?:do not|never) (?:use|add) emojis?/i);
+  }
+});
+
+test('natural writing guidance bans em dashes and leaves voice to the personality', () => {
+  const identity = getBotIdentityInstruction({ name: 'Ada' });
+  const defaultPersonality = getDefaultPersonalityInstruction();
+  const behavioral = getDefaultBehavioralInstruction();
+
+  for (const layer of [defaultPersonality, behavioral]) {
+    assert.match(layer, /Never use em dashes/);
+    assert.match(layer, /avoid an elaborate response when a short one is enough/);
+    assert.doesNotMatch(layer, /Match the conversation's tone/);
+    assert.doesNotMatch(layer, /helpful assistant|always be polite|sounds? enthusiastic/i);
+  }
+  for (const layer of [identity, defaultPersonality, behavioral]) {
+    assert.doesNotMatch(layer, /—/, 'instructions never model em dashes');
+  }
+});
+
+test('shared instructions avoid repetition and answer the current topic', () => {
+  const defaultPersonality = getDefaultPersonalityInstruction();
+  const behavioral = getDefaultBehavioralInstruction();
+
+  for (const layer of [defaultPersonality, behavioral]) {
+    assert.match(layer, /do not repeat a reply you already sent/);
+    assert.match(layer, /recycle a joke or line you have already used/);
+    assert.match(layer, /reuse the same acknowledgement or generic opener/);
+    assert.match(layer, /notice when a topic has already been addressed/);
+    assert.match(
+      layer,
+      /respond to the actual latest relevant message instead of restarting the conversation/,
+    );
+  }
+});
+
+test('configured personality stays the primary voice in the assembled instruction', () => {
+  const identity = getBotIdentityInstruction({ name: 'Ada', aliases: ['@Ada'] });
+  const custom = 'Tsundere: prickly and teasing, reluctantly warm.';
+  const personality = getPersonalityInstruction('custom', custom);
+  const behavioral = getDefaultBehavioralInstruction();
+  const composed = composeSystemInstruction(identity, personality);
+
+  assert.ok(composed.startsWith(identity));
+  assert.ok(composed.endsWith(custom));
+  assert.ok(personality.startsWith(behavioral));
+  assert.match(personality, /configured personality below is your primary voice/);
+  assert.doesNotMatch(behavioral, /Match the conversation's tone/);
+  assert.doesNotMatch(behavioral, /helpful assistant|always be polite|sounds? enthusiastic/i);
+  assert.doesNotMatch(behavioral, /tsundere/i);
+});
+
+test('RNG packet keeps only the latest six messages in their existing order', () => {
   const recentMessages = Array.from({ length: 12 }, (_, index) => ({
     messageId: `m-${index + 1}`,
     message: `Message ${index + 1}`,
@@ -859,7 +1020,7 @@ test('RNG packet keeps only the latest ten messages in their existing order', ()
   }));
   const packet = buildRngPacket(recentMessages);
 
-  assert.deepEqual(packet.contextMessages, recentMessages.slice(-10));
+  assert.deepEqual(packet.contextMessages, recentMessages.slice(-6));
   assert.deepEqual(packet.newMessages, []);
 });
 

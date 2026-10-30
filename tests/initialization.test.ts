@@ -7,6 +7,7 @@ import {
   getBrowserProfilePath,
   initializeConfiguration,
   promptBotPersonality,
+  promptBotTemperament,
   promptMultilinePersonality,
   promptPinRestorationSettings,
 } from '../src/browser/initialization.js';
@@ -611,10 +612,96 @@ test('personality prompt retries invalid answers and cancellation returns null',
     message => errors.push(message),
   );
   assert.deepEqual(retry, { mode: 'default' });
-  assert.match(errors[0], /Choose Default or Custom/);
+  assert.match(errors[0], /Choose 1 \(Default\) or 2 \(Custom\)/);
 
   const cancelled = await promptBotPersonality(createPrompt([null]), () => undefined, () => undefined);
   assert.equal(cancelled, null);
+});
+
+test('temperament and personality prompts present numbered choices', async () => {
+  const temperamentQuestions: string[] = [];
+  const temperamentOutput: string[] = [];
+  const temperament = await promptBotTemperament(
+    createPrompt(['2'], temperamentQuestions),
+    message => temperamentOutput.push(message),
+    () => undefined,
+    'balanced',
+  );
+
+  assert.equal(temperament, 'balanced');
+  assert.match(temperamentQuestions[0] ?? '', /Select temperament \[1-3\]/);
+  assert.ok(temperamentOutput.includes('  [1] Quiet: 10% yes / 90% no'));
+  assert.ok(temperamentOutput.includes('  [2] Balanced: 50% yes / 50% no (current)'));
+  assert.ok(temperamentOutput.includes('  [3] Talkative: 95% yes / 5% no'));
+
+  const personalityQuestions: string[] = [];
+  const personalityOutput: string[] = [];
+  const personality = await promptBotPersonality(
+    createPrompt(['2', 'deadpan', '.'], personalityQuestions),
+    message => personalityOutput.push(message),
+    () => undefined,
+    'default',
+  );
+
+  assert.deepEqual(personality, { mode: 'custom', instruction: 'deadpan' });
+  assert.match(personalityQuestions[0] ?? '', /Select personality \[1-2\]/);
+  assert.ok(personalityOutput.includes('  [1] Default: Existing personality behavior (current)'));
+  assert.ok(personalityOutput.includes('  [2] Custom: Your own custom instruction block'));
+});
+
+test('invalid numbered choices retry and cancellation returns null', async () => {
+  const temperamentErrors: string[] = [];
+  const temperamentQuestions: string[] = [];
+  const temperament = await promptBotTemperament(
+    createPrompt(['9', '3'], temperamentQuestions),
+    () => undefined,
+    message => temperamentErrors.push(message),
+  );
+  assert.equal(temperament, 'talkative');
+  assert.match(
+    temperamentErrors[0] ?? '',
+    /Choose 1 \(Quiet\), 2 \(Balanced\), or 3 \(Talkative\)/,
+  );
+  assert.match(temperamentQuestions[0] ?? '', /default: Balanced/);
+
+  const personalityErrors: string[] = [];
+  const personality = await promptBotPersonality(
+    createPrompt(['7', '1']),
+    () => undefined,
+    message => personalityErrors.push(message),
+  );
+  assert.deepEqual(personality, { mode: 'default' });
+  assert.match(personalityErrors[0] ?? '', /Choose 1 \(Default\) or 2 \(Custom\)/);
+
+  assert.equal(
+    await promptBotTemperament(createPrompt([null]), () => undefined, () => undefined),
+    null,
+  );
+  assert.equal(
+    await promptBotPersonality(createPrompt([null]), () => undefined, () => undefined),
+    null,
+  );
+});
+
+test('initial setup accepts numeric temperament and personality selections', async context => {
+  const filePath = createConfigurationPath(context);
+  const promptCalls: string[] = [];
+  const options = createOptions(filePath, {
+    installedPaths: [bravePath],
+    answers: ['y', 'https://example.test/messages', 'yes', '3', '2', 'Cold and impersonal.', '.'],
+    promptCalls,
+  });
+
+  assert.equal(await initializeConfiguration(options), 'saved');
+  assert.match(promptCalls[3] ?? '', /Select temperament \[1-3\]/);
+  assert.match(promptCalls[4] ?? '', /Select personality \[1-2\]/);
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.equal(loaded.configuration.botTemperament, 'talkative');
+    assert.equal(loaded.configuration.botPersonality, 'custom');
+    assert.equal(loaded.configuration.customPersonalityInstruction, 'Cold and impersonal.');
+  }
 });
 
 test('multiline personality collection rejects an empty block and supports cancellation', async () => {

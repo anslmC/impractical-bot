@@ -16,7 +16,7 @@ import {
   type Configuration,
 } from '../src/config/configuration.js';
 import { generateAliases } from '../src/components/alias-engine.js';
-import { getDefaultBehavioralInstruction, getDefaultPersonalityInstruction } from '../src/components/personality.js';
+import { getDefaultPersonalityInstruction, getPersonalityInstruction } from '../src/components/personality.js';
 import type { BackreadResult } from '../src/components/backread.js';
 import type { CombustionController } from '../src/components/combustion.js';
 import { createContextStore } from '../src/components/context-store.js';
@@ -2060,7 +2060,7 @@ test('runtime status reports lifecycle and in-memory configuration after runtime
   assert.equal(destinationChange.exitCode, 0);
   const temperamentChange = await captureCli(['setbottemp'], configurationFilePath, async () => '1');
   assert.equal(temperamentChange.exitCode, 0);
-  const personalityAnswers = ['custom', 'Cold and impersonal.', '.'];
+  const personalityAnswers = ['2', 'Cold and impersonal.', '.'];
   const personalityChange = await captureCli(
     ['setpersonality'],
     configurationFilePath,
@@ -2711,6 +2711,48 @@ test('setbottemp preserves configuration persisted while the temperament prompt 
   }
 });
 
+test('setbottemp accepts a numbered choice after rejecting an invalid one', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  const answers = ['9', '3'];
+  const result = await captureCli(
+    ['setbottemp'],
+    configurationFilePath,
+    async () => answers.shift() ?? null,
+    undefined,
+    { requestRuntimeSetTemperament: async () => ({ status: 'not-running' }) },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.match(result.errors[0] ?? '', /Choose 1 \(Quiet\), 2 \(Balanced\), or 3 \(Talkative\)/);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.botTemperament, 'talkative');
+  }
+});
+
+test('setpersonality accepts a numbered choice after rejecting an invalid one', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  const answers = ['9', '1'];
+  const result = await captureCli(
+    ['setpersonality'],
+    configurationFilePath,
+    async () => answers.shift() ?? null,
+    undefined,
+    { requestRuntimeSetPersonality: async () => ({ status: 'not-running' }) },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.match(result.errors[0] ?? '', /Choose 1 \(Default\) or 2 \(Custom\)/);
+  const saved = loadConfiguration(configurationFilePath);
+  assert.equal(saved.status, 'valid');
+  if (saved.status === 'valid') {
+    assert.equal(saved.configuration.botPersonality, 'default');
+  }
+});
+
 test('setpersonality preserves configuration persisted while the personality prompts are open', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
@@ -2861,7 +2903,7 @@ test('setbottemp rejects invalid selections without changing configuration', asy
 
   assert.equal(result.exitCode, 0);
   assert.equal(runtimeCalls, 0);
-  assert.match(result.errors[0], /Choose Quiet, Balanced, or Talkative/);
+  assert.match(result.errors[0], /Choose 1 \(Quiet\), 2 \(Balanced\), or 3 \(Talkative\)/);
   assert.match(result.output.at(-1) ?? '', /cancelled/);
   const saved = loadConfiguration(configurationFilePath);
   assert.equal(saved.status, 'valid');
@@ -3088,7 +3130,7 @@ test('setpersonality while stopped persists a custom block without launching a b
   saveConfiguration(validConfiguration, configurationFilePath);
   let launchAttempted = false;
   let runtimeCalled = false;
-  const answers = ['custom', 'Sarcastic and deadpan.', 'Never cheerful.', '.'];
+  const answers = ['2', 'Sarcastic and deadpan.', 'Never cheerful.', '.'];
 
   const result = await captureCli(
     ['setpersonality'],
@@ -3261,7 +3303,7 @@ test('setpersonality updates a running engine and persists without restarting it
   assert.match(change.output.at(-1) ?? '', /Personality changed: custom/);
   assert.equal(launchCalls, 1);
   assert.deepEqual(receivedInstructions, [
-    `Cold and impersonal.\n\n${getDefaultBehavioralInstruction()}`,
+    getPersonalityInstruction('custom', 'Cold and impersonal.'),
   ]);
   const saved = loadConfiguration(configurationFilePath);
   assert.equal(saved.status, 'valid');
