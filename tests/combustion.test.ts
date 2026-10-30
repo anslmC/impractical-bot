@@ -14,6 +14,7 @@ import {
 import type { Configuration } from '../src/config/configuration.js';
 import * as nvidiaModule from '../src/ai/nvidia.js';
 import * as composerModule from '../src/components/composer.js';
+import { ANTI_ECHO_RETRY_INSTRUCTION } from '../src/components/anti-echo.js';
 
 const MESSAGE_SELECTOR =
   '[data-scope="messages_table"][aria-roledescription="message"][data-message-id]';
@@ -2004,6 +2005,292 @@ test('a destination change accepts a reused message id with different text', asy
     assert.equal(contextStore.getRecent(1)[0]?.message, secondConversation[0].message);
   } finally {
     await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+  }
+});
+
+function installAntiEchoPipelineMocks(replies: Array<string | Error>) {
+  const generateRequests: Array<{
+    systemInstruction?: string;
+    messages: readonly { messageId?: string; message: string }[];
+  }> = [];
+  const composedReplies: string[] = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+    options: { systemInstruction?: string } = {},
+  ): Promise<string> => {
+    generateRequests.push({
+      systemInstruction: options.systemInstruction,
+      messages: messages as readonly { messageId?: string; message: string }[],
+    });
+    const next = replies.shift();
+    if (next === undefined) {
+      throw new Error('unexpected generation call');
+    }
+    if (next instanceof Error) {
+      throw next;
+    }
+    return next;
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async (_page, reply) => {
+    composedReplies.push(reply);
+    return { status: 'sent' };
+  };
+
+  return {
+    generateRequests,
+    composedReplies,
+    restore() {
+      (nvidiaModule as unknown as {
+        generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+      }).generateNvidiaReply = originalGenerateNvidiaReply;
+      (composerModule as unknown as {
+        composeMessengerReply: typeof composerModule.composeMessengerReply;
+      }).composeMessengerReply = originalCompose;
+    },
+  };
+}
+
+test('an RNG reply that echoes the incoming message is retried once and suppressed', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  const originalLog = console.log;
+  const logs: string[] = [];
+  Math.random = () => 0;
+  console.log = (...values: unknown[]) => {
+    logs.push(values.map(String).join(' '));
+  };
+  const harness = installAntiEchoPipelineMocks([
+    'dude who are you',
+    'Anselmo: dude who are you 😳',
+  ]);
+  const { page, inject } = createInjectedMessengerPage();
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'rng-echo-1', sender: 'Alex', message: 'dude who are you' }]);
+    for (let poll = 0; poll < 5; poll += 1) {
+      context.mock.timers.tick(3_000);
+      await flushEngine();
+    }
+
+    assert.equal(harness.generateRequests.length, 2, 'the echo is retried exactly once');
+    assert.equal(
+      harness.generateRequests[0].systemInstruction,
+      getDefaultPersonalityInstruction(),
+      'the first attempt uses the unmodified system instruction',
+    );
+    assert.equal(
+      harness.generateRequests[1].systemInstruction,
+      composeSystemInstruction(getDefaultPersonalityInstruction(), ANTI_ECHO_RETRY_INSTRUCTION),
+      'the retry adds only the explicit anti-echo instruction',
+    );
+    assert.deepEqual(harness.composedReplies, [], 'no echo reaches the composer');
+    assert.deepEqual(
+      contextStore.getState().messageIds,
+      ['rng-echo-1'],
+      'nothing is appended by detection or retry',
+    );
+    const suppressionLog = logs.find(line => line.includes('anti-echo suppression'));
+    assert.ok(suppressionLog, 'the suppression is reported at runtime');
+    assert.match(
+      suppressionLog,
+      /packet=rng-packet-\d+ type=rng messageId=rng-echo-1 retry=echoed attempts=2 action=suppressed/,
+    );
+  } finally {
+    await controller.stop();
+    harness.restore();
+    Math.random = originalRandom;
+    console.log = originalLog;
+    context.mock.timers.reset();
+  }
+});
+
+test('a mention-triggered echo is suppressed without entering outgoing history', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  const originalLog = console.log;
+  const logs: string[] = [];
+  Math.random = () => 0.99;
+  console.log = (...values: unknown[]) => {
+    logs.push(values.map(String).join(' '));
+  };
+  const harness = installAntiEchoPipelineMocks([
+    'Anselmo: @Bot can you hear me? 😳',
+    '@Bot can you hear me? 😳',
+  ]);
+  const { page, inject } = createInjectedMessengerPage();
+  const contextStore = createContextStore();
+  const aliases = ['@Bot'];
+  const controller = await startCombustion({
+    page,
+    contextStore,
+    configuration: { ...configuration, puppetName: 'Anselmo' },
+    aliases,
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'mention-echo-1', sender: 'Alex', message: '@Bot can you hear me?' }]);
+    context.mock.timers.tick(3_000);
+    await flushEngine();
+    const snapshotAfterTrigger = contextStore.getRecent(10);
+
+    for (let poll = 0; poll < 3; poll += 1) {
+      context.mock.timers.tick(3_000);
+      await flushEngine();
+    }
+
+    assert.equal(harness.generateRequests.length, 2);
+    const baseInstruction = composeSystemInstruction(
+      getBotIdentityInstruction({ name: 'Anselmo', aliases }),
+      getDefaultPersonalityInstruction(),
+    );
+    assert.equal(harness.generateRequests[0].systemInstruction, baseInstruction);
+    assert.equal(
+      harness.generateRequests[1].systemInstruction,
+      composeSystemInstruction(baseInstruction, ANTI_ECHO_RETRY_INSTRUCTION),
+      'the retry keeps the identity and personality layers intact',
+    );
+    assert.match(
+      String(harness.generateRequests[1].systemInstruction),
+      /Do not begin an ordinary reply with your own name or alias/,
+    );
+    assert.match(
+      String(harness.generateRequests[1].systemInstruction),
+      /playful, warm, spontaneous/,
+      'the configured personality survives the retry',
+    );
+
+    assert.deepEqual(harness.composedReplies, [], 'neither echo is sent');
+    const suppressionLog = logs.find(line => line.includes('anti-echo suppression'));
+    assert.ok(suppressionLog, 'the suppression is reported at runtime');
+    assert.match(
+      suppressionLog,
+      /packet=packet-\d+ type=mention messageId=mention-echo-1 retry=echoed attempts=2 action=suppressed/,
+    );
+    assert.deepEqual(
+      contextStore.getRecent(10),
+      snapshotAfterTrigger,
+      'detection and retry never mutate the Context Store',
+    );
+    assert.deepEqual(contextStore.getState().messageIds, ['mention-echo-1']);
+  } finally {
+    await controller.stop();
+    harness.restore();
+    Math.random = originalRandom;
+    console.log = originalLog;
+    context.mock.timers.reset();
+  }
+});
+
+test('legitimate short replies from both trigger paths are still sent', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  const harness = installAntiEchoPipelineMocks(['Nothing much.', "Yeah, I'm here."]);
+  const { page, inject } = createInjectedMessengerPage();
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'reply-1', sender: 'Alex', message: '@Bot what?' }]);
+    for (let poll = 0; poll < 3; poll += 1) {
+      context.mock.timers.tick(3_000);
+      await flushEngine();
+    }
+    assert.deepEqual(harness.composedReplies, ['Nothing much.']);
+    assert.equal(harness.generateRequests.length, 1, 'a valid mention reply is not retried');
+
+    Math.random = () => 0;
+    inject([{ messageId: 'reply-2', sender: 'Alex', message: 'Are you there?' }]);
+    for (let poll = 0; poll < 5; poll += 1) {
+      context.mock.timers.tick(3_000);
+      await flushEngine();
+    }
+    assert.deepEqual(harness.composedReplies, ['Nothing much.', "Yeah, I'm here."]);
+    assert.equal(harness.generateRequests.length, 2, 'a valid RNG reply is not retried');
+  } finally {
+    await controller.stop();
+    harness.restore();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+  }
+});
+
+test('a failing anti-echo retry does not crash Combustion or send the echo', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  const originalError = console.error;
+  const originalLog = console.log;
+  Math.random = () => 0.99;
+  console.error = () => undefined;
+  console.log = () => undefined;
+  const harness = installAntiEchoPipelineMocks([
+    'can you hear me?',
+    new Error('retry generation failed'),
+    'Loud and clear.',
+  ]);
+  const { page, inject } = createInjectedMessengerPage();
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'failure-1', sender: 'Alex', message: '@Bot can you hear me?' }]);
+    for (let poll = 0; poll < 3; poll += 1) {
+      context.mock.timers.tick(3_000);
+      await flushEngine();
+    }
+    assert.equal(harness.generateRequests.length, 2, 'one retry was attempted');
+    assert.deepEqual(harness.composedReplies, [], 'the rejected echo was not sent');
+
+    inject([{ messageId: 'failure-2', sender: 'Alex', message: '@Bot are you still there?' }]);
+    for (let poll = 0; poll < 3; poll += 1) {
+      context.mock.timers.tick(3_000);
+      await flushEngine();
+    }
+    assert.deepEqual(
+      harness.composedReplies,
+      ['Loud and clear.'],
+      'the engine keeps processing later messages after a failed retry',
+    );
+  } finally {
+    await controller.stop();
+    harness.restore();
+    console.error = originalError;
+    console.log = originalLog;
     Math.random = originalRandom;
     context.mock.timers.reset();
   }

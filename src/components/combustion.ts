@@ -3,6 +3,14 @@ import {
   generateNvidiaReply,
 } from '../ai/nvidia.js';
 import { navigatePageToMessengerDestination } from '../browser/launch.js';
+import {
+  ANTI_ECHO_RETRY_INSTRUCTION,
+  AntiEchoSuppressedError,
+  collectParticipantNames,
+  findLatestIncomingMessage,
+  generateReplyWithAntiEchoGuard,
+  isEchoReply,
+} from './anti-echo.js';
 import type { BackreadMessage } from './backread.js';
 import {
   composeMessengerReply,
@@ -75,6 +83,7 @@ function debugBorder(): string {
 }
 
 type EngineMessage = MessageDetails & { mention?: boolean };
+type PacketTriggerType = 'rng' | 'mention' | 'unknown';
 type ScheduledPacket = (PacketBuilderPacket | RngPacket) & {
   mentionMessages?: PacketBuilderMessage[];
 };
@@ -489,6 +498,7 @@ export async function startCombustion({
   const observedTextByMessageId = new Map<string, string>();
   const packetTimings = new WeakMap<object, PacketTiming>();
   let activePacketTiming: PacketTiming | undefined;
+  let activePacketContext: { packetId: string; type: PacketTriggerType } | null = null;
   const timingForPacket = (packet: object): PacketTiming => {
     let timing = packetTimings.get(packet);
     if (!timing) {
@@ -1118,11 +1128,20 @@ export async function startCombustion({
       apiKey,
       generateReply: async (requestApiKey, messages) => {
         const startedAt = performance.now();
-        try {
+        const latestIncoming = findLatestIncomingMessage(messages);
+        const participantNames = collectParticipantNames({
+          messages,
+          names: [configuration.puppetName ?? '', ...aliases],
+        });
+        const requestReply = async (retry: boolean): Promise<string> => {
           const reply = await generateNvidiaReply(
             requestApiKey,
             messages as unknown as readonly BackreadMessage[],
-            { systemInstruction },
+            {
+              systemInstruction: retry
+                ? composeSystemInstruction(systemInstruction, ANTI_ECHO_RETRY_INSTRUCTION)
+                : systemInstruction,
+            },
           );
           const normalizedReply = stripSelfIdentifyingPrefix(
             reply,
@@ -1140,6 +1159,31 @@ export async function startCombustion({
             );
           }
           return normalizedReply;
+        };
+        try {
+          const outcome = await generateReplyWithAntiEchoGuard({
+            generate: attempt => requestReply(attempt.retry),
+            isEcho: reply => latestIncoming !== null &&
+              isEchoReply(reply, latestIncoming.message, { participantNames }),
+            log: message => console.log(`${styled('[reply]', 'cyan')} ${message}`),
+          });
+          if (outcome.status === 'suppressed') {
+            const suppression = activePacketContext ?? {
+              packetId: 'unknown',
+              type: 'unknown' as const,
+            };
+            console.log(
+              `${styled('[reply]', 'cyan')} anti-echo suppression: ` +
+              `packet=${styled(suppression.packetId, 'bold')} type=${suppression.type} ` +
+              `messageId=${latestIncoming?.messageId ?? 'unknown'} ` +
+              `retry=echoed attempts=${outcome.attempts} action=suppressed`,
+            );
+            throw new AntiEchoSuppressedError(
+              'Suppressed a reply that repeated the latest incoming message ' +
+              `(id=${latestIncoming?.messageId ?? 'unknown'}).`,
+            );
+          }
+          return outcome.reply;
         } finally {
           if (activePacketTiming) {
             activePacketTiming.generateMs = performance.now() - startedAt;
@@ -1166,6 +1210,10 @@ export async function startCombustion({
       timing.startedAt = performance.now();
       activePacketTiming = timing;
       const isRngPacket = packet.packetId === rngPacketInFlightId;
+      activePacketContext = {
+        packetId: packet.packetId,
+        type: isRngPacket ? 'rng' : 'mention',
+      };
       if (isRngPacket) {
         console.log(formatSubsystemStatus(
           'rng',
@@ -1185,6 +1233,7 @@ export async function startCombustion({
         completeRngPacket(packet.packetId, succeeded, processingError);
         console.log(formatPacketTiming(packet, timing, performance.now()));
         activePacketTiming = undefined;
+        activePacketContext = null;
         if (succeeded && !isRngPacket && !stopRequested) {
           startRngCooldown('reply sent');
         }
