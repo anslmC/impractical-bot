@@ -73,6 +73,7 @@ import {
   requestRuntimeSetTemperament,
   requestRuntimeSetPersonality,
   requestRuntimeStatus,
+  requestRuntimeStatusSnapshot,
   requestRuntimeStop,
   RuntimeAlreadyRunningError,
   RuntimeControlTimeoutError,
@@ -82,6 +83,13 @@ import {
   type RuntimeStatusResult,
   type RuntimeStopResult,
 } from './runtime-control.js';
+import { CLI_COMMANDS, formatCliCommand } from './cli-commands.js';
+import {
+  checkDashboardTerminal,
+  startDashboard,
+  type DashboardSession,
+  type DashboardTerminalCheck,
+} from './tui/index.js';
 
 type Output = (message: string) => void;
 
@@ -101,26 +109,23 @@ export interface CliRuntimeOptions {
   requestRuntimeSetTemperament?: typeof requestRuntimeSetTemperament;
   requestRuntimeSetPersonality?: typeof requestRuntimeSetPersonality;
   requestRuntimeStatus?: typeof requestRuntimeStatus;
+  requestRuntimeStatusSnapshot?: typeof requestRuntimeStatusSnapshot;
   requestRuntimeStop?: typeof requestRuntimeStop;
   waitForRuntimeShutdown?: typeof waitForRuntimeShutdown;
   discoverBrowsers?: (options?: BrowserDiscoveryOptions) => Promise<BrowserCandidate[]>;
   browserExecutableExists?: (path: string) => boolean;
+  checkDashboardTerminal?: () => DashboardTerminalCheck;
+  startDashboard?: typeof startDashboard;
 }
+
+const commandReference = CLI_COMMANDS
+  .map(command => `  ${formatCliCommand(command)}`)
+  .join('\n');
 
 const usage = `Usage: impbot <command>
 
 Commands:
-  init     Initialize impractical-bot
-  config   Configure impractical-bot
-  changebrowser  Change the configured browser
-  changemsgUrl  Change the message destination
-  setbottemp  Set the bot temperament
-  setpersonality  Set the bot personality
-  updatekey  Replace the NVIDIA API key
-  start    Start impractical-bot
-  pause    Pause impractical-bot
-  resume   Resume impractical-bot
-  stop     Stop impractical-bot
+${commandReference}
 
 Options:
   -h, --help     Show this help
@@ -982,6 +987,9 @@ async function handleStart(
   prompt: TerminalPrompt,
   runtime: CliRuntimeOptions,
 ): Promise<number> {
+  const dashboardTerminal = (runtime.checkDashboardTerminal ?? checkDashboardTerminal)();
+  const useDashboard = dashboardTerminal.ok;
+
   let configurationResult;
   try {
     configurationResult = loadConfiguration(configurationFilePath);
@@ -1053,6 +1061,7 @@ async function handleStart(
   });
   let combustionController: CombustionController | undefined;
   let runtimeControl: RuntimeControl | undefined;
+  let dashboardSession: DashboardSession | undefined;
   const onSigint = (): void => {
     runtimeControl?.setState('stopping');
     resolveShutdown('sigint');
@@ -1069,6 +1078,12 @@ async function handleStart(
         requestResume: async () => {
           await combustionController?.resume();
         },
+        requestStatus: () => ({
+          browser: configurationResult.configuration.browser,
+          temperament: resolveBotTemperament(configurationResult.configuration),
+          personality: resolveBotPersonalityMode(configurationResult.configuration),
+          messengerDestination: configurationResult.configuration.messageDestination ?? '',
+        }),
         requestChangeDestination: async (destination, options) => {
           if (!combustionController) {
             return {
@@ -1423,11 +1438,36 @@ async function handleStart(
           'READY',
           `Engine ready at ${configurationResult.configuration.messageDestination}.`,
         ));
-        const runtimeResult = await Promise.race([
+        if (useDashboard) {
+          try {
+            dashboardSession = await (runtime.startDashboard ?? startDashboard)({
+              configurationFilePath,
+              requestStatus: runtime.requestRuntimeStatusSnapshot ?? requestRuntimeStatusSnapshot,
+              captureConsoleOutput: true,
+            });
+          } catch (error) {
+            writeError(
+              'Unable to open the terminal dashboard: ' +
+              `${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
+        const engineSession = session;
+        const engineCombustion = combustionController;
+        const waitForEngine = () => Promise.race([
           shutdownPromise.then(source => ({ type: 'shutdown' as const, source })),
-          session.disconnected.then(() => 'disconnected' as const),
-          combustionController.stopped.then(() => 'combustion-stopped' as const),
+          engineSession.disconnected.then(() => 'disconnected' as const),
+          engineCombustion.stopped.then(() => 'combustion-stopped' as const),
         ]);
+        const dashboardClosed = dashboardSession?.closed.then(
+          () => ({ type: 'dashboard-closed' as const }),
+        );
+        let runtimeResult = dashboardClosed === undefined
+          ? await waitForEngine()
+          : await Promise.race([waitForEngine(), dashboardClosed]);
+        if (typeof runtimeResult === 'object' && runtimeResult.type === 'dashboard-closed') {
+          runtimeResult = await waitForEngine();
+        }
         if (typeof runtimeResult === 'object' && runtimeResult.type === 'shutdown') {
           writeOutput('Shutdown requested; disconnecting Playwright.');
           exitCode = runtimeResult.source === 'runtime-control' ? 0 : 130;
@@ -1450,6 +1490,17 @@ async function handleStart(
     exitCode = 1;
   } finally {
     process.removeListener('SIGINT', onSigint);
+    if (dashboardSession) {
+      try {
+        await dashboardSession.close();
+      } catch (error) {
+        writeError(
+          `Unable to close the terminal dashboard: ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+        );
+        exitCode = 1;
+      }
+    }
     runtimeControl.setState('stopping');
     if (combustionController) {
       try {

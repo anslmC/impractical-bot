@@ -12,11 +12,14 @@ import {
   requestRuntimeResume,
   requestRuntimeSetTemperament,
   requestRuntimeSetPersonality,
+  requestRuntimeStatus,
+  requestRuntimeStatusSnapshot,
   requestRuntimeStop,
   waitForRuntimeShutdown,
   RuntimeAlreadyRunningError,
   RuntimeControlEndpointError,
   RuntimeControlTimeoutError,
+  type RuntimeStatusDetails,
 } from '../src/runtime-control.js';
 
 function readPipeLine(socket: Socket): Promise<string> {
@@ -617,6 +620,231 @@ test('runtime control reports personality as unsupported when no handler is regi
     await sendPersonalityCommand(configurationPath, encodeProtocolText('default'), encodeProtocolText('')),
     /UNSUPPORTED$/,
   );
+});
+
+test('runtime status snapshot reports startup and running states with only public fields', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  const destination = 'https://www.facebook.com/messages/t/987654321';
+  let statusRequests = 0;
+  const statusDetails: RuntimeStatusDetails & {
+    queueDepth: number;
+    profilePath: string;
+    messageText: string;
+  } = {
+    browser: 'edge',
+    temperament: 'quiet',
+    personality: 'custom',
+    messengerDestination: destination,
+    queueDepth: 12,
+    profilePath: 'C:\\Users\\test\\AppData\\Local\\Impractical Bot\\profile',
+    messageText: 'internal message text',
+  };
+  const control = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => undefined,
+    requestStatus: () => {
+      statusRequests += 1;
+      return statusDetails;
+    },
+  });
+  context.after(async () => {
+    control.complete(1);
+    await control.close();
+  });
+
+  const starting = await requestRuntimeStatusSnapshot(configurationPath);
+  assert.equal(starting.status, 'running');
+  if (starting.status === 'running') {
+    assert.match(starting.instanceId, /^[0-9a-f-]{36}$/i);
+    assert.equal(starting.state, 'starting');
+    assert.equal(starting.browser, 'edge');
+    assert.equal(starting.temperament, 'quiet');
+    assert.equal(starting.personality, 'custom');
+    assert.equal(starting.messengerDestination, destination);
+    assert.deepEqual(
+      Object.keys(starting).sort(),
+      [
+        'browser',
+        'instanceId',
+        'messengerDestination',
+        'personality',
+        'state',
+        'status',
+        'temperament',
+      ],
+    );
+  }
+
+  control.setState('running');
+  const running = await requestRuntimeStatusSnapshot(configurationPath);
+  assert.equal(running.status, 'running');
+  if (running.status === 'running') {
+    assert.equal(running.state, 'running');
+    assert.equal(running.instanceId, starting.status === 'running' ? starting.instanceId : '');
+  }
+  assert.equal(statusRequests, 2);
+
+  const rawResponse = await sendRuntimeCommand(configurationPath, 'STATUS');
+  assert.match(rawResponse, /^STATUS /);
+  assert.doesNotMatch(rawResponse, /queueDepth/);
+  assert.doesNotMatch(rawResponse, /profilePath/);
+  assert.doesNotMatch(rawResponse, /internal message text/);
+  assert.doesNotMatch(rawResponse, /C:\\/);
+});
+
+test('runtime status snapshot reflects pause and resume transitions', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  const control = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => undefined,
+    requestPause: () => undefined,
+    requestResume: () => undefined,
+    requestStatus: () => ({
+      browser: 'brave',
+      temperament: 'balanced',
+      personality: 'default',
+      messengerDestination: 'https://www.facebook.com/messages/t/987654321',
+    }),
+  });
+  context.after(async () => {
+    control.complete(1);
+    await control.close();
+  });
+  control.setState('running');
+
+  const running = await requestRuntimeStatusSnapshot(configurationPath);
+  assert.equal(running.status === 'running' && running.state, 'running');
+
+  assert.equal((await requestRuntimePause(configurationPath)).status, 'paused');
+  const paused = await requestRuntimeStatusSnapshot(configurationPath);
+  assert.equal(paused.status === 'running' && paused.state, 'paused');
+
+  assert.equal((await requestRuntimeResume(configurationPath)).status, 'resumed');
+  const resumed = await requestRuntimeStatusSnapshot(configurationPath);
+  assert.equal(resumed.status === 'running' && resumed.state, 'running');
+});
+
+test('runtime status snapshot reflects successful destination, temperament, and personality changes', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  const initialDestination = 'https://www.facebook.com/messages/t/111111111';
+  const changedDestination = 'https://www.facebook.com/messages/t/987654321';
+  const details: RuntimeStatusDetails = {
+    browser: 'chrome',
+    temperament: 'balanced',
+    personality: 'default',
+    messengerDestination: initialDestination,
+  };
+  let shutdownRequests = 0;
+  const control = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => {
+      shutdownRequests += 1;
+    },
+    requestStatus: () => ({ ...details }),
+    requestChangeDestination: (destination, options) => {
+      details.messengerDestination = destination;
+      return { status: 'changed', resumed: options.resume };
+    },
+    requestSetTemperament: temperament => {
+      details.temperament = temperament;
+      return { status: 'changed' };
+    },
+    requestSetPersonality: mode => {
+      details.personality = mode;
+      return { status: 'changed' };
+    },
+  });
+  context.after(async () => {
+    control.complete(1);
+    await control.close();
+  });
+  control.setState('running');
+
+  assert.equal((await requestRuntimeSetTemperament(configurationPath, 'talkative')).status, 'changed');
+  assert.equal(
+    (await requestRuntimeSetPersonality(configurationPath, 'custom', 'Deadpan.')).status,
+    'changed',
+  );
+  assert.equal(
+    (await requestRuntimeChangeDestination(configurationPath, changedDestination)).status,
+    'changed',
+  );
+
+  const status = await requestRuntimeStatusSnapshot(configurationPath);
+  assert.equal(status.status, 'running');
+  if (status.status === 'running') {
+    assert.equal(status.state, 'running');
+    assert.equal(status.browser, 'chrome');
+    assert.equal(status.temperament, 'talkative');
+    assert.equal(status.personality, 'custom');
+    assert.equal(status.messengerDestination, changedDestination);
+  }
+  assert.equal(shutdownRequests, 0);
+});
+
+test('runtime status snapshot reports unsupported when no status provider is registered', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  const control = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => undefined,
+  });
+  context.after(async () => {
+    control.complete(1);
+    await control.close();
+  });
+  control.setState('running');
+
+  assert.match(await sendRuntimeCommand(configurationPath, 'STATUS'), /ERROR .* UNSUPPORTED$/);
+  const result = await requestRuntimeStatusSnapshot(configurationPath);
+  assert.equal(result.status, 'unsupported');
+  if (result.status === 'unsupported') {
+    assert.match(result.instanceId, /^[0-9a-f-]{36}$/i);
+  }
+});
+
+test('runtime status snapshot treats an older engine rejection as unsupported', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  const endpoint = getRuntimeControlEndpoint(configurationPath);
+  const instanceId = '11111111-1111-1111-1111-111111111111';
+  const server = createServer(socket => {
+    socket.on('error', () => undefined);
+    socket.write(`IMPBOT_RUNTIME/1 ${instanceId}\n`);
+    socket.once('data', () => socket.end(`ERROR ${instanceId} INVALID_REQUEST\n`));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(endpoint, resolve);
+  });
+  context.after(async () => {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  });
+
+  assert.deepEqual(
+    await requestRuntimeStatusSnapshot(configurationPath),
+    { status: 'unsupported', instanceId },
+  );
+});
+
+test('existing runtime status request remains compatible with the status snapshot', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  const control = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => undefined,
+    requestStatus: () => ({
+      browser: 'brave',
+      temperament: 'balanced',
+      personality: 'default',
+      messengerDestination: 'https://www.facebook.com/messages/t/987654321',
+    }),
+  });
+  context.after(async () => {
+    control.complete(1);
+    await control.close();
+  });
+  control.setState('running');
+
+  const legacy = await requestRuntimeStatus(configurationPath);
+  const snapshot = await requestRuntimeStatusSnapshot(configurationPath);
+  assert.equal(legacy.status, 'running');
+  assert.equal(snapshot.status, 'running');
+  if (legacy.status === 'running' && snapshot.status === 'running') {
+    assert.equal(snapshot.instanceId, legacy.instanceId);
+  }
 });
 
 test('runtime shutdown confirmation waits until the endpoint is no longer owned', async context => {

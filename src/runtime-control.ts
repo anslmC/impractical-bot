@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { win32 } from 'node:path';
-import { resolveConfigurationPaths, isBotTemperament, isBotPersonalityMode, type BotTemperament, type BotPersonalityMode } from './config/configuration.js';
+import { resolveConfigurationPaths, isBotTemperament, isBotPersonalityMode, BROWSER_IDS, type BotTemperament, type BotPersonalityMode, type BrowserId } from './config/configuration.js';
 
 const PROTOCOL = 'IMPBOT_RUNTIME/1';
 const HANDSHAKE_TIMEOUT_MS = 5_000;
@@ -72,7 +72,23 @@ export type RuntimeSetPersonalityResult =
   | { status: 'failed'; instanceId: string; reason: string }
   | { status: 'not-running' };
 
-type RuntimeState = 'starting' | 'running' | 'paused' | 'changing' | 'stopping';
+export type RuntimeEngineState = 'starting' | 'running' | 'paused' | 'changing' | 'stopping';
+
+export interface RuntimeStatusSnapshot {
+  state: RuntimeEngineState;
+  browser: BrowserId;
+  temperament: BotTemperament;
+  personality: BotPersonalityMode;
+  messengerDestination: string;
+}
+
+export interface RuntimeStatusDetails {
+  browser: BrowserId;
+  temperament: BotTemperament;
+  personality: BotPersonalityMode;
+  messengerDestination: string;
+  state?: RuntimeEngineState;
+}
 
 export interface RuntimeDestinationChangeOptions {
   resume: boolean;
@@ -82,6 +98,7 @@ export interface RuntimeControlHandlers {
   requestShutdown: () => void;
   requestPause?: () => void | Promise<void>;
   requestResume?: () => void | Promise<void>;
+  requestStatus?: () => RuntimeStatusDetails | Promise<RuntimeStatusDetails>;
   requestChangeDestination?: (
     destination: string,
     options: RuntimeDestinationChangeOptions,
@@ -219,7 +236,7 @@ export async function createRuntimeControl(
     resolveCompletion = resolve;
   });
   let shutdownRequested = false;
-  let state: RuntimeState = 'starting';
+  let state: RuntimeEngineState = 'starting';
   const isStopping = (): boolean => state === 'stopping';
 
   const commandResult = async (command: string): Promise<string> => {
@@ -231,6 +248,19 @@ export async function createRuntimeControl(
       }
       const exitCode = await completion;
       return `${exitCode === 0 || exitCode === 130 ? 'STOPPED' : 'FAILED'} ${instanceId} ${exitCode}\n`;
+    }
+
+    if (command === `STATUS ${instanceId}`) {
+      if (!runtimeHandlers.requestStatus) {
+        return `ERROR ${instanceId} UNSUPPORTED\n`;
+      }
+      try {
+        const status = await runtimeHandlers.requestStatus();
+        return `STATUS ${instanceId} ${state} ${status.browser} ${status.temperament} ` +
+          `${status.personality} ${encodeProtocolText(status.messengerDestination)}\n`;
+      } catch {
+        return `ERROR ${instanceId} STATUS_FAILED\n`;
+      }
     }
 
     const destinationPrefix = `DESTINATION ${instanceId} `;
@@ -768,6 +798,99 @@ export async function requestRuntimeSetPersonality(
 export type RuntimeStatusResult =
   | { status: 'running'; instanceId: string }
   | { status: 'not-running' };
+
+export type RuntimeStatusSnapshotResult =
+  | ({ status: 'running'; instanceId: string } & RuntimeStatusSnapshot)
+  | { status: 'not-running' }
+  | { status: 'unsupported'; instanceId: string };
+
+function isRuntimeEngineState(value: string): value is RuntimeEngineState {
+  return ['starting', 'running', 'paused', 'changing', 'stopping'].includes(value);
+}
+
+function isBrowserId(value: string): value is BrowserId {
+  return (BROWSER_IDS as readonly string[]).includes(value);
+}
+
+export async function requestRuntimeStatusSnapshot(
+  configurationFilePath?: string,
+): Promise<RuntimeStatusSnapshotResult> {
+  if (process.platform !== 'win32') {
+    throw new RuntimeControlEndpointError('Runtime control is only supported on Windows.');
+  }
+
+  const endpoint = getRuntimeControlEndpoint(configurationFilePath);
+  const socket = createConnection(endpoint);
+  try {
+    let instanceId: string;
+    try {
+      const greeting = await readLine(socket);
+      const match = greeting.match(new RegExp(`^${PROTOCOL} ([0-9a-f-]{36})$`, 'i'));
+      if (!match) {
+        throw new RuntimeControlEndpointError(
+          'The runtime-control endpoint is not owned by an impractical-bot engine; ' +
+          'no status request was sent.',
+        );
+      }
+      instanceId = match[1];
+    } catch (error) {
+      if (isPipeMissing(error)) {
+        return { status: 'not-running' };
+      }
+      throw error;
+    }
+
+    socket.setTimeout(0);
+    socket.write(`STATUS ${instanceId}\n`);
+    const response = await readLine(socket, 0);
+    const responsePrefix = `STATUS ${instanceId} `;
+    if (response.startsWith(responsePrefix)) {
+      const [state, browser, temperament, personality, encodedDestination, ...extra] =
+        response.slice(responsePrefix.length).split(' ');
+      if (
+        extra.length > 0 ||
+        !isRuntimeEngineState(state) ||
+        !isBrowserId(browser) ||
+        !isBotTemperament(temperament) ||
+        !isBotPersonalityMode(personality) ||
+        encodedDestination === undefined
+      ) {
+        throw new RuntimeControlEndpointError(
+          'The engine returned an invalid status response.',
+        );
+      }
+      return {
+        status: 'running',
+        instanceId,
+        state,
+        browser,
+        temperament,
+        personality,
+        messengerDestination: decodeProtocolText(encodedDestination),
+      };
+    }
+    if (
+      response === `ERROR ${instanceId} UNSUPPORTED` ||
+      response === `ERROR ${instanceId} INVALID_REQUEST`
+    ) {
+      return { status: 'unsupported', instanceId };
+    }
+    if (response.startsWith(`ERROR ${instanceId} `)) {
+      const reason = response.slice(`ERROR ${instanceId} `.length);
+      throw new RuntimeControlEndpointError(
+        `The engine could not provide its runtime status (${reason}).`,
+      );
+    }
+    throw new RuntimeControlEndpointError('The engine returned an invalid status response.');
+  } catch (error) {
+    if (isPipeMissing(error)) {
+      return { status: 'not-running' };
+    }
+    throw error;
+  } finally {
+    socket.destroy();
+  }
+}
 
 export async function requestRuntimeStatus(
   configurationFilePath?: string,

@@ -27,6 +27,7 @@ import {
   requestRuntimeResume,
   requestRuntimeSetPersonality,
   requestRuntimeSetTemperament,
+  requestRuntimeStatusSnapshot,
   RuntimeControlEndpointError,
   RuntimeControlTimeoutError,
 } from '../src/runtime-control.js';
@@ -2026,6 +2027,84 @@ test('pause and resume commands control the running Combustion engine', async co
   assert.deepEqual(events, ['paused', 'resumed', 'stopped', 'disconnected', 'browser-closed']);
 });
 
+test('runtime status reports lifecycle and in-memory configuration after runtime changes', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const engine = await startTestEngine(configurationFilePath);
+
+  const initial = await requestRuntimeStatusSnapshot(configurationFilePath);
+  assert.equal(initial.status, 'running');
+  if (initial.status === 'running') {
+    assert.equal(initial.state, 'running');
+    assert.equal(initial.browser, 'brave');
+    assert.equal(initial.temperament, 'balanced');
+    assert.equal(initial.personality, 'default');
+    assert.equal(initial.messengerDestination, validConfiguration.messageDestination);
+  }
+
+  assert.equal((await captureCli(['pause'], configurationFilePath)).exitCode, 0);
+  const paused = await requestRuntimeStatusSnapshot(configurationFilePath);
+  assert.equal(paused.status === 'running' && paused.state, 'paused');
+
+  assert.equal((await captureCli(['resume'], configurationFilePath)).exitCode, 0);
+  const resumed = await requestRuntimeStatusSnapshot(configurationFilePath);
+  assert.equal(resumed.status === 'running' && resumed.state, 'running');
+
+  const destination = 'https://www.facebook.com/messages/t/987654321';
+  const destinationChange = await captureCli(
+    ['changemsgUrl'],
+    configurationFilePath,
+    async () => destination,
+  );
+  assert.equal(destinationChange.exitCode, 0);
+  const temperamentChange = await captureCli(['setbottemp'], configurationFilePath, async () => '1');
+  assert.equal(temperamentChange.exitCode, 0);
+  const personalityAnswers = ['custom', 'Cold and impersonal.', '.'];
+  const personalityChange = await captureCli(
+    ['setpersonality'],
+    configurationFilePath,
+    async () => personalityAnswers.shift() ?? null,
+  );
+  assert.equal(personalityChange.exitCode, 0);
+
+  // The engine must report its live configuration even if the on-disk file is stale.
+  saveConfiguration(
+    {
+      ...validConfiguration,
+      messageDestination: 'https://www.facebook.com/messages/t/555555555',
+      botTemperament: 'talkative',
+      botPersonality: 'default',
+      customPersonalityInstruction: undefined,
+    },
+    configurationFilePath,
+  );
+
+  const changed = await requestRuntimeStatusSnapshot(configurationFilePath);
+  assert.equal(changed.status, 'running');
+  if (changed.status === 'running') {
+    assert.equal(changed.state, 'running');
+    assert.equal(changed.browser, 'brave');
+    assert.equal(changed.temperament, 'quiet');
+    assert.equal(changed.personality, 'custom');
+    assert.equal(changed.messengerDestination, destination);
+    assert.deepEqual(
+      Object.keys(changed).sort(),
+      [
+        'browser',
+        'instanceId',
+        'messengerDestination',
+        'personality',
+        'state',
+        'status',
+        'temperament',
+      ],
+    );
+  }
+
+  assert.equal((await engine.stop()).exitCode, 0);
+});
+
 test('changemsgUrl updates a running engine through runtime control', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
@@ -3440,19 +3519,21 @@ test('help options and no command display usage', async () => {
 
     assert.equal(result.exitCode, 0);
     assert.match(result.output[0], /Usage: impbot <command>/);
-    assert.match(result.output[0], /init\s+Initialize impractical-bot/);
-    assert.match(result.output[0], /config\s+Configure impractical-bot/);
+    assert.match(result.output[0], /init\s+Initialize Impractical Bot/);
+    assert.match(result.output[0], /config\s+Configure Impractical Bot/);
     assert.match(result.output[0], /changebrowser\s+Change the configured browser/);
-    assert.match(result.output[0], /changemsgUrl\s+Change the message destination/);
-    assert.match(result.output[0], /setbottemp\s+Set the bot temperament/);
-    assert.match(result.output[0], /setpersonality\s+Set the bot personality/);
+    assert.match(result.output[0], /changemsgUrl\s+Change Messenger destination/);
+    assert.match(result.output[0], /setbottemp\s+Set bot temperament/);
+    assert.match(result.output[0], /setpersonality\s+Set bot personality/);
     assert.doesNotMatch(result.output[0], /changemsgdestination/);
     assert.doesNotMatch(result.output[0], /changemessagedestination/);
     assert.match(result.output[0], /updatekey\s+Replace the NVIDIA API key/);
-      assert.match(result.output[0], /start\s+Start impractical-bot/);
-      assert.match(result.output[0], /pause\s+Pause impractical-bot/);
-      assert.match(result.output[0], /resume\s+Resume impractical-bot/);
-      assert.match(result.output[0], /stop\s+Stop impractical-bot/);
+    assert.match(result.output[0], /start\s+Start Impractical Bot/);
+    assert.match(result.output[0], /pause\s+Pause Impractical Bot/);
+    assert.match(result.output[0], /resume\s+Resume Impractical Bot/);
+    assert.match(result.output[0], /stop\s+Stop Impractical Bot/);
+    assert.doesNotMatch(result.output[0], /--tui/);
+    assert.doesNotMatch(result.output[0], /\btui\b/);
     assert.deepEqual(result.errors, []);
   }
 });
@@ -3480,4 +3561,172 @@ test('unknown commands and unexpected arguments fail with a usage hint', async (
     assert.match(result.errors[0], /^Error: /);
     assert.match(result.errors[0], /Usage: impbot <command>/);
   }
+});
+
+test('removed dashboard flags and attach command are rejected', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  for (const args of [['start', '--tui'], ['tui']]) {
+    const result = await captureCli(args, configurationFilePath);
+
+    assert.equal(result.exitCode, 1);
+    assert.deepEqual(result.output, []);
+    assert.match(result.errors[0], /Usage: impbot <command>/);
+    assert.doesNotMatch(result.output.join('\n'), /--tui/);
+  }
+});
+
+test('start automatically opens the dashboard after readiness and keeps the engine running when it closes', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const shutdown = deferred<void>();
+  const dashboardClosed = deferred<void>();
+  const observed: string[] = [];
+  const lifecycle: string[] = [];
+  let dashboardStarts = 0;
+  let dashboardCloses = 0;
+  let combustionStops = 0;
+
+  const start = captureCli(
+    ['start'],
+    configurationFilePath,
+    undefined,
+    undefined,
+    {
+      checkDashboardTerminal: () => {
+        lifecycle.push('terminal');
+        return { ok: true };
+      },
+      validateNvidiaApiKey: async () => undefined,
+      launchBrowser: async () => {
+        lifecycle.push('launch');
+        return {
+          endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+          browserVersion: 'Brave Chromium test',
+          disconnected: new Promise<void>(() => undefined),
+          async prepare() {
+            return stubPage;
+          },
+          async disconnect() {
+            return undefined;
+          },
+        };
+      },
+      readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+      startCombustion: async () => createTestCombustionController(() => {
+        combustionStops += 1;
+      }),
+      waitForShutdown: () => shutdown.promise,
+      startDashboard: async options => {
+        lifecycle.push('dashboard');
+        dashboardStarts += 1;
+        const beforeDashboard = observed.join('\n');
+        assert.match(beforeDashboard, /CRANKING/);
+        assert.match(beforeDashboard, /BACKREAD/);
+        assert.match(beforeDashboard, /CONTEXT/);
+        assert.match(beforeDashboard, /READY/);
+        assert.ok(options);
+        assert.equal(options.configurationFilePath, configurationFilePath);
+        assert.equal(options.captureConsoleOutput, true);
+        assert.equal(typeof options.requestStatus, 'function');
+        return {
+          closed: dashboardClosed.promise,
+          async close() {
+            dashboardCloses += 1;
+            dashboardClosed.resolve();
+          },
+          async refresh() {
+            return undefined;
+          },
+        };
+      },
+    },
+    message => {
+      observed.push(message);
+      if (message.includes('Engine ready')) ready.resolve();
+    },
+  );
+
+  await ready.promise;
+  assert.equal(dashboardStarts, 1);
+  assert.deepEqual(lifecycle, ['terminal', 'launch', 'dashboard']);
+
+  dashboardClosed.resolve();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(combustionStops, 0);
+
+  const stopped = await captureCli(['stop'], configurationFilePath);
+  assert.equal(stopped.exitCode, 0);
+  shutdown.resolve();
+  const result = await start;
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(dashboardCloses, 1);
+  assert.equal(combustionStops, 1);
+  assert.match(result.output.join('\n'), /Engine ready/);
+});
+
+test('start falls back to traditional CLI output in a non-interactive terminal', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const shutdown = deferred<void>();
+  const observed: string[] = [];
+  let dashboardStarts = 0;
+
+  const start = captureCli(
+    ['start'],
+    configurationFilePath,
+    undefined,
+    undefined,
+    {
+      checkDashboardTerminal: () => ({
+        ok: false,
+        reason: 'stdout is not an interactive terminal.',
+      }),
+      validateNvidiaApiKey: async () => undefined,
+      launchBrowser: async () => ({
+        endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+        browserVersion: 'Brave Chromium test',
+        disconnected: new Promise<void>(() => undefined),
+        async prepare() {
+          return stubPage;
+        },
+        async disconnect() {
+          return undefined;
+        },
+      }),
+      readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+      startCombustion: async () => createTestCombustionController(),
+      waitForShutdown: () => shutdown.promise,
+      startDashboard: async () => {
+        dashboardStarts += 1;
+        throw new Error('the dashboard must not start without a TTY');
+      },
+    },
+    message => {
+      observed.push(message);
+      if (message.includes('Engine ready')) ready.resolve();
+    },
+  );
+
+  await ready.promise;
+  assert.equal(dashboardStarts, 0);
+  const beforeStop = observed.join('\n');
+  assert.match(beforeStop, /CRANKING/);
+  assert.match(beforeStop, /BACKREAD/);
+  assert.match(beforeStop, /CONTEXT/);
+  assert.match(beforeStop, /READY/);
+  assert.doesNotMatch(beforeStop, /terminal dashboard/i);
+
+  const stopped = await captureCli(['stop'], configurationFilePath);
+  assert.equal(stopped.exitCode, 0);
+  shutdown.resolve();
+  const result = await start;
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(dashboardStarts, 0);
+  assert.deepEqual(result.errors, []);
 });
