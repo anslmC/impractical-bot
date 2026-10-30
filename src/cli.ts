@@ -1444,6 +1444,7 @@ async function handleStart(
               configurationFilePath,
               requestStatus: runtime.requestRuntimeStatusSnapshot ?? requestRuntimeStatusSnapshot,
               captureConsoleOutput: true,
+              onInterrupt: onSigint,
             });
           } catch (error) {
             writeError(

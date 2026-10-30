@@ -3667,6 +3667,168 @@ test('start automatically opens the dashboard after readiness and keeps the engi
   assert.match(result.output.join('\n'), /Engine ready/);
 });
 
+test('start Ctrl+C inside the active dashboard completes shutdown and releases runtime ownership', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const dashboardStarted = deferred<void>();
+  const dashboardClosed = deferred<void>();
+  let interrupt: (() => void) | undefined;
+  let dashboardCloses = 0;
+  let combustionStops = 0;
+  let disconnects = 0;
+  let browserCloses = 0;
+
+  const start = captureCli(
+    ['start'],
+    configurationFilePath,
+    undefined,
+    undefined,
+    {
+      checkDashboardTerminal: () => ({ ok: true }),
+      validateNvidiaApiKey: async () => undefined,
+      launchBrowser: async () => ({
+        endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+        browserVersion: 'Brave Chromium test',
+        disconnected: new Promise<void>(() => undefined),
+        async prepare() {
+          return stubPage;
+        },
+        async disconnect() {
+          disconnects += 1;
+        },
+      }),
+      closeBrowser: async () => {
+        browserCloses += 1;
+      },
+      readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+      startCombustion: async () => createTestCombustionController(() => {
+        combustionStops += 1;
+      }),
+      waitForShutdown: () => new Promise<void>(() => undefined),
+      startDashboard: async options => {
+        assert.ok(options);
+        interrupt = options.onInterrupt;
+        dashboardStarted.resolve();
+        return {
+          closed: dashboardClosed.promise,
+          async close() {
+            dashboardCloses += 1;
+            dashboardClosed.resolve();
+          },
+          async refresh() {
+            return undefined;
+          },
+        };
+      },
+    },
+    message => {
+      if (message.includes('Engine ready')) ready.resolve();
+    },
+  );
+
+  await ready.promise;
+  await dashboardStarted.promise;
+  assert.equal(typeof interrupt, 'function');
+
+  interrupt!();
+  const result = await start;
+
+  assert.equal(result.exitCode, 130);
+  assert.equal(dashboardCloses, 1);
+  assert.equal(combustionStops, 1);
+  assert.equal(disconnects, 1);
+  assert.equal(browserCloses, 1);
+  assert.match(result.output.join('\n'), /Shutdown requested; disconnecting Playwright/);
+
+  const afterShutdown = await captureCli(['stop'], configurationFilePath);
+  assert.match(afterShutdown.output[0], /No impractical-bot engine is running/);
+});
+
+test('C closes the dashboard without stopping the engine and a later Ctrl+C shuts it down', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const dashboardStarted = deferred<void>();
+  const dashboardClosed = deferred<void>();
+  let dashboardCloses = 0;
+  let combustionStops = 0;
+  let disconnects = 0;
+  let browserCloses = 0;
+
+  const start = captureCli(
+    ['start'],
+    configurationFilePath,
+    undefined,
+    undefined,
+    {
+      checkDashboardTerminal: () => ({ ok: true }),
+      validateNvidiaApiKey: async () => undefined,
+      launchBrowser: async () => ({
+        endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+        browserVersion: 'Brave Chromium test',
+        disconnected: new Promise<void>(() => undefined),
+        async prepare() {
+          return stubPage;
+        },
+        async disconnect() {
+          disconnects += 1;
+        },
+      }),
+      closeBrowser: async () => {
+        browserCloses += 1;
+      },
+      readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+      startCombustion: async () => createTestCombustionController(() => {
+        combustionStops += 1;
+      }),
+      waitForShutdown: () => new Promise<void>(() => undefined),
+      startDashboard: async options => {
+        assert.ok(options);
+        assert.equal(typeof options.onInterrupt, 'function');
+        dashboardStarted.resolve();
+        return {
+          closed: dashboardClosed.promise,
+          async close() {
+            dashboardCloses += 1;
+            dashboardClosed.resolve();
+          },
+          async refresh() {
+            return undefined;
+          },
+        };
+      },
+    },
+    message => {
+      if (message.includes('Engine ready')) ready.resolve();
+    },
+  );
+
+  await ready.promise;
+  await dashboardStarted.promise;
+
+  dashboardClosed.resolve();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(dashboardCloses, 0);
+  assert.equal(combustionStops, 0);
+  assert.equal(disconnects, 0);
+  assert.equal(browserCloses, 0);
+
+  process.emit('SIGINT');
+  const result = await start;
+
+  assert.equal(result.exitCode, 130);
+  assert.equal(dashboardCloses, 1);
+  assert.equal(combustionStops, 1);
+  assert.equal(disconnects, 1);
+  assert.equal(browserCloses, 1);
+
+  const afterShutdown = await captureCli(['stop'], configurationFilePath);
+  assert.match(afterShutdown.output[0], /No impractical-bot engine is running/);
+});
+
 test('start falls back to traditional CLI output in a non-interactive terminal', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);

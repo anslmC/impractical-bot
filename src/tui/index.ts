@@ -1,8 +1,15 @@
-import { format } from 'node:util';
 import {
   requestRuntimeStatusSnapshot,
   type RuntimeStatusSnapshotResult,
 } from '../runtime-control.js';
+import {
+  DEFAULT_MAXIMUM_LOG_ENTRIES,
+  DashboardLogBuffer,
+  captureConsoleOutput,
+  type ConsoleCapture,
+  type ConsoleCaptureOptions,
+  type DashboardLogEntry,
+} from './logs.js';
 import {
   createInitialDashboardView,
   renderDashboardLines,
@@ -10,13 +17,26 @@ import {
   type DashboardView,
 } from './layout.js';
 
+export {
+  DEFAULT_MAXIMUM_LOG_ENTRIES,
+  DashboardLogBuffer,
+  captureConsoleOutput,
+  formatDashboardLogLine,
+  formatLogTimestamp,
+  sanitizeLogText,
+  stripAnsi,
+  type ConsoleCapture,
+  type ConsoleCaptureOptions,
+  type DashboardLogEntry,
+  type DashboardLogLevel,
+} from './logs.js';
+
 const ALTERNATE_SCREEN_ENTER = '\u001b[?1049h';
 const ALTERNATE_SCREEN_EXIT = '\u001b[?1049l';
 const CURSOR_HIDE = '\u001b[?25l';
 const CURSOR_SHOW = '\u001b[?25h';
 const CLEAR_SCREEN = '\u001b[2J\u001b[H';
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
-const DEFAULT_MAX_CAPTURED_CONSOLE_LINES = 500;
 
 export class DashboardTerminalError extends Error {
   constructor(message: string) {
@@ -52,58 +72,6 @@ export function isDashboardTerminalSupported(
   return checkDashboardTerminal(input, output).ok;
 }
 
-export interface ConsoleCapture {
-  restore(): void;
-  getLines(): string[];
-}
-
-const CAPTURED_CONSOLE_METHODS = ['log', 'info', 'warn', 'error', 'debug', 'trace'] as const;
-type CapturedConsoleMethod = typeof CAPTURED_CONSOLE_METHODS[number];
-
-export function captureConsoleOutput(
-  maximumLines = DEFAULT_MAX_CAPTURED_CONSOLE_LINES,
-): ConsoleCapture {
-  const consoleRecord = console as unknown as Record<
-    CapturedConsoleMethod,
-    (...args: unknown[]) => void
-  >;
-  const originals = new Map<CapturedConsoleMethod, (...args: unknown[]) => void>();
-  const lines: string[] = [];
-  const limit = Math.max(1, Math.floor(maximumLines));
-
-  const append = (args: unknown[]): void => {
-    const text = format(...args);
-    for (const line of text.split(/\r?\n/)) {
-      lines.push(line);
-      if (lines.length > limit) {
-        lines.shift();
-      }
-    }
-  };
-
-  for (const method of CAPTURED_CONSOLE_METHODS) {
-    const original = consoleRecord[method];
-    originals.set(method, original);
-    consoleRecord[method] = (...args: unknown[]) => append(args);
-  }
-
-  let restored = false;
-  return {
-    restore() {
-      if (restored) {
-        return;
-      }
-      restored = true;
-      for (const [method, original] of originals) {
-        consoleRecord[method] = original;
-      }
-    },
-    getLines() {
-      return [...lines];
-    },
-  };
-}
-
 export interface DashboardOptions {
   configurationFilePath?: string;
   input?: NodeJS.ReadStream;
@@ -114,6 +82,9 @@ export interface DashboardOptions {
   pollIntervalMs?: number;
   captureConsoleOutput?: boolean;
   maximumCapturedConsoleLines?: number;
+  maximumLogEntries?: number;
+  now?: () => Date;
+  onInterrupt?: () => void;
 }
 
 export interface DashboardSession {
@@ -139,6 +110,7 @@ function sameLines(left: string[] | undefined, right: string[]): boolean {
 function emptyView(
   connection: DashboardView['connection'],
   state: DashboardView['state'],
+  logs: readonly DashboardLogEntry[],
 ): DashboardView {
   return {
     connection,
@@ -147,6 +119,7 @@ function emptyView(
     temperament: 'Unknown',
     personality: 'Unknown',
     messengerDestination: 'Unknown',
+    logs,
   };
 }
 
@@ -165,20 +138,24 @@ export async function startDashboard(
     1,
     Math.floor(options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS),
   );
+  const logCapacity = options.maximumLogEntries ??
+    options.maximumCapturedConsoleLines ??
+    DEFAULT_MAXIMUM_LOG_ENTRIES;
+  const logBuffer = new DashboardLogBuffer(logCapacity);
   const wasRaw = input.isRaw === true;
+  const wasFlowing = input.readableFlowing === true;
   let view = createInitialDashboardView();
   let previousLines: string[] | undefined;
   let previousDimensions: DashboardDimensions | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
+  let pendingLogRender: NodeJS.Immediate | undefined;
+  let capturedConsole: ConsoleCapture | undefined;
   let inFlight = false;
   let closed = false;
   let resolveClosed!: () => void;
   const closedPromise = new Promise<void>(resolve => {
     resolveClosed = resolve;
   });
-  const capturedConsole = options.captureConsoleOutput
-    ? captureConsoleOutput(options.maximumCapturedConsoleLines)
-    : undefined;
 
   const writeOutput = (text: string): void => {
     if (closed) {
@@ -195,34 +172,57 @@ export async function startDashboard(
     if (closed) {
       return;
     }
-    const dimensions = getDimensions(output);
-    const lines = renderDashboardLines(view, dimensions);
-    const dimensionsChanged = previousDimensions === undefined ||
-      previousDimensions.columns !== dimensions.columns ||
-      previousDimensions.rows !== dimensions.rows;
-    if (!dimensionsChanged && sameLines(previousLines, lines)) {
-      return;
-    }
+    try {
+      const dimensions = getDimensions(output);
+      const lines = renderDashboardLines(view, dimensions);
+      const dimensionsChanged = previousDimensions === undefined ||
+        previousDimensions.columns !== dimensions.columns ||
+        previousDimensions.rows !== dimensions.rows;
+      if (!dimensionsChanged && sameLines(previousLines, lines)) {
+        return;
+      }
 
-    if (previousLines === undefined || dimensionsChanged) {
-      writeOutput(
-        CLEAR_SCREEN +
-        lines.map((line, index) => `\u001b[${index + 1};1H\u001b[2K${line}`).join(''),
-      );
-    } else {
-      const changed: string[] = [];
-      const lineCount = Math.max(previousLines.length, lines.length);
-      for (let index = 0; index < lineCount; index += 1) {
-        if (previousLines[index] !== lines[index]) {
-          changed.push(`\u001b[${index + 1};1H\u001b[2K${lines[index] ?? ''}`);
+      if (previousLines === undefined || dimensionsChanged) {
+        writeOutput(
+          CLEAR_SCREEN +
+          lines.map((line, index) => `\u001b[${index + 1};1H\u001b[2K${line}`).join(''),
+        );
+      } else {
+        const changed: string[] = [];
+        const lineCount = Math.max(previousLines.length, lines.length);
+        for (let index = 0; index < lineCount; index += 1) {
+          if (previousLines[index] !== lines[index]) {
+            changed.push(`\u001b[${index + 1};1H\u001b[2K${lines[index] ?? ''}`);
+          }
+        }
+        if (changed.length > 0) {
+          writeOutput(changed.join(''));
         }
       }
-      if (changed.length > 0) {
-        writeOutput(changed.join(''));
-      }
+      previousLines = lines;
+      previousDimensions = dimensions;
+    } catch {
+      void close();
     }
-    previousLines = lines;
-    previousDimensions = dimensions;
+  };
+
+  const scheduleLogRender = (): void => {
+    if (closed || pendingLogRender !== undefined) {
+      return;
+    }
+    pendingLogRender = setImmediate(() => {
+      pendingLogRender = undefined;
+      render();
+    });
+  };
+
+  const appendLog = (entry: DashboardLogEntry): void => {
+    if (closed) {
+      return;
+    }
+    logBuffer.add(entry);
+    view = { ...view, logs: logBuffer.getEntries() };
+    scheduleLogRender();
   };
 
   const requestStatusSafely = async (): Promise<void> => {
@@ -235,6 +235,7 @@ export async function startDashboard(
       if (closed) {
         return;
       }
+      const logs = view.logs ?? [];
       if (result.status === 'running') {
         view = {
           connection: 'connected',
@@ -243,16 +244,17 @@ export async function startDashboard(
           temperament: result.temperament,
           personality: result.personality,
           messengerDestination: result.messengerDestination,
+          logs,
         };
       } else if (result.status === 'not-running') {
-        view = emptyView('stopped', 'stopped');
+        view = emptyView('stopped', 'stopped', logs);
       } else {
-        view = emptyView('unsupported', 'disconnected');
+        view = emptyView('unsupported', 'disconnected', logs);
       }
       render();
     } catch {
       if (!closed) {
-        view = emptyView('disconnected', 'disconnected');
+        view = emptyView('disconnected', 'disconnected', view.logs ?? []);
         render();
       }
     } finally {
@@ -276,6 +278,18 @@ export async function startDashboard(
       return;
     }
     for (const character of text) {
+      if (character === '\u0003') {
+        try {
+          if (options.onInterrupt) {
+            options.onInterrupt();
+          } else {
+            void close();
+          }
+        } catch {
+          void close();
+        }
+        return;
+      }
       if (character === 'c' || character === 'C') {
         void close();
         return;
@@ -292,6 +306,10 @@ export async function startDashboard(
       clearInterval(timer);
       timer = undefined;
     }
+    if (pendingLogRender !== undefined) {
+      clearImmediate(pendingLogRender);
+      pendingLogRender = undefined;
+    }
     input.removeListener('data', onData);
     input.removeListener('error', onInputError);
     output.removeListener('resize', onResize);
@@ -303,7 +321,18 @@ export async function startDashboard(
     } catch {
       // Terminal restoration is best effort during teardown.
     }
-    capturedConsole?.restore();
+    try {
+      if (!wasFlowing) {
+        input.pause();
+      }
+    } catch {
+      // Input restoration is best effort during teardown.
+    }
+    try {
+      capturedConsole?.restore();
+    } catch {
+      // Console restoration is best effort during teardown.
+    }
     try {
       output.write(`${CURSOR_SHOW}${ALTERNATE_SCREEN_EXIT}`);
     } catch {
@@ -314,6 +343,13 @@ export async function startDashboard(
   }
 
   try {
+    const captureOptions: ConsoleCaptureOptions = {
+      onEntry: appendLog,
+      now: options.now,
+    };
+    if (options.captureConsoleOutput) {
+      capturedConsole = captureConsoleOutput(logBuffer.capacity, captureOptions);
+    }
     output.write(`${ALTERNATE_SCREEN_ENTER}${CURSOR_HIDE}${CLEAR_SCREEN}`);
     if (typeof input.setRawMode === 'function') {
       input.setRawMode(true);

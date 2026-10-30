@@ -18,13 +18,24 @@ class FakeInput extends EventEmitter {
   isTTY = true;
   isRaw = false;
   rawModes: boolean[] = [];
+  readableFlowing: boolean | null = null;
   resumed = false;
+  pauses = 0;
   setRawMode(value: boolean): this {
     this.isRaw = value;
     this.rawModes.push(value);
     return this;
   }
+  isPaused(): boolean {
+    return this.readableFlowing === false;
+  }
+  pause(): this {
+    this.readableFlowing = false;
+    this.pauses += 1;
+    return this;
+  }
   resume(): this {
+    this.readableFlowing = true;
     this.resumed = true;
     return this;
   }
@@ -211,8 +222,66 @@ test('dashboard restores the terminal for C and closes idempotently', async () =
     assert.equal(output.listenerCount('resize'), 0);
     assert.equal(output.listenerCount('error'), 0);
     assert.deepEqual(input.rawModes, [true, false]);
+    assert.equal(input.readableFlowing, false);
+    assert.equal(input.pauses, 1);
     assert.match(output.text(), /\u001b\[\?25h\u001b\[\?1049l$/);
   }
+});
+
+test('dashboard Ctrl+C delegates interruption and pauses resumed input when closed', async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  const originalLog = console.log;
+  let interrupts = 0;
+
+  const session = await startDashboard({
+    input: streamInput(input),
+    output: streamOutput(output),
+    pollIntervalMs: 60_000,
+    requestStatus: async () => runningStatus,
+    captureConsoleOutput: true,
+    onInterrupt: () => {
+      interrupts += 1;
+    },
+  });
+
+  try {
+    assert.equal(input.readableFlowing, true);
+    assert.notEqual(console.log, originalLog);
+
+    input.emit('data', Buffer.from('\u0003'));
+    await new Promise(resolve => setTimeout(resolve, 5));
+
+    assert.equal(interrupts, 1);
+    assert.equal(input.listenerCount('data'), 1);
+    assert.deepEqual(input.rawModes, [true]);
+  } finally {
+    await session.close();
+  }
+
+  assert.equal(input.readableFlowing, false);
+  assert.equal(input.pauses, 1);
+  assert.equal(input.listenerCount('data'), 0);
+  assert.deepEqual(input.rawModes, [true, false]);
+  assert.equal(console.log, originalLog);
+});
+
+test('dashboard preserves an input that was already flowing before it started', async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  input.resume();
+
+  const session = await startDashboard({
+    input: streamInput(input),
+    output: streamOutput(output),
+    pollIntervalMs: 60_000,
+    requestStatus: async () => runningStatus,
+  });
+  await session.close();
+
+  assert.equal(input.readableFlowing, true);
+  assert.equal(input.pauses, 0);
+  assert.equal(input.listenerCount('data'), 0);
 });
 
 test('dashboard ignores Q and Escape until C closes it', async () => {
