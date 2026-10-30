@@ -137,38 +137,87 @@ export function classifyMessageLabel(ariaLabel: string | null): {
   };
 }
 
-const LEGITIMATE_SENT_PRECEDING_WORDS = new Set(['have', 'has', 'had']);
+const DELIVERY_STATUS_PATTERN = 'Sent|Delivered|Seen|Sending';
+const TRAILING_DELIVERY_STATUS = new RegExp(
+  `^(.*\\S)(\\s+|[\\s]*[·•|;\\-–—✓✔][\\s]*)?(${DELIVERY_STATUS_PATTERN})([.!…✓✔·•]*)$`,
+  'su',
+);
+const LEGITIMATE_STATUS_PRECEDING_WORDS = new Set([
+  'have', 'has', 'had',
+  'was', 'were', 'is', 'are', 'am', 'be', 'been', 'being',
+  'will', 'would', 'should', 'could', 'can', 'may', 'might', 'must',
+  'do', 'does', 'did', 'not', 'never', 'just', 'already', 'still', 'ever',
+  "i've", "we've", "they've", "you've", "he's", "she's", "it's", "that's",
+]);
 
-function stripTrailingDeliveryStatus(content: string): string {
-  const withoutAttachedStatus = content.replace(/(\S)Sent$/u, '$1');
-  const separatedStatus = withoutAttachedStatus.match(/^(.*?\S)\s+Sent$/su);
-  if (!separatedStatus) {
-    return withoutAttachedStatus;
-  }
-  const precedingWord = separatedStatus[1].match(/(\S+)$/u)?.[1].toLowerCase() ?? '';
-  if (LEGITIMATE_SENT_PRECEDING_WORDS.has(precedingWord)) {
-    return withoutAttachedStatus;
-  }
-  return separatedStatus[1];
+function normalizeText(content: string): string {
+  return content
+    .replace(/\r\n?/gu, '\n')
+    .replace(/[\u00a0\u202f]/gu, ' ')
+    .trim();
 }
 
-export function extractMessageContent(ariaLabel: string | null, textWithoutSenderHeading: string): string {
-  if (ariaLabel === null) {
-    return stripTrailingDeliveryStatus(textWithoutSenderHeading);
+function stripOutgoingPresentationPrefix(content: string): string {
+  const withoutPrefix = content.replace(
+    /^(?:You\s+sent(?:\s*:\s*|\s+)|You:\s+)/u,
+    '',
+  );
+  return withoutPrefix.trim() ? withoutPrefix : content;
+}
+
+function stripTrailingDeliveryStatus(content: string): string {
+  const match = content.match(TRAILING_DELIVERY_STATUS);
+  if (!match) {
+    return content;
+  }
+
+  const body = match[1].replace(/[\s·•|;\-–—✓✔]+$/u, '').trim();
+  const precedingWord = body.match(/([A-Za-z']+)[^A-Za-z']*$/u)?.[1].toLowerCase() ?? '';
+  if (LEGITIMATE_STATUS_PRECEDING_WORDS.has(precedingWord)) {
+    return content;
+  }
+  return body;
+}
+
+function normalizeMessageContent(
+  content: string,
+  { stripOutgoingPrefix = false }: { stripOutgoingPrefix?: boolean } = {},
+): string {
+  let normalized = normalizeText(content);
+  if (stripOutgoingPrefix) {
+    normalized = stripOutgoingPresentationPrefix(normalized);
+  }
+  return stripTrailingDeliveryStatus(normalized).trim();
+}
+
+function extractAriaLabelBody(ariaLabel: string | null): string | null {
+  if (typeof ariaLabel !== 'string') {
+    return null;
   }
 
   const { remainder } = parseTimestampLabel(ariaLabel);
   const match = remainder.match(/^([^:\r\n]+):\s+([\s\S]*)$/);
   if (!match) {
-    return stripTrailingDeliveryStatus(textWithoutSenderHeading);
+    return null;
   }
 
   const sender = classifyMessageLabel(ariaLabel).sender;
   if (sender === 'UNKNOWN' || match[1].trim() !== sender) {
-    return stripTrailingDeliveryStatus(textWithoutSenderHeading);
+    return null;
   }
 
-  return stripTrailingDeliveryStatus(match[2].trim());
+  return match[2];
+}
+
+export function extractMessageContent(ariaLabel: string | null, textWithoutSenderHeading: string): string {
+  const labelBody = extractAriaLabelBody(ariaLabel);
+  if (labelBody !== null) {
+    return normalizeMessageContent(labelBody);
+  }
+
+  return normalizeMessageContent(textWithoutSenderHeading, {
+    stripOutgoingPrefix: true,
+  });
 }
 
 export function extractMessageDetails({

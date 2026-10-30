@@ -290,6 +290,134 @@ test('message extraction preserves the legitimate phrase "I have Sent"', () => {
   }).message, 'I have Sent');
 });
 
+test('message extraction normalizes delivery statuses in every supported format', () => {
+  const statuses = ['Sent', 'Delivered', 'Seen', 'Sending'];
+  const formats: Array<{ name: string; render: (status: string) => string }> = [
+    { name: 'attached', render: status => `Hahaha!${status}` },
+    { name: 'whitespace', render: status => `Hahaha! ${status}` },
+    { name: 'newline', render: status => `Hahaha!\n${status}` },
+    { name: 'trailing line', render: status => `Hahaha!\n· ${status}` },
+    { name: 'punctuated', render: status => `Hahaha! — ${status}.` },
+  ];
+
+  for (const status of statuses) {
+    for (const format of formats) {
+      const rendered = format.render(status);
+      assert.equal(
+        extractMessageDetails({
+          messageId: `status-${status}-${format.name}`,
+          ariaLabel: `At October 18, 2026, 1:15 PM, You: ${rendered}`,
+          textWithoutSenderHeading: `You sent ${rendered}`,
+        }).message,
+        'Hahaha!',
+        `${status} ${format.name}`,
+      );
+    }
+  }
+});
+
+test('message extraction preserves legitimate status-like body endings', () => {
+  const legitimateBodies = [
+    'I have Sent',
+    'She has Delivered',
+    'They had Seen',
+    'He was Sending',
+  ];
+
+  for (const body of legitimateBodies) {
+    assert.equal(
+      extractMessageDetails({
+        messageId: `legitimate-${body}`,
+        ariaLabel: `At October 18, 2026, 1:15 PM, You: ${body}`,
+        textWithoutSenderHeading: `You sent ${body}`,
+      }).message,
+      body,
+    );
+  }
+
+  assert.equal(
+    extractMessageDetails({
+      messageId: 'standalone-status',
+      ariaLabel: null,
+      textWithoutSenderHeading: 'Seen',
+    }).message,
+    'Seen',
+  );
+});
+
+test('accessibility-label and fallback extraction produce identical normalized content', () => {
+  const messageId = 'mid.$gAAW_kanMS16nveVCpGhjJ_5kQXYs';
+  const clean = extractMessageDetails({
+    messageId,
+    ariaLabel: "At October 18, 2026, 1:15 PM, You: Gg it's borken",
+    textWithoutSenderHeading: "You sent Gg it's borken",
+  });
+  const equivalents = [
+    {
+      ariaLabel: "At October 18, 2026, 1:15 PM, You: Gg it's borken Sent",
+      textWithoutSenderHeading: "You sent Gg it's borken Sent",
+    },
+    {
+      ariaLabel: "At October 18, 2026, 1:15 PM, You: Gg it's borken Delivered",
+      textWithoutSenderHeading: "You sent Gg it's borken Delivered",
+    },
+    {
+      ariaLabel: "At October 18, 2026, 1:15 PM, You: Gg it's borken\nSeen",
+      textWithoutSenderHeading: "You sent Gg it's borken\nSeen",
+    },
+    {
+      ariaLabel: null,
+      textWithoutSenderHeading: "You sent Gg it's borken",
+    },
+    {
+      ariaLabel: null,
+      textWithoutSenderHeading: "You sent Gg it's borken Sending",
+    },
+    {
+      ariaLabel: "At October 18, 2026, 1:15 PM, Gg it's borken Delivered",
+      textWithoutSenderHeading: "You sent Gg it's borken Delivered",
+    },
+    {
+      ariaLabel: null,
+      textWithoutSenderHeading: "You: Gg it's borken Seen",
+    },
+  ];
+
+  for (const equivalent of equivalents) {
+    assert.equal(
+      extractMessageDetails({ messageId, ...equivalent }).message,
+      clean.message,
+      `variant should normalize to the clean body: ${JSON.stringify(equivalent)}`,
+    );
+  }
+
+  assert.equal(
+    extractMessageDetails({
+      messageId,
+      ariaLabel: 'At October 18, 2026, 1:15 PM, You: You sent me a file',
+      textWithoutSenderHeading: 'You sent You sent me a file',
+    }).message,
+    'You sent me a file',
+  );
+});
+
+test('message extraction still distinguishes a genuine content edit', () => {
+  const first = extractMessageDetails({
+    messageId: 'genuine-edit',
+    ariaLabel: "At October 18, 2026, 1:15 PM, You: Gg it's borken",
+    textWithoutSenderHeading: "You sent Gg it's borken",
+  });
+
+  assert.notEqual(
+    extractMessageDetails({
+      messageId: 'genuine-edit',
+      ariaLabel: "At October 18, 2026, 1:15 PM, You: Gg it's fixed",
+      textWithoutSenderHeading: "You sent Gg it's fixed",
+    }).message,
+    first.message,
+  );
+});
+
 test('packet builder accepts a delivery-status-only difference once normalized', () => {
   const firstObservation = extractMessageDetails({
     messageId: 'mid.$gAAW_kanMS16ns3jGqGhgjN7o1gW1',

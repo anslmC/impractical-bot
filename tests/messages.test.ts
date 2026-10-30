@@ -252,6 +252,38 @@ test('uses accessible sender/body boundaries without stripping genuine message p
   );
 });
 
+test('backread uses shared normalization for status and fallback presentation', async () => {
+  const renderedMessages: TestMessage[] = [
+    {
+      messageId: 'outgoing-delivered',
+      ariaLabel: "At October 18, 2026, 1:15 PM, You: Gg it's borken Delivered",
+      message: "You sent Gg it's borken Delivered",
+    },
+    {
+      messageId: 'outgoing-fallback',
+      ariaLabel: null,
+      message: "You sent Gg it's borken Seen",
+    },
+    {
+      messageId: 'legitimate-status-body',
+      ariaLabel: 'At October 18, 2026, 1:15 PM, You: I have Sent',
+      message: 'You sent I have Sent',
+    },
+  ];
+  const { page } = createPage([renderedMessages]);
+
+  const result = await readMessengerMessages(page);
+
+  assert.deepEqual(
+    result.messages.map(message => [message.id, message.message]),
+    [
+      ['outgoing-delivered', "Gg it's borken"],
+      ['outgoing-fallback', "Gg it's borken"],
+      ['legitimate-status-body', 'I have Sent'],
+    ],
+  );
+});
+
 test('continues scrolling without new IDs until the conversation top', async () => {
   const renderedMessages = [createMessage(1), createMessage(2)];
   const { page, waitDurations, progressWaits, scrollPositions } = createPage([

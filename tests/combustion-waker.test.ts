@@ -71,6 +71,10 @@ class FakeElement {
     this.attributes.set(name, value);
   }
 
+  removeAttribute(name: string): void {
+    this.attributes.delete(name);
+  }
+
   appendChild(child: FakeElement): FakeElement {
     child.parent = this;
     this.children.push(child);
@@ -307,6 +311,22 @@ function createWakerPage() {
       message.setAttribute('aria-label', `At October 18, 2026, 1:15 PM, ${sender}: ${text}`);
       return message;
     },
+    setMessagePresentation(
+      messageId: string,
+      ariaLabel: string | null,
+      innerText: string,
+    ) {
+      const message = document.querySelectorAll(MESSAGE_SELECTOR)
+        .find(candidate => candidate.getAttribute('data-message-id') === messageId);
+      assert.ok(message, `expected message ${messageId} to be rendered`);
+      message.innerText = innerText;
+      if (ariaLabel === null) {
+        message.removeAttribute('aria-label');
+      } else {
+        message.setAttribute('aria-label', ariaLabel);
+      }
+      return message;
+    },
     replaceLog() {
       const previousLog = document.querySelectorAll(LOG_SELECTOR)[0];
       assert.ok(previousLog, 'expected a rendered message log');
@@ -421,6 +441,90 @@ test('A Sent status suffix does not stop polling or duplicate the message', asyn
     assert.equal(stoppedError, undefined);
     assert.ok(wakerPage.messageReadCalls > readsBeforeNewMessage);
     assert.deepEqual(contextStore.getState().messageIds, ['baseline-1', 'after-status-1']);
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+  }
+});
+
+test('delivery status and accessibility-label changes do not stop Combustion', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  const wakerPage = createWakerPage();
+  wakerPage.setMessagePresentation(
+    'baseline-1',
+    'At October 18, 2026, 1:15 PM, You: hello',
+    'You sent hello',
+  );
+  const contextStore = createContextStore();
+  let stoppedError: unknown;
+  const controller = await startCombustion({
+    page: wakerPage.page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+  void controller.stopped.catch(error => {
+    stoppedError = error;
+  });
+
+  const advance = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flush();
+  };
+
+  try {
+    assert.deepEqual(contextStore.getState().messageIds, ['baseline-1']);
+    assert.equal(contextStore.getRecent(1)[0].message, 'hello');
+
+    wakerPage.setMessagePresentation(
+      'baseline-1',
+      'At October 18, 2026, 1:15 PM, You: hello Sent',
+      'You sent hello Sent',
+    );
+    await advance();
+    assert.equal(stoppedError, undefined);
+    assert.equal(contextStore.getRecent(1)[0].message, 'hello');
+
+    wakerPage.setMessagePresentation(
+      'baseline-1',
+      'At October 18, 2026, 1:15 PM, You: hello Delivered',
+      'You sent hello Delivered',
+    );
+    await advance();
+    assert.equal(stoppedError, undefined);
+    assert.equal(contextStore.getRecent(1)[0].message, 'hello');
+
+    wakerPage.setMessagePresentation(
+      'baseline-1',
+      'At October 18, 2026, 1:15 PM, You: hello Seen',
+      'You sent hello Seen',
+    );
+    await advance();
+    assert.equal(stoppedError, undefined);
+    assert.equal(contextStore.getRecent(1)[0].message, 'hello');
+
+    wakerPage.setMessagePresentation('baseline-1', null, 'You sent hello Seen');
+    await advance();
+    assert.equal(stoppedError, undefined);
+    assert.equal(contextStore.getRecent(1)[0].message, 'hello');
+    assert.deepEqual(contextStore.getState().messageIds, ['baseline-1']);
+
+    wakerPage.setMessagePresentation(
+      'baseline-1',
+      'At October 18, 2026, 1:15 PM, You: genuinely different',
+      'You sent genuinely different',
+    );
+    await advance();
+
+    assert.match(
+      String((stoppedError as Error | undefined)?.message),
+      /Message ID baseline-1 was observed with different content\./,
+    );
   } finally {
     await controller.stop();
     Math.random = originalRandom;
