@@ -840,7 +840,7 @@ test('mention packets keep a five-message topic window before the trigger', asyn
 
   const { page, inject } = createInjectedMessengerPage();
   const contextStore = createContextStore();
-  contextStore.add([
+  const transcript = [
     { messageId: 'essay-1', message: 'did you finish the essay?', sender: 'Alex' },
     { messageId: 'essay-2', message: 'yeah, submitted it last night', sender: 'Blair' },
     { messageId: 'friday-1', message: 'are we still on for friday?', sender: 'Alex' },
@@ -848,7 +848,13 @@ test('mention packets keep a five-message topic window before the trigger', asyn
     { messageId: 'friday-3', message: "I can't, they moved my shift", sender: 'Casey' },
     { messageId: 'friday-4', message: 'wait, why?', sender: 'Alex' },
     { messageId: 'friday-5', message: 'they need someone until nine', sender: 'Casey' },
-  ].map(message => ({ ...message, direction: 'INCOMING' })));
+  ].map(message => ({ ...message, direction: 'INCOMING' as const }));
+  contextStore.add(transcript);
+  inject(transcript.slice(-3).map(({ messageId, sender, message }) => ({
+    messageId,
+    sender,
+    message,
+  })));
   const controller = await startCombustion({
     page,
     contextStore,
@@ -869,6 +875,65 @@ test('mention packets keep a five-message topic window before the trigger', asyn
       ['friday-1', 'friday-2', 'friday-3', 'friday-4', 'friday-5', 'mention-limit-1'],
       'the five-message window keeps the friday topic anchor and drops the resolved essay thread',
     );
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('a longer handle that starts with an alias does not trigger a reply', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  const generatedRequests: Array<readonly { messageId: string; message: string }[]> = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    generatedRequests.push(messages as readonly { messageId: string; message: string }[]);
+    return 'mocked reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => ({ status: 'sent' });
+
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flushEngine();
+  };
+
+  const { page, inject } = createInjectedMessengerPage();
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'botany-1', sender: 'Alex', message: '@Botany is a plant' }]);
+    await advancePoll();
+    await advancePoll();
+    assert.equal(generatedRequests.length, 0, 'the longer handle is not a mention');
+
+    inject([{ messageId: 'mention-1', sender: 'Alex', message: '@Bot, still there?' }]);
+    await advancePoll();
+    await advancePoll();
+    assert.equal(generatedRequests.length, 1);
+    assert.equal(generatedRequests[0].at(-1)?.messageId, 'mention-1');
   } finally {
     await controller.stop();
     Math.random = originalRandom;

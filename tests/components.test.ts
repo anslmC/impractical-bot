@@ -114,6 +114,35 @@ test('packet builder holds a mention turn until the next poll', () => {
   assert.deepEqual(secondTurn.packet?.contextMessages.map(message => message.messageId), ['context-1']);
 });
 
+test('packet builder applies the context limit after deduplicating history', () => {
+  const history = Array.from({ length: 8 }, (_, index) => ({
+    messageId: `context-${index + 1}`,
+    message: `context message ${index + 1}`,
+  }));
+  const result = buildPacketTurn({
+    newMessages: [{
+      messageId: 'in-1', message: '@Bot still on?', mention: true, direction: 'INCOMING',
+    }],
+    recentContext: [...history, ...history.slice(-3)],
+    contextLimit: 5,
+  });
+
+  assert.deepEqual(
+    result.pendingPacket?.contextMessages.map(message => message.messageId),
+    ['context-4', 'context-5', 'context-6', 'context-7', 'context-8'],
+    'the newest five distinct messages survive a rendered/store overlap',
+  );
+  assert.deepEqual(
+    result.pendingPacket?.newMessages.map(message => message.messageId),
+    ['in-1'],
+    'the trigger is new work, not history',
+  );
+  assert.throws(
+    () => buildPacketTurn({ newMessages: [], contextLimit: 0 }),
+    /contextLimit must be a positive integer/,
+  );
+});
+
 test('packet builder opens a mention packet only for INCOMING messages', () => {
   const incoming = buildPacketTurn({
     newMessages: [{

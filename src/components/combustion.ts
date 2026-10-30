@@ -173,7 +173,7 @@ function createMentionMatcher(aliases: readonly string[]): (message: string) => 
     .filter(Boolean)
     .map(alias => alias.split(/\s+/)
       .map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-      .join('\\s+'));
+      .join('\\s+') + '(?![\\p{L}\\p{N}_])');
   if (patterns.length === 0) {
     return () => false;
   }
@@ -846,7 +846,6 @@ export async function startCombustion({
                 ...messages,
               ]
                 .filter(message => message.messageId && !newMessageIds.has(message.messageId))
-                .slice(-PACKET_CONTEXT_MESSAGE_LIMIT)
                 .map(message => ({
                   ...message,
                   mention: mentionsConfiguredAlias(message.message),
@@ -857,6 +856,7 @@ export async function startCombustion({
             newMessages: newMessagesWithMentions,
             recentContext,
             state: packetBuilderState,
+            contextLimit: PACKET_CONTEXT_MESSAGE_LIMIT,
           });
           packetBuilderState = result.state;
           appendContextMessages(

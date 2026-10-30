@@ -60,10 +60,12 @@ export function buildPacketTurn({
   newMessages,
   recentContext = [],
   state = createPacketBuilderState(),
+  contextLimit,
 }: {
   newMessages: PacketBuilderMessage[];
   recentContext?: PacketBuilderMessage[];
   state?: PacketBuilderState;
+  contextLimit?: number;
 }): {
   packet: PacketBuilderPacket | null;
   pendingPacket: PacketBuilderPacket | null;
@@ -75,6 +77,9 @@ export function buildPacketTurn({
   if (!state || !Array.isArray(state.observedMessages) ||
       !Number.isInteger(state.nextPacketNumber) || state.nextPacketNumber < 1) {
     throw new TypeError('state must be created by createPacketBuilderState().');
+  }
+  if (contextLimit !== undefined && (!Number.isInteger(contextLimit) || contextLimit < 1)) {
+    throw new TypeError('contextLimit must be a positive integer when provided.');
   }
 
   const observedById = new Map(
@@ -109,6 +114,8 @@ export function buildPacketTurn({
     const inContext = contextById.get(message.messageId);
     if (inContext) {
       assertMatchingContent(inContext, message);
+      contextById.delete(message.messageId);
+      contextById.set(message.messageId, message);
       continue;
     }
 
@@ -155,7 +162,9 @@ export function buildPacketTurn({
       mentionMessages: uniqueNewMessages
         .filter(isMentionTrigger)
         .map(message => ({ ...message })),
-      contextMessages: [...contextById.values()].map(message => ({ ...message })),
+      contextMessages: [...contextById.values()]
+        .slice(contextLimit === undefined ? 0 : -contextLimit)
+        .map(message => ({ ...message })),
     };
     nextPacketNumber += 1;
   }
