@@ -201,11 +201,11 @@ test('dashboard renders the latest bounded logs and an empty waiting message', (
   assert.equal(lines.length, 24);
   assert.ok(lines.every(line => line.length === 80));
   assert.match(rendered, /LIVE LOGS/);
+  assert.match(rendered, /\[03:04:05\] two/);
   assert.match(rendered, /\[03:04:05\] three/);
   assert.match(rendered, /\[03:04:05\] four/);
   assert.match(rendered, /\[03:04:05\] five/);
   assert.doesNotMatch(rendered, /\[03:04:05\] one/);
-  assert.doesNotMatch(rendered, /\[03:04:05\] two/);
   assert.match(rendered, /Status: Connected/);
 
   const empty = renderDashboardLines(

@@ -1,5 +1,13 @@
-import { RUNNING_ENGINE_COMMANDS, formatCliCommand } from '../cli-commands.js';
+import { formatCliCommand } from '../cli-commands.js';
 import type { RuntimeEngineState } from '../runtime-control.js';
+import {
+  getDashboardCommandHints,
+  personalityChoices,
+  renderPromptInput,
+  temperamentChoices,
+  type DashboardNotice,
+  type DashboardPrompt,
+} from './commands.js';
 import {
   formatDashboardLogLine,
   type DashboardLogEntry,
@@ -22,6 +30,10 @@ export interface DashboardView {
   personality: string;
   messengerDestination: string;
   logs?: readonly DashboardLogEntry[];
+  prompt?: DashboardPrompt;
+  notice?: DashboardNotice;
+  pending?: boolean;
+  commandsEnabled?: boolean;
 }
 
 export interface DashboardDimensions {
@@ -116,8 +128,84 @@ function boxedLine(content: string, width: number): string {
   return `│${pad(content, width)}│`;
 }
 
-function renderCommands(width: number): string[] {
-  return RUNNING_ENGINE_COMMANDS.map(command => truncate(formatCliCommand(command), width));
+function renderCommands(view: DashboardView, width: number): string[] {
+  const lines = ['COMMANDS'];
+  for (const hint of getDashboardCommandHints(view)) {
+    lines.push(truncate(`[${hint.key}] ${formatCliCommand(hint)}`, width));
+  }
+  if (view.prompt === undefined) {
+    lines.push('[C] Close dashboard');
+  }
+  return lines;
+}
+
+function noticePrefix(notice: DashboardNotice): string {
+  switch (notice.tone) {
+    case 'pending':
+      return 'Pending: ';
+    case 'success':
+      return '';
+    case 'error':
+      return 'Error: ';
+    case 'info':
+      return '';
+  }
+}
+
+function promptErrorLines(prompt: DashboardPrompt, width: number): string[] {
+  if (!('error' in prompt) || prompt.error === undefined) {
+    return [];
+  }
+  return [truncate(`Error: ${prompt.error}`, width)];
+}
+
+function promptFooterLines(prompt: DashboardPrompt, width: number): string[] {
+  switch (prompt.kind) {
+    case 'destination':
+      return [
+        truncate(renderPromptInput('Destination URL: ', prompt.value, width).text, width),
+        truncate('[Enter] Apply  [Esc] Cancel', width),
+        ...promptErrorLines(prompt, width),
+      ];
+    case 'temperament':
+      return [
+        'Select temperament:',
+        truncate(temperamentChoices(), width),
+        truncate('[Esc] Cancel', width),
+      ];
+    case 'personality':
+      return [
+        'Select personality:',
+        truncate(personalityChoices(), width),
+        truncate('[Esc] Cancel', width),
+      ];
+    case 'personalityInstruction':
+      return [
+        truncate(
+          renderPromptInput('Personality instruction: ', prompt.value, width).text,
+          width,
+        ),
+        truncate('[Enter] Apply  [Esc] Cancel', width),
+        ...promptErrorLines(prompt, width),
+      ];
+    case 'stopConfirmation':
+      return [
+        'Stop Impractical Bot?',
+        truncate('[Y] Confirm  [Esc/N] Cancel', width),
+      ];
+  }
+}
+
+function footerLines(view: DashboardView, width: number): string[] {
+  if (view.prompt !== undefined) {
+    return promptFooterLines(view.prompt, width)
+      .map(line => truncate(line, width));
+  }
+  const status = `Status: ${connectionLabel(view)}`;
+  if (view.notice === undefined) {
+    return [truncate(status, width)];
+  }
+  return [truncate(`${status}  |  ${noticePrefix(view.notice)}${view.notice.message}`, width)];
 }
 
 function renderLogLines(
@@ -149,18 +237,14 @@ function bodyLines(view: DashboardView, width: number, available: number): strin
     truncate(`Personality: ${capitalize(displayValue(view.personality))}`, width),
     truncate(`Destination: ${displayValue(view.messengerDestination)}`, width),
   ];
-  const commandLines = [
-    'COMMANDS',
-    ...renderCommands(width),
-    '[C] Close dashboard',
-  ];
-  const statusLine = `Status: ${connectionLabel(view)}`;
+  const commandLines = renderCommands(view, width);
+  const footer = footerLines(view, width);
   const fixedLines = [
     ...engineLines,
     separator,
     ...commandLines,
     separator,
-    statusLine,
+    ...footer,
   ];
 
   const logCapacity = available - fixedLines.length - 2;
@@ -173,7 +257,7 @@ function bodyLines(view: DashboardView, width: number, available: number): strin
       'LIVE LOGS',
       ...renderLogLines(view.logs ?? [], width, logCapacity),
       separator,
-      statusLine,
+      ...footer,
     ];
   }
 
@@ -188,18 +272,14 @@ function plainLines(view: DashboardView, width: number, rows: number): string[] 
     truncate(`Personality: ${capitalize(view.personality)}`, width),
     truncate(`Destination: ${displayValue(view.messengerDestination)}`, width),
   ];
-  const commandLines = [
-    'COMMANDS',
-    ...renderCommands(width),
-    '[C] Close dashboard',
-  ];
-  const statusLine = truncate(`Status: ${connectionLabel(view)}`, width);
+  const commandLines = renderCommands(view, width);
+  const footer = footerLines(view, width);
   const fixedLines = [
     center('IMPRACTICAL BOT', width),
     center(stateLabel(view), width),
     ...engineLines,
     ...commandLines,
-    statusLine,
+    ...footer,
   ];
   const logCapacity = rows - fixedLines.length - 1;
   if (logCapacity < 1) {
@@ -212,7 +292,7 @@ function plainLines(view: DashboardView, width: number, rows: number): string[] 
     ...commandLines,
     'LIVE LOGS',
     ...renderLogLines(view.logs ?? [], width, logCapacity),
-    statusLine,
+    ...footer,
   ];
   return lines.slice(0, Math.max(0, rows));
 }
@@ -239,6 +319,60 @@ function fitBody(lines: string[], available: number): string[] {
   }
   const status = lines[lines.length - 1];
   return [...lines.slice(0, available - 1), status];
+}
+
+export interface DashboardCursorPosition {
+  readonly row: number;
+  readonly column: number;
+}
+
+function promptInput(
+  prompt: DashboardPrompt,
+): { prefix: string; value: string } | undefined {
+  switch (prompt.kind) {
+    case 'destination':
+      return { prefix: 'Destination URL: ', value: prompt.value };
+    case 'personalityInstruction':
+      return { prefix: 'Personality instruction: ', value: prompt.value };
+    default:
+      return undefined;
+  }
+}
+
+export function getDashboardPromptCursor(
+  view: DashboardView,
+  dimensions: DashboardDimensions,
+): DashboardCursorPosition | undefined {
+  if (view.prompt === undefined) {
+    return undefined;
+  }
+  const input = promptInput(view.prompt);
+  if (input === undefined) {
+    return undefined;
+  }
+
+  const columns = Math.max(0, Math.floor(dimensions.columns));
+  const rows = Math.max(0, Math.floor(dimensions.rows));
+  if (columns === 0 || rows === 0) {
+    return undefined;
+  }
+
+  const plain = columns < 12 || rows < 6;
+  const contentWidth = plain ? columns : columns - 2;
+  const footer = footerLines(view, contentWidth);
+  const promptLineIndex = 0;
+  const rendered = renderPromptInput(input.prefix, input.value, contentWidth);
+
+  if (plain) {
+    return {
+      row: Math.max(1, rows - footer.length + promptLineIndex + 1),
+      column: Math.min(columns, Math.max(1, 1 + rendered.cursorOffset)),
+    };
+  }
+  return {
+    row: Math.max(1, rows - footer.length + promptLineIndex),
+    column: Math.min(columns, Math.max(2, 2 + rendered.cursorOffset)),
+  };
 }
 
 export function renderDashboardLines(

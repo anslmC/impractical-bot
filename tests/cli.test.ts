@@ -3630,6 +3630,17 @@ test('start automatically opens the dashboard after readiness and keeps the engi
         assert.equal(options.configurationFilePath, configurationFilePath);
         assert.equal(options.captureConsoleOutput, true);
         assert.equal(typeof options.requestStatus, 'function');
+        assert.ok(options.commands);
+        for (const operation of [
+          'pause',
+          'resume',
+          'stop',
+          'changeDestination',
+          'setTemperament',
+          'setPersonality',
+        ] as const) {
+          assert.equal(typeof options.commands[operation], 'function');
+        }
         return {
           closed: dashboardClosed.promise,
           async close() {

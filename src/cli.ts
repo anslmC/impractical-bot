@@ -110,6 +110,8 @@ export interface CliRuntimeOptions {
   requestRuntimeSetPersonality?: typeof requestRuntimeSetPersonality;
   requestRuntimeStatus?: typeof requestRuntimeStatus;
   requestRuntimeStatusSnapshot?: typeof requestRuntimeStatusSnapshot;
+  requestRuntimePause?: typeof requestRuntimePause;
+  requestRuntimeResume?: typeof requestRuntimeResume;
   requestRuntimeStop?: typeof requestRuntimeStop;
   waitForRuntimeShutdown?: typeof waitForRuntimeShutdown;
   discoverBrowsers?: (options?: BrowserDiscoveryOptions) => Promise<BrowserCandidate[]>;
@@ -1445,6 +1447,33 @@ async function handleStart(
               requestStatus: runtime.requestRuntimeStatusSnapshot ?? requestRuntimeStatusSnapshot,
               captureConsoleOutput: true,
               onInterrupt: onSigint,
+              commands: {
+                pause: () => (runtime.requestRuntimePause ?? requestRuntimePause)(
+                  configurationFilePath,
+                ),
+                resume: () => (runtime.requestRuntimeResume ?? requestRuntimeResume)(
+                  configurationFilePath,
+                ),
+                stop: () => (runtime.requestRuntimeStop ?? requestRuntimeStop)(
+                  configurationFilePath,
+                ),
+                changeDestination: destination =>
+                  (runtime.requestRuntimeChangeDestination ?? requestRuntimeChangeDestination)(
+                    configurationFilePath,
+                    destination,
+                  ),
+                setTemperament: temperament =>
+                  (runtime.requestRuntimeSetTemperament ?? requestRuntimeSetTemperament)(
+                    configurationFilePath,
+                    temperament,
+                  ),
+                setPersonality: (mode, instruction) =>
+                  (runtime.requestRuntimeSetPersonality ?? requestRuntimeSetPersonality)(
+                    configurationFilePath,
+                    mode,
+                    instruction,
+                  ),
+              },
             });
           } catch (error) {
             writeError(
@@ -1595,9 +1624,12 @@ async function handlePause(
   writeOutput: Output,
   writeError: Output,
   configurationFilePath: string | undefined,
+  runtime: CliRuntimeOptions,
 ): Promise<number> {
   try {
-    const result = await requestRuntimePause(configurationFilePath);
+    const result = await (runtime.requestRuntimePause ?? requestRuntimePause)(
+      configurationFilePath,
+    );
     if (result.status === 'not-running') {
       writeOutput('No impractical-bot engine is running for this configuration.');
       return 0;
@@ -1614,9 +1646,12 @@ async function handleResume(
   writeOutput: Output,
   writeError: Output,
   configurationFilePath: string | undefined,
+  runtime: CliRuntimeOptions,
 ): Promise<number> {
   try {
-    const result = await requestRuntimeResume(configurationFilePath);
+    const result = await (runtime.requestRuntimeResume ?? requestRuntimeResume)(
+      configurationFilePath,
+    );
     if (result.status === 'not-running') {
       writeOutput('No impractical-bot engine is running for this configuration.');
       return 0;
@@ -1722,8 +1757,8 @@ export async function runCli(
     ),
     updatekey: () => handleUpdateKey(writeOutput, writeError, configurationFilePath, runtime),
     start: () => handleStart(writeOutput, writeError, configurationFilePath, prompt, runtime),
-    pause: () => handlePause(writeOutput, writeError, configurationFilePath),
-    resume: () => handleResume(writeOutput, writeError, configurationFilePath),
+    pause: () => handlePause(writeOutput, writeError, configurationFilePath, runtime),
+    resume: () => handleResume(writeOutput, writeError, configurationFilePath, runtime),
     stop: () => handleStop(writeOutput, writeError, configurationFilePath, runtime),
   };
   const handler = command ? handlers[command] : undefined;
