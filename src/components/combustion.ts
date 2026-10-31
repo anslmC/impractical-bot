@@ -734,6 +734,66 @@ export async function startCombustion({
     return cleanupPromise;
   };
 
+  const attachWakerObserver = async (): Promise<void> => {
+    await page.locator(LOG_SELECTOR).evaluate((log, options) => {
+      const pageWindow = window as Window & {
+        __impracticalBotWakerObserver?: MutationObserver & { active: boolean };
+      };
+      pageWindow.__impracticalBotWakerObserver?.disconnect();
+      const observer = new MutationObserver(mutations => {
+        if (!observer.active) {
+          return;
+        }
+        const logs = Array.from(log.ownerDocument.querySelectorAll(options.logSelector));
+        for (const mutation of mutations) {
+          const addedNodes = [];
+          for (const node of mutation.addedNodes) {
+            const isElement = node.nodeType === Node.ELEMENT_NODE;
+            const nodeMatchesMessage = isElement && (node as Element).matches(options.messageSelector);
+            const messageElements: Element[] = [];
+            if (nodeMatchesMessage) {
+              messageElements.push(node as Element);
+            }
+            if (isElement) {
+              messageElements.push(...(node as Element).querySelectorAll(options.messageSelector));
+            }
+            const messageElementsInLogs = messageElements.filter(message =>
+              logs.some(candidate => candidate.contains(message))
+            );
+            if (messageElementsInLogs.length === 0) {
+              continue;
+            }
+            addedNodes.push({
+              tagName: isElement ? (node as Element).tagName.toLowerCase() : node.nodeName.toLowerCase(),
+              role: isElement ? (node as Element).getAttribute('role') : null,
+              nodeMatchesMessage: Boolean(nodeMatchesMessage),
+              subtreeContainsMessageElements: messageElementsInLogs.length > 0,
+              messages: messageElementsInLogs.map(message => ({
+                id: message.getAttribute('data-message-id'),
+                ariaRoleDescription: message.getAttribute('aria-roledescription'),
+              })),
+            });
+          }
+          if (addedNodes.length > 0) {
+            const diagnostic = options.debug
+              ? JSON.stringify({ mutationType: mutation.type, addedNodes })
+              : 'Potential DOM activity detected; waking poller.';
+            console.log(`${options.logPrefix}${diagnostic}`);
+          }
+        }
+      }) as MutationObserver & { active: boolean };
+      observer.active = false;
+      observer.observe(log.ownerDocument.body, { childList: true, subtree: true });
+      pageWindow.__impracticalBotWakerObserver = observer;
+    }, {
+      messageSelector: WAKER_MESSAGE_SELECTOR,
+      logSelector: LOG_SELECTOR,
+      logPrefix: LOG_PREFIX,
+      debug: DEBUG_ENGINE,
+    });
+    observerAttached = true;
+  };
+
   const onConsole = (message: ConsoleMessage): void => {
     const text = message.text();
     if (!text.startsWith(LOG_PREFIX) || mode !== 'idle') {
@@ -1015,6 +1075,10 @@ export async function startCombustion({
     }
     try {
       await navigateToDestination(previousDestination);
+      if (!stopRequested) {
+        observerAttached = false;
+        await attachWakerObserver();
+      }
       console.log('[engine] Returned to the previous message destination.');
     } catch (error) {
       console.error(
@@ -1053,6 +1117,8 @@ export async function startCombustion({
             reason: 'The engine stopped during destination navigation.',
           };
         }
+        observerAttached = false;
+        await attachWakerObserver();
         messageIdentity.clear();
         detectedAtByMessageId.clear();
         observedTextByMessageId.clear();
@@ -1243,61 +1309,7 @@ export async function startCombustion({
 
     page.on('console', onConsole);
     listenerAttached = true;
-    await page.locator(LOG_SELECTOR).evaluate((log, options) => {
-      const observer = new MutationObserver(mutations => {
-        if (!observer.active) {
-          return;
-        }
-        const logs = Array.from(log.ownerDocument.querySelectorAll(options.logSelector));
-        for (const mutation of mutations) {
-          const addedNodes = [];
-          for (const node of mutation.addedNodes) {
-            const isElement = node.nodeType === Node.ELEMENT_NODE;
-            const nodeMatchesMessage = isElement && (node as Element).matches(options.messageSelector);
-            const messageElements: Element[] = [];
-            if (nodeMatchesMessage) {
-              messageElements.push(node as Element);
-            }
-            if (isElement) {
-              messageElements.push(...(node as Element).querySelectorAll(options.messageSelector));
-            }
-            const messageElementsInLogs = messageElements.filter(message =>
-              logs.some(candidate => candidate.contains(message))
-            );
-            if (messageElementsInLogs.length === 0) {
-              continue;
-            }
-            addedNodes.push({
-              tagName: isElement ? (node as Element).tagName.toLowerCase() : node.nodeName.toLowerCase(),
-              role: isElement ? (node as Element).getAttribute('role') : null,
-              nodeMatchesMessage: Boolean(nodeMatchesMessage),
-              subtreeContainsMessageElements: messageElementsInLogs.length > 0,
-              messages: messageElementsInLogs.map(message => ({
-                id: message.getAttribute('data-message-id'),
-                ariaRoleDescription: message.getAttribute('aria-roledescription'),
-              })),
-            });
-          }
-          if (addedNodes.length > 0) {
-            const diagnostic = options.debug
-              ? JSON.stringify({ mutationType: mutation.type, addedNodes })
-              : 'Potential DOM activity detected; waking poller.';
-            console.log(`${options.logPrefix}${diagnostic}`);
-          }
-        }
-      }) as MutationObserver & { active: boolean };
-      observer.active = false;
-      observer.observe(log.ownerDocument.body, { childList: true, subtree: true });
-      (window as Window & {
-        __impracticalBotWakerObserver?: MutationObserver & { active: boolean };
-      }).__impracticalBotWakerObserver = observer;
-    }, {
-      messageSelector: WAKER_MESSAGE_SELECTOR,
-      logSelector: LOG_SELECTOR,
-      logPrefix: LOG_PREFIX,
-      debug: DEBUG_ENGINE,
-    });
-    observerAttached = true;
+    await attachWakerObserver();
 
     const baseline = await readLatestMessages();
     seenMessageIds = new Set([

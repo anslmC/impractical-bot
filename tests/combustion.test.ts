@@ -253,7 +253,7 @@ test('Combustion pauses polling and resumes it without duplicating reads', async
   }
 });
 
-test('Combustion changes destinations, resets conversation state, and resumes without duplicate observers', async context => {
+test('Combustion changes destinations, resets conversation state, and reattaches its observer', async context => {
   context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
   const mockPage = createMockPage({ messageCount: 2 });
   const contextStore = createContextStore();
@@ -303,7 +303,7 @@ test('Combustion changes destinations, resets conversation state, and resumes wi
     assert.deepEqual(persisted, [firstDestination, secondDestination]);
     assert.equal(configuration.messageDestination, secondDestination);
     assert.equal(mockPage.baselineReadCalls, 3);
-    assert.equal(mockPage.observerSetupCalls, 1);
+    assert.equal(mockPage.observerSetupCalls, 3);
     assert.equal(mockPage.listenerCount, 1);
   } finally {
     await controller.stop();

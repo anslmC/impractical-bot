@@ -336,6 +336,13 @@ function createWakerPage() {
       });
       previousLog.replaceWith(replacement);
     },
+    simulateDocumentReplacement() {
+      const observer = windowObject.__impracticalBotWakerObserver as
+        | FakeMutationObserver
+        | undefined;
+      observer?.disconnect();
+      delete windowObject.__impracticalBotWakerObserver;
+    },
     get observer() {
       return windowObject.__impracticalBotWakerObserver as
         | (FakeMutationObserver & { active: boolean })
@@ -775,6 +782,51 @@ test('Stop while idle removes the observer and console listener cleanly', async 
     assert.equal(wakerPage.listenerCount, 0);
     assert.equal(wakerPage.observer, undefined);
   } finally {
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+  }
+});
+
+test('Destination navigation reattaches the idle waker observer', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  const wakerPage = createWakerPage();
+  const contextStore = createContextStore();
+  const destination = 'https://www.facebook.com/messages/t/987654321';
+  let navigationCalls = 0;
+  const controller = await startCombustion({
+    page: wakerPage.page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+    navigateDestination: async () => {
+      navigationCalls += 1;
+      wakerPage.simulateDocumentReplacement();
+    },
+  });
+
+  try {
+    await advanceToIdle(context, wakerPage);
+    assert.equal(wakerPage.observer?.active, true);
+
+    const result = await controller.changeDestination(destination, { resume: true });
+    assert.deepEqual(result, { status: 'changed', resumed: true });
+    assert.equal(navigationCalls, 1);
+    assert.equal(wakerPage.observerSetupCalls, 2);
+    assert.ok(wakerPage.observer, 'the replacement document gets a waker observer');
+
+    await advanceToIdle(context, wakerPage);
+    const readsBeforeWake = wakerPage.messageReadCalls;
+    wakerPage.appendMessage('after-navigation-1', 'new message after navigation');
+    await flush();
+
+    assert.ok(wakerPage.messageReadCalls > readsBeforeWake);
+    assert.ok(contextStore.getState().messageIds.includes('after-navigation-1'));
+  } finally {
+    await controller.stop();
     Math.random = originalRandom;
     context.mock.timers.reset();
   }
