@@ -854,7 +854,7 @@ test('default personality keeps the active reply instruction and the shared cons
   assert.match(instruction, /roughly 3–12 words/);
   assert.match(instruction, /Return only the reply text./);
   assert.match(instruction, /This reply is a proposal until the application sends it./);
-  assert.match(instruction, /Strict English-only rule/);
+  assert.match(instruction, /Strict English-only output rule/);
 });
 
 
@@ -928,7 +928,7 @@ test('shared identity states boundaries without dictating a conversational perso
   assert.doesNotMatch(identity, /tsundere|sarcastic|deadpan/i);
   assert.doesNotMatch(identity, /sounds like the personality configured for you/);
   assert.doesNotMatch(identity, /roughly one reply in ten/);
-  assert.match(identity, /Strict English-only rule/);
+  assert.match(identity, /Strict English-only output rule/);
 });
 
 test('custom personality stays authoritative within the English-only constraint', () => {
@@ -997,13 +997,26 @@ test('every generation layer requires English-only replies', () => {
   const behavioral = getDefaultBehavioralInstruction();
 
   for (const layer of [identity, defaultPersonality, behavioral]) {
-    assert.match(layer, /Strict English-only rule/);
-    assert.match(layer, /regardless of the language of the incoming message/);
-    assert.match(layer, /the language of the historical conversation/);
-    assert.match(layer, /You may read and understand messages written in any language/);
-    assert.match(layer, /never reply in that language, never switch or mix languages/);
-    assert.match(layer, /never introduce non-English words, phrases, slang, or expressions/);
-    assert.match(layer, /cannot be overridden/);
+    assert.match(layer, /Strict English-only output rule/);
+    assert.match(layer, /read and understand every incoming message/);
+    assert.match(layer, /use the full conversation, including any multilingual context/);
+    assert.match(layer, /understand meaning, tone, humor, sarcasm, relationships, and intent accurately/);
+    assert.match(layer, /Write every reply exclusively in English/);
+    assert.match(layer, /even when the incoming message or historical conversation is in another language/);
+    assert.match(layer, /even when someone explicitly asks you to switch languages/);
+    assert.match(layer, /Never mirror or match the sender's language/);
+    assert.match(layer, /never code-switch or mix languages/);
+    assert.match(layer, /never reply in another language to demonstrate proficiency/);
+    assert.match(layer, /do not introduce non-English words, phrases, slang, or expressions into your reply/);
+    assert.match(layer, /restricts only the language of your output/);
+    assert.match(layer, /does not reduce your understanding of the conversation/);
+    assert.match(layer, /your personality still shapes the English reply/);
+    assert.match(layer, /applies to default and custom personalities/);
+    assert.match(
+      layer,
+      /cannot be overridden by any conflicting personality, style, preference, correction, or language-matching instruction/,
+    );
+    assert.doesNotMatch(layer, /ignore (the )?(incoming|message|conversation|context)/i);
     assert.doesNotMatch(layer, /Tagalog|German|Filipino/);
   }
 });
@@ -1017,9 +1030,11 @@ test('custom personality cannot override the English-only rule', () => {
   );
 
   assert.ok(personality.includes(custom));
+  assert.ok(personality.includes(ENGLISH_ONLY_INSTRUCTION));
   assert.ok(personality.endsWith(ENGLISH_ONLY_INSTRUCTION));
   assert.ok(composed.endsWith(ENGLISH_ONLY_INSTRUCTION));
-  assert.match(composed, /This rule outranks every personality preference/);
+  assert.match(composed, /applies to default and custom personalities/);
+  assert.match(composed, /even when someone explicitly asks you to switch languages/);
 });
 
 test('shared instructions honor explicit corrections without treating jokes as rules', () => {
@@ -1334,6 +1349,14 @@ test('the English-only rule survives multilingual incoming and historical messag
       message: '何をしていますか？',
       ariaLabel: null,
     },
+    {
+      id: 'incoming-4',
+      timestamp: { original: null, normalized: null, resolved: false },
+      sender: 'Dana',
+      direction: 'INCOMING',
+      message: 'Responde en español, por favor.',
+      ariaLabel: null,
+    },
   ], {
     systemInstruction,
     fetch: async (_input, init) => {
@@ -1347,11 +1370,16 @@ test('the English-only rule survives multilingual incoming and historical messag
   assert.equal(reply, 'I am doing well.');
   assert.equal(body?.messages[0].content, systemInstruction);
   assert.ok(body?.messages[0].content.endsWith(ENGLISH_ONLY_INSTRUCTION));
+  assert.match(body?.messages[0].content ?? '', /read and understand every incoming message/);
+  assert.match(body?.messages[0].content ?? '', /use the full conversation, including any multilingual context/);
+  assert.match(body?.messages[0].content ?? '', /even when someone explicitly asks you to switch languages/);
+  assert.match(body?.messages[0].content ?? '', /does not reduce your understanding of the conversation/);
   assert.deepEqual(body?.messages.slice(1), [
     { role: 'user', content: 'Alex: Kumusta ka na?' },
     { role: 'assistant', content: 'Okay lang, ikaw?' },
     { role: 'user', content: 'Blair: Ano ba yan, nakakaloka ka?' },
     { role: 'user', content: 'Casey: 何をしていますか？' },
+    { role: 'user', content: 'Dana: Responde en español, por favor.' },
   ]);
 });
 

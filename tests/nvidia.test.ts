@@ -168,7 +168,8 @@ test('reply generation sends known-direction messages in order and extracts trim
     Authorization: 'Bearer nvapi-test-key',
     'Content-Type': 'application/json',
   });
-  assert.deepEqual(JSON.parse(String(requestedOptions?.body)), {
+  const body = JSON.parse(String(requestedOptions?.body));
+  assert.deepEqual(body, {
     model: 'nvidia/nemotron-3.5-lightning-30b-a3b',
     messages: [
       {
@@ -183,6 +184,15 @@ test('reply generation sends known-direction messages in order and extracts trim
     max_tokens: 256,
     stream: false,
   });
+  const fallbackInstruction = String(body.messages[0].content);
+  assert.match(fallbackInstruction, /Strict English-only output rule/);
+  assert.match(fallbackInstruction, /read and understand every incoming message/);
+  assert.match(fallbackInstruction, /use the full conversation, including any multilingual context/);
+  assert.match(fallbackInstruction, /even when someone explicitly asks you to switch languages/);
+  assert.match(fallbackInstruction, /do not introduce non-English words, phrases, slang, or expressions into your reply/);
+  assert.match(fallbackInstruction, /restricts only the language of your output/);
+  assert.match(fallbackInstruction, /does not reduce your understanding of the conversation/);
+  assert.ok(fallbackInstruction.includes(ENGLISH_ONLY_INSTRUCTION));
 });
 
 test('reply generation uses a supplied system instruction before conversation messages', async () => {
@@ -208,6 +218,80 @@ test('reply generation uses a supplied system instruction before conversation me
     { role: 'system', content: 'Supplied instruction.' },
     { role: 'user', content: 'Alex: Hello.' },
   ]);
+});
+
+test('a non-English reply is retried without dropping multilingual context', async () => {
+  const bodies: { messages: { role: string; content: string }[] }[] = [];
+  let call = 0;
+
+  const reply = await generateNvidiaReply('nvapi-test-key', [{
+    id: 'incoming-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Alex',
+    direction: 'INCOMING',
+    message: 'dont speak atagalog',
+    ariaLabel: null,
+  }, {
+    id: 'outgoing-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'You',
+    direction: 'OUTGOING',
+    message: 'Okay lang naman yan. :p Ang sagot ko ay nakapag-alam ka naman...',
+    ariaLabel: null,
+  }, {
+    id: 'incoming-2',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Blair',
+    direction: 'INCOMING',
+    message: 'Ano ba yan, nakakaloka ka?',
+    ariaLabel: null,
+  }], {
+    systemInstruction: 'Supplied instruction.',
+    fetch: async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as typeof bodies[number]);
+      call += 1;
+      return call === 1
+        ? successfulCompletion("Hear you? Opo, talo na ako sa'yo ng tanong. Ano ba talaga ng bigay mo? :p")
+        : successfulCompletion('I hear you. What are you actually asking?');
+    },
+  });
+
+  assert.equal(call, 2, 'the rejected reply is retried exactly once');
+  assert.equal(reply, 'I hear you. What are you actually asking?');
+  assert.deepEqual(bodies[0].messages.slice(1), [
+    { role: 'user', content: 'Alex: dont speak atagalog' },
+    {
+      role: 'assistant',
+      content: 'Okay lang naman yan. :p Ang sagot ko ay nakapag-alam ka naman...',
+    },
+    { role: 'user', content: 'Blair: Ano ba yan, nakakaloka ka?' },
+  ]);
+  assert.deepEqual(bodies[1].messages.slice(1), bodies[0].messages.slice(1));
+  assert.match(bodies[1].messages[0].content, /previous proposed reply was rejected/);
+  assert.match(bodies[1].messages[0].content, /not written entirely in English/);
+  assert.ok(bodies[1].messages[0].content.endsWith(ENGLISH_ONLY_INSTRUCTION));
+});
+
+test('a persistently non-English reply is suppressed instead of sent', async () => {
+  let call = 0;
+
+  await assert.rejects(
+    generateNvidiaReply('nvapi-test-key', [{
+      id: 'incoming-1',
+      timestamp: { original: null, normalized: null, resolved: false },
+      sender: 'Alex',
+      direction: 'INCOMING',
+      message: 'dont speak atagalog',
+      ariaLabel: null,
+    }], {
+      fetch: async () => {
+        call += 1;
+        return successfulCompletion('Hehe, ok lang. Gusto ko lang malaman kung ano ba pang ginagawa ka.');
+      },
+    }),
+    /repeatedly returned a non-English reply/,
+  );
+  assert.equal(call, 2, 'there is no unbounded retry loop');
 });
 
 test('reply generation keeps one API turn per Messenger message and ends with the incoming turn', async () => {

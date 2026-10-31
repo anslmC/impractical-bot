@@ -14,6 +14,10 @@ import { basename, dirname, join } from 'node:path';
 import { config as loadDotenv, parse } from 'dotenv';
 import { resolveConfigurationPaths } from '../config/configuration.js';
 import type { BackreadMessage } from '../components/backread.js';
+import {
+  buildEnglishOnlyRetryInstruction,
+  isEnglishOnlyReply,
+} from '../components/english-only.js';
 import { ENGLISH_ONLY_INSTRUCTION } from '../components/personality.js';
 import { stripParticipantSpeakerLabel } from '../components/reply-normalization.js';
 
@@ -327,85 +331,101 @@ export async function generateNvidiaReply(
     conversationMessages.slice(0, latestIncomingIndex + 1),
   );
 
-  let response: Response;
-  try {
-    response = await (options.fetch ?? fetch)(NVIDIA_CHAT_COMPLETIONS_URL, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: NVIDIA_CHAT_COMPLETIONS_MODEL,
-        messages: [
-          {
-            role: 'system',
-            content: options.systemInstruction ?? DEFAULT_SYSTEM_INSTRUCTION,
-          },
-          ...requestMessages,
-        ],
-        chat_template_kwargs: { enable_thinking: false },
-        max_tokens: REPLY_MAX_TOKENS,
-        stream: false,
-      }),
-      signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS),
-    });
-  } catch (error) {
-    throw new NvidiaRequestError(
-      'network',
-      'Unable to reach NVIDIA to generate a reply. Check the network connection and try again.',
-      { cause: error },
-    );
-  }
-
-  const failure = response.status === 200
-    ? undefined
-    : await readErrorResponse(response, apiKey);
-  if (response.status === 401) {
-    throw new NvidiaApiKeyError(
-      'authentication',
-      `NVIDIA rejected the API key. ${formatHttpFailure(failure!.status, failure!.body)}`,
-    );
-  }
-  if (response.status === 202) {
-    throw new NvidiaRequestError(
-      'service',
-      `NVIDIA accepted the reply request but left it pending. ` +
-      `${formatHttpFailure(failure!.status, failure!.body)} Try again later.`,
-    );
-  }
-  if (response.status !== 200) {
-    throw new NvidiaRequestError(
-      'service',
-      `NVIDIA could not generate a reply. ${formatHttpFailure(failure!.status, failure!.body)}`,
-    );
-  }
-
-  let body: unknown;
-  try {
-    body = await response.json() as unknown;
-  } catch (error) {
-    if (error instanceof SyntaxError) {
+  const requestCompletion = async (systemInstruction: string): Promise<string> => {
+    let response: Response;
+    try {
+      response = await (options.fetch ?? fetch)(NVIDIA_CHAT_COMPLETIONS_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: NVIDIA_CHAT_COMPLETIONS_MODEL,
+          messages: [
+            { role: 'system', content: systemInstruction },
+            ...requestMessages,
+          ],
+          chat_template_kwargs: { enable_thinking: false },
+          max_tokens: REPLY_MAX_TOKENS,
+          stream: false,
+        }),
+        signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS),
+      });
+    } catch (error) {
       throw new NvidiaRequestError(
-        'service',
-        'NVIDIA returned an unexpected reply response.',
+        'network',
+        'Unable to reach NVIDIA to generate a reply. Check the network connection and try again.',
         { cause: error },
       );
     }
-    throw new NvidiaRequestError(
-      'network',
-      'The NVIDIA reply response could not be read. Try again.',
-      { cause: error },
-    );
-  }
-  if (!isCompletionResponse(body)) {
-    throw new NvidiaRequestError('service', 'NVIDIA returned an unexpected reply response.');
+
+    const failure = response.status === 200
+      ? undefined
+      : await readErrorResponse(response, apiKey);
+    if (response.status === 401) {
+      throw new NvidiaApiKeyError(
+        'authentication',
+        `NVIDIA rejected the API key. ${formatHttpFailure(failure!.status, failure!.body)}`,
+      );
+    }
+    if (response.status === 202) {
+      throw new NvidiaRequestError(
+        'service',
+        `NVIDIA accepted the reply request but left it pending. ` +
+        `${formatHttpFailure(failure!.status, failure!.body)} Try again later.`,
+      );
+    }
+    if (response.status !== 200) {
+      throw new NvidiaRequestError(
+        'service',
+        `NVIDIA could not generate a reply. ${formatHttpFailure(failure!.status, failure!.body)}`,
+      );
+    }
+
+    let body: unknown;
+    try {
+      body = await response.json() as unknown;
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        throw new NvidiaRequestError(
+          'service',
+          'NVIDIA returned an unexpected reply response.',
+          { cause: error },
+        );
+      }
+      throw new NvidiaRequestError(
+        'network',
+        'The NVIDIA reply response could not be read. Try again.',
+        { cause: error },
+      );
+    }
+    if (!isCompletionResponse(body)) {
+      throw new NvidiaRequestError('service', 'NVIDIA returned an unexpected reply response.');
+    }
+
+    const reply = (body as { choices: { message: { content: string } }[] })
+      .choices[0].message.content.trim();
+    if (!reply) {
+      throw new NvidiaRequestError('service', 'NVIDIA returned an empty reply.');
+    }
+    return reply;
+  };
+
+  const systemInstruction = options.systemInstruction ?? DEFAULT_SYSTEM_INSTRUCTION;
+  const firstReply = await requestCompletion(systemInstruction);
+  if (isEnglishOnlyReply(firstReply)) {
+    return firstReply;
   }
 
-  const reply = (body as { choices: { message: { content: string } }[] })
-    .choices[0].message.content.trim();
-  if (!reply) {
-    throw new NvidiaRequestError('service', 'NVIDIA returned an empty reply.');
+  const retryReply = await requestCompletion(
+    buildEnglishOnlyRetryInstruction(systemInstruction),
+  );
+  if (!isEnglishOnlyReply(retryReply)) {
+    throw new NvidiaRequestError(
+      'service',
+      'NVIDIA repeatedly returned a non-English reply. The reply was not sent.',
+    );
   }
-  return reply;
+  return retryReply;
 }

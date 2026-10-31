@@ -7,6 +7,7 @@ import { startCombustion, shouldRngRespond } from '../src/components/combustion.
 import { createContextStore } from '../src/components/context-store.js';
 import {
   composeSystemInstruction,
+  ENGLISH_ONLY_INSTRUCTION,
   getBotIdentityInstruction,
   getDefaultBehavioralInstruction,
   getDefaultPersonalityInstruction,
@@ -646,6 +647,8 @@ test('Personality changes at runtime apply to replies and keep the configured id
       composeSystemInstruction(identityInstruction, getDefaultPersonalityInstruction()),
     );
     assert.match(String(capturedRequests[0].systemInstruction), /You are PleaseGetout Daily/);
+    assert.match(String(capturedRequests[0].systemInstruction), /Strict English-only output rule/);
+    assert.ok(String(capturedRequests[0].systemInstruction).endsWith(ENGLISH_ONLY_INSTRUCTION));
     assert.ok(
       capturedRequests[0].messages.some(message => message.message === literalRequest),
       'the literal instruction reaches the request unchanged',
@@ -679,6 +682,15 @@ ${getDefaultBehavioralInstruction()}`;
       String(capturedRequests[1].systemInstruction),
       /Do not begin an ordinary reply with your own name or alias/,
       'a runtime personality change cannot remove the self-mention rule',
+    );
+    assert.match(
+      String(capturedRequests[1].systemInstruction),
+      /read and understand every incoming message/,
+      'a runtime personality change cannot remove multilingual comprehension',
+    );
+    assert.ok(
+      String(capturedRequests[1].systemInstruction).endsWith(ENGLISH_ONLY_INSTRUCTION),
+      'a runtime personality change cannot remove the English-only output rule',
     );
     assert.doesNotMatch(
       String(capturedRequests[1].systemInstruction),
@@ -2710,6 +2722,15 @@ test('a mention-triggered echo is suppressed without entering outgoing history',
       String(harness.generateRequests[1].systemInstruction),
       /sounds like the personality configured for you/,
       'the configured personality survives the retry',
+    );
+    assert.match(
+      String(harness.generateRequests[1].systemInstruction),
+      /read and understand every incoming message/,
+      'the retry keeps multilingual comprehension',
+    );
+    assert.ok(
+      String(harness.generateRequests[1].systemInstruction).endsWith(ENGLISH_ONLY_INSTRUCTION),
+      'the retry still ends with the English-only output rule',
     );
 
     assert.deepEqual(harness.composedReplies, [], 'neither echo is sent');
