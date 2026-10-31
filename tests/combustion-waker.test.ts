@@ -165,7 +165,7 @@ class FakeMutationObserver {
   private target: FakeElement | null = null;
 
   constructor(
-    private readonly document: FakeDocument,
+    document: FakeDocument,
     private readonly callback: (
       mutations: { type: string; addedNodes: FakeElement[] }[],
     ) => void,

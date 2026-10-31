@@ -6,7 +6,7 @@ A local Node.js CLI for a safety-conscious Facebook Messenger bot. The project h
 
 Production code validates the NVIDIA API key, launches and prepares the configured browser, handles login and Messenger startup challenges, seeds context from Backread, and runs the continuous Combustion engine: it polls rendered messages, answers explicitly incoming mentions through FIFO packets, may participate through the RNG path, and uses the tested composer for one send attempt per reply. A composer click is not confirmation of delivery.
 
-JavaScript scripts in `Tools/` are independent experiments, not production modules or automated tests. Brave, Google Chrome, and Microsoft Edge are supported targets; Firefox is out of scope. See [ARCHITECTURE.md](ARCHITECTURE.md) for the implemented M2 pipeline and its proven boundary.
+Standalone JavaScript maintenance utilities live in `Tools/utilities/` and are not production modules. Brave, Google Chrome, and Microsoft Edge are supported targets; Firefox is out of scope. See [ARCHITECTURE.md](ARCHITECTURE.md) for the implemented M2 pipeline and its proven boundary.
 
 ## Intended Operation
 
@@ -21,7 +21,7 @@ Install project dependencies with `npm install`.
 
 ## Development
 
-Production code will be written in TypeScript under `src/`, compiled for Node.js using the NodeNext module model. The package remains compatible with the existing CommonJS JavaScript experiments. Automated tests use Node's built-in test runner. Scripts in `Tools/` remain independent JavaScript experiments; they are neither converted nor run by the project scripts.
+Production code is written in TypeScript under `src/`, compiled for Node.js using the NodeNext module model. Automated tests use Node's built-in test runner. Standalone maintenance utilities remain in `Tools/utilities/` and are not part of the production build.
 
 - `npm run build` compiles TypeScript into `dist/`.
 - `npm run lint` runs ESLint against the project, excluding `Tools/` and generated output.

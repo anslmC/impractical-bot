@@ -4,13 +4,13 @@
 
 The project is a local Node.js CLI, intended to run as one process and one bot instance. It needs no server, database, or plugin system. Production code provides browser discovery and managed launch, configuration, NVIDIA key validation and reply generation, message backread, the persistent M2 conversation engine ("Combustion"), and a tested Messenger composer.
 
-The M2 engine is implemented: initialization seeds historical context, runtime polling observes new messages, explicitly incoming mentions open response packets, a FIFO scheduler runs one generation/send at a time, and a temperament-driven RNG path participates without a mention. Live end-to-end behavior in a real Messenger conversation still requires smoke verification. Code under `Tools/` contains independent experiments and is not production behavior.
+The M2 engine is implemented: initialization seeds historical context, runtime polling observes new messages, explicitly incoming mentions open response packets, a FIFO scheduler runs one generation/send at a time, and a temperament-driven RNG path participates without a mention. Live end-to-end behavior in a real Messenger conversation still requires smoke verification. Standalone maintenance utilities under `Tools/utilities/` are not production behavior.
 
 Not implemented: bounded NVIDIA retries/backoff, saved or persistent conversation context (recent messages plus Backread are the whole context), and pre-send content reassessment beyond pause and destination checks.
 
 ## Responsibilities
 
-- **CLI (`src/cli.ts`, `bin/`):** route commands and coordinate startup, operation, and shutdown.
+- **CLI (`src/cli.ts`):** route commands and coordinate startup, operation, and shutdown.
 - **Configuration (`src/config/`):** load and validate local settings. Configuration, credentials, and runtime state belong outside the repository, under the user's local application-data directory.
 - **Browser (`src/browser/`):** discover Brave, Google Chrome, or Microsoft Edge, prepare a dedicated profile, launch the selected browser with remote debugging bound to loopback, and connect Playwright through CDP. Firefox is out of scope.
 - **Messages (`src/components/backread.ts`, `src/components/message-extraction.ts`):** read rendered messages and provide stable identity, sender, direction, and freshness information.
@@ -93,6 +93,6 @@ M2 development stages, in order, are **fresh-message detection**, **batching/dec
 - Production generation builds an identity-plus-personality system instruction and a role-attributed, ID-deduplicated conversation request; the composer checks the composer and send control before clicking. Message readers report each merge once (`[identity] merged duplicate rendered record` in the engine, a Backread diagnostic at startup) with the observed and canonical ids, direction, sender, character count and a text fingerprint.
 - Backread is bounded (up to 30 messages) and runs only during initialization.
 - The RNG participation path, cooldown, pause/resume, destination switching, and shutdown are implemented and covered by offline tests.
-- Scripts in `Tools/` are exploratory, independent experiments. They can provide evidence for the specific behaviors they exercise but do not establish managed-startup, live-Messenger, or live-NVIDIA behavior.
+- Standalone utilities in `Tools/utilities/` support local maintenance. They do not establish managed-startup, live-Messenger, or live-NVIDIA behavior.
 
 Messenger's rendered structure can change, so verification should exercise the production path and preserve the send-outcome distinction. Live smoke testing remains the repository owner's step for confirming real conversation quality, delivery behavior, and NVIDIA response characteristics.

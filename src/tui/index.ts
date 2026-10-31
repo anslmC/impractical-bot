@@ -90,13 +90,6 @@ export function checkDashboardTerminal(
   return { ok: true };
 }
 
-export function isDashboardTerminalSupported(
-  input: NodeJS.ReadStream = process.stdin,
-  output: NodeJS.WriteStream = process.stdout,
-): boolean {
-  return checkDashboardTerminal(input, output).ok;
-}
-
 export interface DashboardOptions {
   configurationFilePath?: string;
   input?: NodeJS.ReadStream;

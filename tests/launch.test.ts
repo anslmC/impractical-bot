@@ -150,16 +150,13 @@ class StartupPage {
   readonly loginGate = deferred<void>();
   readonly scenario: StartupScenario;
 
-  constructor(destination: string, scenario: StartupScenario) {
+  constructor(scenario: StartupScenario) {
     this.currentUrl = 'https://www.facebook.com/';
     this.scenario = scenario;
-    this.destination = destination;
     void this.loginGate.promise.then(() => {
       this.loginDetected = true;
     });
   }
-
-  private readonly destination: string;
 
   isClosed(): boolean { return false; }
   url(): string { return this.currentUrl; }
@@ -435,7 +432,7 @@ function browserMock() {
 }
 
 test('startup handles notification before skipping PIN restoration when configured', async () => {
-  const page = new StartupPage(baseConfiguration.messageDestination!, 'notification-and-skip-pin');
+  const page = new StartupPage('notification-and-skip-pin');
   const browser = browserForStartupPage(page);
   const configuration = { ...baseConfiguration, skipPinRestoration: true, pin: null };
   const preparation = prepareConfiguredBrowser(browser, configuration, {
@@ -469,9 +466,9 @@ test('startup handles notification before skipping PIN restoration when configur
 
 test('startup detects login on the feed tab and navigates the configured Messenger tab', async () => {
   const destination = baseConfiguration.messageDestination!;
-  const feedPage = new StartupPage(destination, 'no-pin');
+  const feedPage = new StartupPage('no-pin');
   feedPage.loginGate.resolve();
-  const messengerPage = new StartupPage(destination, 'no-pin');
+  const messengerPage = new StartupPage('no-pin');
   messengerPage.currentUrl = 'https://www.facebook.com/messages/';
   messengerPage.loginDetected = true;
   messengerPage.loginIndicatorsAvailable = false;
@@ -490,7 +487,7 @@ test('startup detects login on the feed tab and navigates the configured Messeng
 });
 
 test('startup opens Facebook in the existing blank tab when no Facebook tab is restored', async () => {
-  const page = new StartupPage(baseConfiguration.messageDestination!, 'no-pin');
+  const page = new StartupPage('no-pin');
   page.currentUrl = 'about:blank';
   page.loginGate.resolve();
 
@@ -503,7 +500,7 @@ test('startup opens Facebook in the existing blank tab when no Facebook tab is r
 });
 
 test('startup detects login on a single Facebook tab', async () => {
-  const page = new StartupPage(baseConfiguration.messageDestination!, 'no-pin');
+  const page = new StartupPage('no-pin');
   page.loginGate.resolve();
   await Promise.resolve();
 
@@ -516,7 +513,7 @@ test('startup detects login on a single Facebook tab', async () => {
 });
 
 test('startup skips feed login indicators when already at the configured conversation', async () => {
-  const page = new StartupPage(baseConfiguration.messageDestination!, 'no-pin');
+  const page = new StartupPage('no-pin');
   page.currentUrl = baseConfiguration.messageDestination!;
   page.loginIndicatorsAvailable = false;
   page.composerReady = true;
@@ -539,7 +536,7 @@ test('startup still requires login detection on another conversation or checkpoi
   ];
 
   for (const pageUrl of pageUrls) {
-    const page = new StartupPage(baseConfiguration.messageDestination!, 'no-pin');
+    const page = new StartupPage('no-pin');
     page.currentUrl = pageUrl;
     page.loginIndicatorsAvailable = false;
 
@@ -554,7 +551,7 @@ test('startup still requires login detection on another conversation or checkpoi
 });
 
 test('startup keeps waiting for manual login before navigating', async () => {
-  const page = new StartupPage(baseConfiguration.messageDestination!, 'no-pin');
+  const page = new StartupPage('no-pin');
   const preparation = prepareConfiguredBrowser(browserForStartupPage(page), baseConfiguration, {
     loginTimeoutMs: 1_000,
   });
@@ -569,11 +566,10 @@ test('startup keeps waiting for manual login before navigating', async () => {
 });
 
 test('startup times out when multiple Facebook tabs have no sufficient login evidence', async () => {
-  const destination = baseConfiguration.messageDestination!;
-  const messengerPage = new StartupPage(destination, 'no-pin');
+  const messengerPage = new StartupPage('no-pin');
   messengerPage.currentUrl = 'https://www.facebook.com/messages/t/999999999';
   messengerPage.loginIndicatorsAvailable = false;
-  const feedPage = new StartupPage(destination, 'no-pin');
+  const feedPage = new StartupPage('no-pin');
   feedPage.loginIndicatorsAvailable = false;
 
   await assert.rejects(
@@ -588,7 +584,7 @@ test('startup times out when multiple Facebook tabs have no sufficient login evi
 });
 
 test('startup reports login indicator page errors instead of relabeling them as timeouts', async () => {
-  const page = new StartupPage(baseConfiguration.messageDestination!, 'no-pin');
+  const page = new StartupPage('no-pin');
   page.loginIndicatorError = new Error('Facebook tab target closed');
 
   await assert.rejects(
@@ -602,7 +598,7 @@ test('startup reports login indicator page errors instead of relabeling them as 
 });
 
 test('startup reports each blocker that appears after the initial checks', async () => {
-  const page = new StartupPage(baseConfiguration.messageDestination!, 'late-blockers');
+  const page = new StartupPage('late-blockers');
   page.loginGate.resolve();
   await assert.rejects(
     prepareConfiguredBrowser(browserForStartupPage(page), {
@@ -618,7 +614,7 @@ test('startup reports each blocker that appears after the initial checks', async
 });
 
 test('startup aborts when the notification dialog cannot be dismissed', async () => {
-  const page = new StartupPage(baseConfiguration.messageDestination!, 'notification-dismiss-failure');
+  const page = new StartupPage('notification-dismiss-failure');
   page.loginGate.resolve();
   await assert.rejects(
     prepareConfiguredBrowser(browserForStartupPage(page), baseConfiguration),
@@ -628,7 +624,7 @@ test('startup aborts when the notification dialog cannot be dismissed', async ()
 });
 
 test('startup rejects missing or invalid PINs before navigation when restoration is enabled', async () => {
-  const page = new StartupPage(baseConfiguration.messageDestination!, 'no-pin');
+  const page = new StartupPage('no-pin');
   page.loginGate.resolve();
   const missingPin = { ...baseConfiguration } as Partial<Configuration>;
   delete missingPin.pin;
@@ -649,7 +645,7 @@ test('startup rejects missing or invalid PINs before navigation when restoration
 });
 
 test('startup follows the configured skip-restoration flow without entering a PIN', async () => {
-  const page = new StartupPage(baseConfiguration.messageDestination!, 'skip-pin-multiple-close');
+  const page = new StartupPage('skip-pin-multiple-close');
   page.loginGate.resolve();
   const logs: string[] = [];
   const originalLog = console.log;
@@ -676,7 +672,7 @@ test('startup follows the configured skip-restoration flow without entering a PI
 });
 
 test('startup restores chats with the configured PIN when skipping is disabled', async () => {
-  const page = new StartupPage(baseConfiguration.messageDestination!, 'pin-entry');
+  const page = new StartupPage('pin-entry');
   page.loginGate.resolve();
   const logs: string[] = [];
   const originalLog = console.log;
@@ -697,7 +693,7 @@ test('startup restores chats with the configured PIN when skipping is disabled',
 });
 
 test('startup fails when the configured PIN is rejected or restoration remains unresolved', async () => {
-  const rejectedPage = new StartupPage(baseConfiguration.messageDestination!, 'pin-rejected');
+  const rejectedPage = new StartupPage('pin-rejected');
   rejectedPage.loginGate.resolve();
   await assert.rejects(
     prepareConfiguredBrowser(browserForStartupPage(rejectedPage), baseConfiguration, {
@@ -708,7 +704,7 @@ test('startup fails when the configured PIN is rejected or restoration remains u
   assert.equal(rejectedPage.enteredPin, baseConfiguration.pin);
   assert.equal(rejectedPage.skipClicked, false);
 
-  const unresolvedPage = new StartupPage(baseConfiguration.messageDestination!, 'pin-unresolved');
+  const unresolvedPage = new StartupPage('pin-unresolved');
   unresolvedPage.loginGate.resolve();
   await assert.rejects(
     prepareConfiguredBrowser(browserForStartupPage(unresolvedPage), baseConfiguration, {
@@ -722,7 +718,7 @@ test('startup fails when the configured PIN is rejected or restoration remains u
 });
 
 test('startup aborts when the PIN skip confirmation does not disappear', async () => {
-  const page = new StartupPage(baseConfiguration.messageDestination!, 'pin-skip-failure');
+  const page = new StartupPage('pin-skip-failure');
   page.loginGate.resolve();
   await assert.rejects(
     prepareConfiguredBrowser(browserForStartupPage(page), {
@@ -735,7 +731,7 @@ test('startup aborts when the PIN skip confirmation does not disappear', async (
 });
 
 test('startup does not report readiness for the wrong conversation or a missing composer', async () => {
-  const wrongConversation = new StartupPage(baseConfiguration.messageDestination!, 'wrong-conversation');
+  const wrongConversation = new StartupPage('wrong-conversation');
   wrongConversation.loginGate.resolve();
   await assert.rejects(
     prepareConfiguredBrowser(browserForStartupPage(wrongConversation), {
@@ -746,7 +742,7 @@ test('startup does not report readiness for the wrong conversation or a missing 
     /did not settle on conversation/,
   );
 
-  const missingComposer = new StartupPage(baseConfiguration.messageDestination!, 'no-composer');
+  const missingComposer = new StartupPage('no-composer');
   missingComposer.loginGate.resolve();
   await assert.rejects(
     prepareConfiguredBrowser(browserForStartupPage(missingComposer), {
@@ -824,7 +820,7 @@ test('launches configured browser, connects to its configured port, then disconn
 
 test('navigates an engine page to a verified Messenger conversation', async () => {
   const destination = 'https://www.facebook.com/messages/t/987654321';
-  const page = new StartupPage(destination, 'no-pin');
+  const page = new StartupPage('no-pin');
   page.loginDetected = true;
 
   await navigatePageToMessengerDestination(
@@ -842,7 +838,7 @@ test('navigates an engine page to a verified Messenger conversation', async () =
 
 test('conversation navigation skips redundant navigation and rejects unverifiable destinations', async () => {
   const destination = 'https://www.facebook.com/messages/t/987654321';
-  const currentPage = new StartupPage(destination, 'no-pin');
+  const currentPage = new StartupPage('no-pin');
   currentPage.currentUrl = destination;
   currentPage.composerReady = true;
 
@@ -853,7 +849,7 @@ test('conversation navigation skips redundant navigation and rejects unverifiabl
   );
   assert.deepEqual(currentPage.gotoUrls, []);
 
-  const wrongPage = new StartupPage(destination, 'wrong-conversation');
+  const wrongPage = new StartupPage('wrong-conversation');
   wrongPage.loginDetected = true;
   await assert.rejects(
     navigatePageToMessengerDestination(
@@ -865,7 +861,7 @@ test('conversation navigation skips redundant navigation and rejects unverifiabl
   );
 
   const invalidDestination = 'https://www.facebook.com/messages/t/not-a-number';
-  const invalidPage = new StartupPage(destination, 'no-pin');
+  const invalidPage = new StartupPage('no-pin');
   invalidPage.loginDetected = true;
   await assert.rejects(
     navigatePageToMessengerDestination(

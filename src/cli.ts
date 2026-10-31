@@ -986,7 +986,6 @@ async function handleStart(
   writeOutput: Output,
   writeError: Output,
   configurationFilePath: string | undefined,
-  prompt: TerminalPrompt,
   runtime: CliRuntimeOptions,
 ): Promise<number> {
   const dashboardTerminal = (runtime.checkDashboardTerminal ?? checkDashboardTerminal)();
@@ -1756,7 +1755,7 @@ export async function runCli(
       runtime,
     ),
     updatekey: () => handleUpdateKey(writeOutput, writeError, configurationFilePath, runtime),
-    start: () => handleStart(writeOutput, writeError, configurationFilePath, prompt, runtime),
+    start: () => handleStart(writeOutput, writeError, configurationFilePath, runtime),
     pause: () => handlePause(writeOutput, writeError, configurationFilePath, runtime),
     resume: () => handleResume(writeOutput, writeError, configurationFilePath, runtime),
     stop: () => handleStop(writeOutput, writeError, configurationFilePath, runtime),
