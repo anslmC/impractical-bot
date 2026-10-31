@@ -165,12 +165,12 @@ test('P pauses and R resumes through the injected command API', async () => {
     await waitFor(() => output.text().includes('Engine paused.'));
     await waitFor(() => statusRequests() > initialRequests);
     assert.deepEqual(events, ['pause']);
-    await waitFor(() => output.text().includes('State:       Paused'));
+    await waitFor(() => output.text().includes('● Paused'));
 
     input.emit('data', Buffer.from('r'));
     await waitFor(() => output.text().includes('Engine resumed.'));
     assert.deepEqual(events, ['pause', 'resume']);
-    await waitFor(() => output.text().includes('State:       Running'));
+    await waitFor(() => output.text().includes('● Running'));
   } finally {
     await session.close();
   }

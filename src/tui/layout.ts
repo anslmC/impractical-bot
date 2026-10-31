@@ -1,4 +1,3 @@
-import { formatCliCommand } from '../cli-commands.js';
 import type { RuntimeEngineState } from '../runtime-control.js';
 import {
   getDashboardCommandHints,
@@ -9,9 +8,24 @@ import {
   type DashboardPrompt,
 } from './commands.js';
 import {
-  formatDashboardLogLine,
+  dashboardLogCategory,
+  formatDashboardLogEntries,
   type DashboardLogEntry,
 } from './logs.js';
+import {
+  centerVisible,
+  padVisible,
+  paint,
+  renderLine,
+  truncateVisible,
+  type DashboardTone,
+  type StyledSegment,
+} from './theme.js';
+import {
+  renderPlainWordmark,
+  renderWordmarkForWidth,
+  WORDMARK_TAGLINE,
+} from './wordmark.js';
 
 export type DashboardConnectionState =
   | 'connecting'
@@ -41,8 +55,15 @@ export interface DashboardDimensions {
   rows: number;
 }
 
+export interface DashboardRenderOptions {
+  color?: boolean;
+}
+
 export const DASHBOARD_UNKNOWN_VALUE = 'Unknown';
 export const DASHBOARD_EMPTY_LOGS_MESSAGE = 'Waiting for engine output...';
+
+const FIELD_GAP = 3;
+const BORDER_TONE: DashboardTone = 'brandSoft';
 
 export function createInitialDashboardView(): DashboardView {
   return {
@@ -79,64 +100,205 @@ function connectionLabel(view: DashboardView): string {
   }
 }
 
-function stateLabel(view: DashboardView): string {
-  if (view.connection === 'connected') {
-    return capitalize(view.state);
+function connectionTone(view: DashboardView): DashboardTone {
+  switch (view.connection) {
+    case 'connected':
+      return 'success';
+    case 'connecting':
+      return 'warning';
+    case 'stopped':
+    case 'disconnected':
+      return 'danger';
+    case 'unsupported':
+      return 'muted';
   }
-  if (view.connection === 'connecting') {
-    return 'Starting';
-  }
-  return connectionLabel(view);
 }
 
-function truncate(text: string, maximum: number): string {
-  if (maximum <= 0) {
-    return '';
-  }
-  if (text.length <= maximum) {
-    return text;
-  }
-  if (maximum === 1) {
-    return '…';
-  }
-  return `${text.slice(0, maximum - 1)}…`;
+interface StatusAppearance {
+  readonly label: string;
+  readonly tone: DashboardTone;
 }
 
-function pad(text: string, width: number): string {
-  const bounded = truncate(text, width);
-  return bounded + ' '.repeat(Math.max(0, width - bounded.length));
-}
-
-function center(text: string, width: number): string {
-  const bounded = truncate(text, width);
-  const left = Math.max(0, Math.floor((width - bounded.length) / 2));
-  return ' '.repeat(left) + bounded + ' '.repeat(Math.max(0, width - bounded.length - left));
-}
-
-function borderTitle(title: string, width: number): string {
-  const label = ` ${title} `;
-  if (width <= label.length) {
-    return `┌${'─'.repeat(Math.max(0, width - 2))}┐`;
+function statusAppearance(view: DashboardView): StatusAppearance {
+  if (view.connection !== 'connected') {
+    switch (view.connection) {
+      case 'connecting':
+        return { label: 'Starting', tone: 'warning' };
+      case 'stopped':
+        return { label: 'Stopped', tone: 'danger' };
+      case 'unsupported':
+        return { label: 'Status unavailable', tone: 'muted' };
+      case 'disconnected':
+        return { label: 'Disconnected', tone: 'danger' };
+    }
   }
-  const remaining = width - label.length - 2;
-  const left = Math.floor(remaining / 2);
-  const right = remaining - left;
-  return `┌${'─'.repeat(left)}${label}${'─'.repeat(right)}┐`;
-}
-
-function boxedLine(content: string, width: number): string {
-  return `│${pad(content, width)}│`;
-}
-
-function renderCommands(view: DashboardView, width: number): string[] {
-  const lines = ['COMMANDS'];
-  for (const hint of getDashboardCommandHints(view)) {
-    lines.push(truncate(`[${hint.key}] ${formatCliCommand(hint)}`, width));
+  switch (view.state) {
+    case 'running':
+      return { label: 'Running', tone: 'success' };
+    case 'paused':
+      return { label: 'Paused', tone: 'warning' };
+    case 'starting':
+      return { label: 'Starting', tone: 'warning' };
+    case 'changing':
+      return { label: 'Changing', tone: 'warning' };
+    case 'stopping':
+      return { label: 'Stopping', tone: 'danger' };
+    case 'disconnected':
+      return { label: 'Disconnected', tone: 'danger' };
+    case 'stopped':
+      return { label: 'Stopped', tone: 'danger' };
   }
+}
+
+interface DashboardField {
+  readonly label: string;
+  readonly value: string;
+}
+
+function configurationFields(view: DashboardView): DashboardField[] {
+  return [
+    { label: 'Browser', value: displayValue(view.browser) },
+    { label: 'Temperament', value: capitalize(displayValue(view.temperament)) },
+    { label: 'Personality', value: capitalize(displayValue(view.personality)) },
+  ];
+}
+
+function destinationField(view: DashboardView): DashboardField {
+  return {
+    label: 'Destination',
+    value: displayValue(view.messengerDestination),
+  };
+}
+
+function renderFields(
+  fields: readonly DashboardField[],
+  width: number,
+  color: boolean,
+): string[] {
+  const rows: StyledSegment[][] = [];
+  let current: StyledSegment[] = [];
+  let currentWidth = 0;
+  for (const field of fields) {
+    const fieldWidth = `${field.label}: ${field.value}`.length;
+    if (current.length > 0 && currentWidth + FIELD_GAP + fieldWidth > width) {
+      rows.push(current);
+      current = [];
+      currentWidth = 0;
+    }
+    if (current.length > 0) {
+      current.push({ text: ' '.repeat(FIELD_GAP) });
+      currentWidth += FIELD_GAP;
+    }
+    current.push(
+      { text: `${field.label}: `, tone: 'muted' },
+      { text: field.value, tone: 'value' },
+    );
+    currentWidth += fieldWidth;
+  }
+  if (current.length > 0) {
+    rows.push(current);
+  }
+  return rows.map(row => renderLine(row, width, color));
+}
+
+function sectionRule(
+  title: string,
+  right: string | undefined,
+  rightTone: DashboardTone | undefined,
+  width: number,
+  color: boolean,
+): string {
+  const lead = '── ';
+  const minimumFill = 2;
+  let titleText = title;
+  let suffix = right === undefined ? '──' : ` ${right} ──`;
+  if (`${lead}${titleText} `.length + suffix.length + minimumFill > width) {
+    suffix = '──';
+  }
+  if (`${lead}${titleText} `.length + suffix.length + minimumFill > width) {
+    const available = Math.max(
+      0,
+      width - lead.length - suffix.length - minimumFill - 1,
+    );
+    titleText = truncateVisible(titleText, available);
+  }
+  const head = `${lead}${titleText} `;
+  const fill = Math.max(minimumFill, width - head.length - suffix.length);
+  return renderLine(
+    [
+      { text: lead, tone: 'muted' },
+      { text: titleText, tone: 'heading' },
+      { text: ' ', tone: 'muted' },
+      { text: '─'.repeat(fill), tone: 'muted' },
+      { text: suffix, tone: rightTone ?? 'muted' },
+    ],
+    width,
+    color,
+  );
+}
+
+function engineStatusRule(
+  label: string,
+  tone: DashboardTone,
+  width: number,
+  color: boolean,
+): string {
+  const right = `● ${label}`;
+  const required =
+    '── '.length + 'ENGINE STATUS '.length + ` ${right} ──`.length + 2;
+  if (width >= required) {
+    return sectionRule('ENGINE STATUS', right, tone, width, color);
+  }
+  const lead = '── ';
+  if (width >= lead.length + right.length) {
+    return renderLine(
+      [
+        { text: lead, tone: 'muted' },
+        { text: right, tone },
+      ],
+      width,
+      color,
+    );
+  }
+  return renderLine([{ text: truncateVisible(right, width), tone }], width, color);
+}
+
+function commandChips(
+  view: DashboardView,
+  width: number,
+  color: boolean,
+): string[] {
+  const chips: StyledSegment[][] = getDashboardCommandHints(view).map(hint => [
+    { text: `[${hint.key}]`, tone: 'brandSoft' },
+    { text: ` ${hint.name}`, tone: 'value' },
+  ]);
   if (view.prompt === undefined) {
-    lines.push('[C] Close dashboard');
+    chips.push([
+      { text: '[C]', tone: 'brandSoft' },
+      { text: ' Close dashboard', tone: 'value' },
+    ]);
   }
-  return lines;
+  const rows: StyledSegment[][] = [];
+  let current: StyledSegment[] = [];
+  let currentWidth = 0;
+  for (const chip of chips) {
+    const chipWidth = chip.reduce((total, segment) => total + segment.text.length, 0);
+    if (current.length > 0 && currentWidth + FIELD_GAP + chipWidth > width) {
+      rows.push(current);
+      current = [];
+      currentWidth = 0;
+    }
+    if (current.length > 0) {
+      current.push({ text: ' '.repeat(FIELD_GAP) });
+      currentWidth += FIELD_GAP;
+    }
+    current.push(...chip);
+    currentWidth += chipWidth;
+  }
+  if (current.length > 0) {
+    rows.push(current);
+  }
+  return rows.map(row => renderLine(row, width, color));
 }
 
 function noticePrefix(notice: DashboardNotice): string {
@@ -152,150 +314,130 @@ function noticePrefix(notice: DashboardNotice): string {
   }
 }
 
+function noticeTone(notice: DashboardNotice): DashboardTone {
+  switch (notice.tone) {
+    case 'pending':
+      return 'warning';
+    case 'success':
+      return 'success';
+    case 'error':
+      return 'danger';
+    case 'info':
+      return 'info';
+  }
+}
+
 function promptErrorLines(prompt: DashboardPrompt, width: number): string[] {
   if (!('error' in prompt) || prompt.error === undefined) {
     return [];
   }
-  return [truncate(`Error: ${prompt.error}`, width)];
+  return [truncateVisible(`Error: ${prompt.error}`, width)];
 }
 
 function promptFooterLines(prompt: DashboardPrompt, width: number): string[] {
   switch (prompt.kind) {
     case 'destination':
       return [
-        truncate(renderPromptInput('Destination URL: ', prompt.value, width).text, width),
-        truncate('[Enter] Apply  [Esc] Cancel', width),
+        truncateVisible(renderPromptInput('Destination URL: ', prompt.value, width).text, width),
+        truncateVisible('[Enter] Apply  [Esc] Cancel', width),
         ...promptErrorLines(prompt, width),
       ];
     case 'temperament':
       return [
         'Select temperament:',
-        truncate(temperamentChoices(), width),
-        truncate('[Esc] Cancel', width),
+        truncateVisible(temperamentChoices(), width),
+        truncateVisible('[Esc] Cancel', width),
       ];
     case 'personality':
       return [
         'Select personality:',
-        truncate(personalityChoices(), width),
-        truncate('[Esc] Cancel', width),
+        truncateVisible(personalityChoices(), width),
+        truncateVisible('[Esc] Cancel', width),
       ];
     case 'personalityInstruction':
       return [
-        truncate(
+        truncateVisible(
           renderPromptInput('Personality instruction: ', prompt.value, width).text,
           width,
         ),
-        truncate('[Enter] Apply  [Esc] Cancel', width),
+        truncateVisible('[Enter] Apply  [Esc] Cancel', width),
         ...promptErrorLines(prompt, width),
       ];
     case 'stopConfirmation':
       return [
         'Stop Impractical Bot?',
-        truncate('[Y] Confirm  [Esc/N] Cancel', width),
+        truncateVisible('[Y] Confirm  [Esc/N] Cancel', width),
       ];
   }
 }
 
-function footerLines(view: DashboardView, width: number): string[] {
+function footerLines(
+  view: DashboardView,
+  width: number,
+  color: boolean,
+): string[] {
   if (view.prompt !== undefined) {
-    return promptFooterLines(view.prompt, width)
-      .map(line => truncate(line, width));
+    return promptFooterLines(view.prompt, width);
   }
-  const status = `Status: ${connectionLabel(view)}`;
-  if (view.notice === undefined) {
-    return [truncate(status, width)];
+  const segments: StyledSegment[] = [
+    { text: 'Status: ', tone: 'muted' },
+    { text: connectionLabel(view), tone: connectionTone(view) },
+  ];
+  if (view.notice !== undefined) {
+    segments.push(
+      { text: '   ' },
+      {
+        text: `${noticePrefix(view.notice)}${view.notice.message}`,
+        tone: noticeTone(view.notice),
+      },
+    );
   }
-  return [truncate(`${status}  |  ${noticePrefix(view.notice)}${view.notice.message}`, width)];
+  return [renderLine(segments, width, color)];
 }
 
 function renderLogLines(
   entries: readonly DashboardLogEntry[],
   width: number,
   capacity: number,
+  color: boolean,
 ): string[] {
   if (capacity <= 0) {
     return [];
   }
+  const categoryWidth = Math.min(
+    8,
+    entries.slice(-capacity).reduce(
+      (maximum, entry) =>
+        Math.max(maximum, dashboardLogCategory(entry.message)?.chip.length ?? 0),
+      0,
+    ),
+  );
   const lines = entries.length === 0
-    ? [truncate(DASHBOARD_EMPTY_LOGS_MESSAGE, width)]
-    : entries
-      .slice(-capacity)
-      .map(entry => formatDashboardLogLine(entry, width));
-  while (lines.length < capacity) {
-    lines.push('');
+    ? [renderLine([{ text: DASHBOARD_EMPTY_LOGS_MESSAGE, tone: 'muted' }], width, color)]
+    : formatDashboardLogEntries(entries, width, { color, categoryWidth })
+      .map(line => padVisible(line, width));
+  const bounded = lines.length > capacity
+    ? lines.slice(lines.length - capacity)
+    : lines;
+  while (bounded.length < capacity) {
+    bounded.push(' '.repeat(width));
   }
-  return lines.slice(0, capacity);
+  return bounded;
 }
 
-function bodyLines(view: DashboardView, width: number, available: number): string[] {
-  const separator = '─'.repeat(width);
-  const engineLines = [
-    'ENGINE',
-    truncate(`State:       ${capitalize(view.state)}`, width),
-    truncate(`Browser:     ${displayValue(view.browser)}`, width),
-    truncate(`Temperament: ${capitalize(displayValue(view.temperament))}`, width),
-    truncate(`Personality: ${capitalize(displayValue(view.personality))}`, width),
-    truncate(`Destination: ${displayValue(view.messengerDestination)}`, width),
-  ];
-  const commandLines = renderCommands(view, width);
-  const footer = footerLines(view, width);
-  const fixedLines = [
-    ...engineLines,
-    separator,
-    ...commandLines,
-    separator,
-    ...footer,
-  ];
-
-  const logCapacity = available - fixedLines.length - 2;
-  if (logCapacity >= 1) {
-    return [
-      ...engineLines,
-      separator,
-      ...commandLines,
-      separator,
-      'LIVE LOGS',
-      ...renderLogLines(view.logs ?? [], width, logCapacity),
-      separator,
-      ...footer,
-    ];
-  }
-
-  return fitBody(fixedLines, available);
+interface ChromeLevel {
+  readonly art: boolean;
+  readonly tagline: boolean;
+  readonly spacers: boolean;
+  readonly minimumLogs: number;
 }
 
-function plainLines(view: DashboardView, width: number, rows: number): string[] {
-  const engineLines = [
-    truncate(`State: ${capitalize(view.state)}`, width),
-    truncate(`Browser: ${displayValue(view.browser)}`, width),
-    truncate(`Temperament: ${capitalize(view.temperament)}`, width),
-    truncate(`Personality: ${capitalize(view.personality)}`, width),
-    truncate(`Destination: ${displayValue(view.messengerDestination)}`, width),
-  ];
-  const commandLines = renderCommands(view, width);
-  const footer = footerLines(view, width);
-  const fixedLines = [
-    center('IMPRACTICAL BOT', width),
-    center(stateLabel(view), width),
-    ...engineLines,
-    ...commandLines,
-    ...footer,
-  ];
-  const logCapacity = rows - fixedLines.length - 1;
-  if (logCapacity < 1) {
-    return fixedLines.slice(0, Math.max(0, rows));
-  }
-  const lines = [
-    center('IMPRACTICAL BOT', width),
-    center(stateLabel(view), width),
-    ...engineLines,
-    ...commandLines,
-    'LIVE LOGS',
-    ...renderLogLines(view.logs ?? [], width, logCapacity),
-    ...footer,
-  ];
-  return lines.slice(0, Math.max(0, rows));
-}
+const CHROME_LEVELS: readonly ChromeLevel[] = [
+  { art: true, tagline: true, spacers: true, minimumLogs: 3 },
+  { art: true, tagline: true, spacers: false, minimumLogs: 2 },
+  { art: true, tagline: false, spacers: false, minimumLogs: 1 },
+  { art: false, tagline: false, spacers: false, minimumLogs: 1 },
+];
 
 function fitBody(lines: string[], available: number): string[] {
   if (available <= 0) {
@@ -310,15 +452,120 @@ function fitBody(lines: string[], available: number): string[] {
     }
     return [
       ...lines.slice(0, -1),
-      ...Array<string>(available - lines.length).fill(''),
+      ...Array<string>(available - lines.length).fill(' '.repeat(lines[0]?.length ?? 0)),
       lines[lines.length - 1],
     ];
   }
   if (available === 1) {
     return [lines[0]];
   }
-  const status = lines[lines.length - 1];
-  return [...lines.slice(0, available - 1), status];
+  return [...lines.slice(0, available - 1), lines[lines.length - 1]];
+}
+
+function bodyLines(
+  view: DashboardView,
+  width: number,
+  available: number,
+  color: boolean,
+): string[] {
+  if (available <= 0) {
+    return [];
+  }
+  const appearance = statusAppearance(view);
+  const engineHeading = engineStatusRule(appearance.label, appearance.tone, width, color);
+  const configRows = [
+    ...renderFields(configurationFields(view), width, color),
+    ...renderFields([destinationField(view)], width, color),
+  ];
+  const entries = view.logs ?? [];
+  const logsHeading = sectionRule(
+    'LIVE LOGS',
+    entries.length > 0 ? String(entries.length) : 'idle',
+    'muted',
+    width,
+    color,
+  );
+  const commandsHeading = sectionRule('COMMANDS', undefined, undefined, width, color);
+  const chips = commandChips(view, width, color);
+  const footer = footerLines(view, width, color);
+  const art = renderWordmarkForWidth(width, { color });
+
+  for (const level of CHROME_LEVELS) {
+    const spacer = level.spacers ? [''] : [];
+    const header = level.art && art !== undefined
+      ? [
+        ...art,
+        ...(level.tagline
+          ? [centerVisible(paint(WORDMARK_TAGLINE, 'muted', color), width)]
+          : []),
+      ]
+      : [centerVisible(renderPlainWordmark({ color }), width)];
+    const top = [
+      ...spacer,
+      ...header,
+      ...spacer,
+      engineHeading,
+      ...configRows,
+      ...spacer,
+      logsHeading,
+    ];
+    const bottom = [
+      ...spacer,
+      commandsHeading,
+      ...chips,
+      ...footer,
+    ];
+    const capacity = available - top.length - bottom.length;
+    if (capacity >= level.minimumLogs) {
+      return [
+        ...top,
+        ...renderLogLines(entries, width, capacity, color),
+        ...bottom,
+      ];
+    }
+  }
+
+  const fallback = [
+    centerVisible(renderPlainWordmark({ color }), width),
+    engineHeading,
+    ...configRows,
+    commandsHeading,
+    ...chips,
+    ...footer,
+  ];
+  return fitBody(fallback, available);
+}
+
+function plainLines(
+  view: DashboardView,
+  width: number,
+  rows: number,
+  color: boolean,
+): string[] {
+  const appearance = statusAppearance(view);
+  const footer = footerLines(view, width, color);
+  const fixed = [
+    centerVisible(renderPlainWordmark({ color }), width),
+    renderLine([{ text: `● ${appearance.label}`, tone: appearance.tone }], width, color),
+    ...renderFields(configurationFields(view), width, color),
+    ...renderFields([destinationField(view)], width, color),
+    ...commandChips(view, width, color),
+  ];
+  const heading = renderLine([{ text: 'LIVE LOGS', tone: 'heading' }], width, color);
+  const budget = Math.max(0, rows - footer.length);
+  if (fixed.length + 1 > budget) {
+    return [...fixed.slice(0, Math.max(0, budget)), ...footer].slice(0, Math.max(0, rows));
+  }
+  const capacity = budget - fixed.length - 1;
+  if (capacity < 1) {
+    return [...fixed, ...footer].slice(0, Math.max(0, rows));
+  }
+  return [
+    ...fixed,
+    heading,
+    ...renderLogLines(view.logs ?? [], width, capacity, color),
+    ...footer,
+  ].slice(0, Math.max(0, rows));
 }
 
 export interface DashboardCursorPosition {
@@ -359,7 +606,7 @@ export function getDashboardPromptCursor(
 
   const plain = columns < 12 || rows < 6;
   const contentWidth = plain ? columns : columns - 2;
-  const footer = footerLines(view, contentWidth);
+  const footer = footerLines(view, contentWidth, false);
   const promptLineIndex = 0;
   const rendered = renderPromptInput(input.prefix, input.value, contentWidth);
 
@@ -378,7 +625,9 @@ export function getDashboardPromptCursor(
 export function renderDashboardLines(
   view: DashboardView,
   dimensions: DashboardDimensions,
+  options: DashboardRenderOptions = {},
 ): string[] {
+  const color = options.color === true;
   const columns = Math.max(0, Math.floor(dimensions.columns));
   const rows = Math.max(0, Math.floor(dimensions.rows));
   if (columns === 0 || rows === 0) {
@@ -386,21 +635,23 @@ export function renderDashboardLines(
   }
 
   if (columns < 12 || rows < 6) {
-    return plainLines(view, columns, rows);
+    return plainLines(view, columns, rows, color);
   }
 
   const innerWidth = columns - 2;
-  const body = bodyLines(view, innerWidth, rows - 2);
+  const body = bodyLines(view, innerWidth, rows - 2, color);
   return [
-    borderTitle('IMPRACTICAL BOT', columns),
-    ...body.map(line => boxedLine(line, innerWidth)),
-    `└${'─'.repeat(innerWidth)}┘`,
+    paint(`┌${'─'.repeat(innerWidth)}┐`, BORDER_TONE, color),
+    ...body.map(line =>
+      `${paint('│', BORDER_TONE, color)}${padVisible(line, innerWidth)}${paint('│', BORDER_TONE, color)}`),
+    paint(`└${'─'.repeat(innerWidth)}┘`, BORDER_TONE, color),
   ];
 }
 
 export function renderDashboard(
   view: DashboardView,
   dimensions: DashboardDimensions,
+  options: DashboardRenderOptions = {},
 ): string {
-  return renderDashboardLines(view, dimensions).join('\n');
+  return renderDashboardLines(view, dimensions, options).join('\n');
 }

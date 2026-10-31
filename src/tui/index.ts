@@ -104,6 +104,7 @@ export interface DashboardOptions {
   now?: () => Date;
   onInterrupt?: () => void;
   commands?: DashboardCommandApi;
+  color?: boolean;
 }
 
 export interface DashboardSession {
@@ -169,6 +170,12 @@ export async function startDashboard(
     DEFAULT_MAXIMUM_LOG_ENTRIES;
   const logBuffer = new DashboardLogBuffer(logCapacity);
   const commands = options.commands;
+  const colorEnabled = options.color ?? (
+    output === process.stdout &&
+    output.isTTY === true &&
+    process.env.NO_COLOR === undefined &&
+    process.env.TERM !== 'dumb'
+  );
   const wasRaw = input.isRaw === true;
   const wasFlowing = input.readableFlowing === true;
   let statusView = createInitialDashboardView();
@@ -234,7 +241,7 @@ export async function startDashboard(
     try {
       const dimensions = getDimensions(output);
       const view = buildView();
-      const lines = renderDashboardLines(view, dimensions);
+      const lines = renderDashboardLines(view, dimensions, { color: colorEnabled });
       const dimensionsChanged = previousDimensions === undefined ||
         previousDimensions.columns !== dimensions.columns ||
         previousDimensions.rows !== dimensions.rows;

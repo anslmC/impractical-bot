@@ -112,14 +112,14 @@ test('dashboard layout renders every field within the requested dimensions', () 
   assert.doesNotMatch(rendered, /\btui\b/);
 
   const commands = [
-    ['P', 'pause', 'Pause Impractical Bot'],
-    ['M', 'changemsgUrl', 'Change Messenger destination'],
-    ['T', 'setbottemp', 'Set bot temperament'],
-    ['Y', 'setpersonality', 'Set bot personality'],
-    ['S', 'stop', 'Stop Impractical Bot'],
+    ['P', 'pause'],
+    ['M', 'changemsgUrl'],
+    ['T', 'setbottemp'],
+    ['Y', 'setpersonality'],
+    ['S', 'stop'],
   ] as const;
-  for (const [key, name, description] of commands) {
-    assert.match(rendered, new RegExp(`\\[${key}\\] ${name}\\s+${description}`));
+  for (const [key, name] of commands) {
+    assert.match(rendered, new RegExp(`\\[${key}\\] ${name}\\b`));
   }
   assert.doesNotMatch(rendered, /\[R\] resume/);
 
@@ -127,7 +127,7 @@ test('dashboard layout renders every field within the requested dimensions', () 
     { ...connectedView, state: 'paused' },
     dimensions,
   ).join('\n');
-  assert.match(paused, /\[R\] resume\s+Resume Impractical Bot/);
+  assert.match(paused, /\[R\] resume\b/);
   assert.doesNotMatch(paused, /\[P\] pause/);
   assert.match(paused, /\[M\] changemsgUrl/);
   assert.match(paused, /\[S\] stop/);
