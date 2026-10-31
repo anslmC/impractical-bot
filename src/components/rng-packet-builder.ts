@@ -1,3 +1,5 @@
+import type { ReplyDecision } from './reply-adjudication.js';
+
 let nextPacketNumber = 1;
 
 export interface RngPacketMessage {
@@ -10,6 +12,7 @@ export interface RngPacket {
   packetId: string;
   contextMessages: RngPacketMessage[];
   newMessages: never[];
+  reply: ReplyDecision;
 }
 
 export function buildRngPacket(recentMessages: RngPacketMessage[]): RngPacket {
@@ -17,7 +20,7 @@ export function buildRngPacket(recentMessages: RngPacketMessage[]): RngPacket {
     throw new TypeError('recentMessages must be an array.');
   }
 
-  const contextMessages = recentMessages.slice(-6).map(message => {
+  const contextMessages = recentMessages.slice(-15).map(message => {
     if (!message || typeof message !== 'object' || Array.isArray(message) ||
         typeof message.messageId !== 'string' || !message.messageId ||
         typeof message.message !== 'string') {
@@ -32,5 +35,6 @@ export function buildRngPacket(recentMessages: RngPacketMessage[]): RngPacket {
     packetId,
     contextMessages,
     newMessages: [],
+    reply: 'pending',
   };
 }

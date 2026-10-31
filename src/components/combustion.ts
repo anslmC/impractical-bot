@@ -1,5 +1,7 @@
 import type { ConsoleMessage, Page } from 'playwright';
 import {
+  NvidiaIdentityError,
+  adjudicateNvidiaReply,
   generateNvidiaReply,
 } from '../ai/nvidia.js';
 import { navigatePageToMessengerDestination } from '../browser/launch.js';
@@ -42,6 +44,8 @@ import {
   type DuplicateMessageRecord,
 } from './message-identity.js';
 import { createPacketProcessor } from './packet-processor.js';
+import { validateReplyIdentity } from './identity-policy.js';
+import { assertReplyApproved } from './reply-adjudication.js';
 import {
   stripLeadingParticipantMentions,
   stripParticipantSpeakerLabel,
@@ -50,9 +54,9 @@ import {
 import { createPacketScheduler } from './packet-scheduler.js';
 import { createPauseGate } from './pause-gate.js';
 import {
-  composeSystemInstruction,
-  getBotIdentityInstruction,
-  getPersonalityInstruction,
+  appendRetryInstruction,
+  composeProductionSystemInstruction,
+  type BotPersonalityMode,
 } from './personality.js';
 import { buildRngPacket, type RngPacket } from './rng-packet-builder.js';
 import { formatPollSummary, formatTerminalText } from './terminal-formatting.js';
@@ -65,8 +69,8 @@ const MESSAGE_LIMIT = 20;
 const CONTEXT_STORE_CAPACITY = 60;
 const POLL_INTERVAL_MS = 1500;
 const RNG_ROLL_INTERVAL_MS = 7000;
-const RNG_CONTEXT_MESSAGE_LIMIT = 6;
-const PACKET_CONTEXT_MESSAGE_LIMIT = 5;
+const RNG_CONTEXT_MESSAGE_LIMIT = 15;
+const PACKET_CONTEXT_MESSAGE_LIMIT = 13;
 const IDLE_THRESHOLD_MS = 120000;
 const MESSAGE_HISTORY_LIMIT = 200;
 const LOG_PREFIX = '__MESSENGER_WAKER__:';
@@ -117,7 +121,7 @@ function formatPacketTiming(packet: ScheduledPacket, timing: PacketTiming, finis
 }
 type PacketScheduler = ReturnType<typeof createPacketScheduler<ScheduledPacket>>;
 type ContextStoreState = ReturnType<ContextStore['getState']>;
-type MessageText = Pick<ContextMessage, 'messageId' | 'message' | 'mention'>;
+type MessageText = Pick<ContextMessage, 'messageId' | 'message' | 'sender' | 'mention'>;
 
 export function shouldRngRespond(
   temperament: BotTemperament,
@@ -151,7 +155,7 @@ export interface CombustionController {
   pause(): Promise<void>;
   resume(): Promise<void>;
   setTemperament(temperament: BotTemperament): void;
-  setPersonality(instruction: string): void;
+  setPersonality(mode: BotPersonalityMode, customInstruction?: string): void;
   changeDestination(
     destination: string,
     options: DestinationChangeOptions,
@@ -211,12 +215,21 @@ function formatPacketMessages(messages: PacketBuilderMessage[]): string {
   }).join('\n');
 }
 
+function formatSender(sender: unknown): string {
+  const value = typeof sender === 'string' ? sender.trim() : '';
+  const display = value && value.toUpperCase() !== 'UNKNOWN'
+    ? value
+    : '(unknown sender)';
+  return `${styled('sender=', 'dim')}${JSON.stringify(display)}; `;
+}
+
 function formatMessages(messages: MessageText[]): string {
   if (messages.length === 0) {
     return `  ${styled('(none)', 'dim')}`;
   }
   return messages.map(message =>
     `  ${styled('-', 'dim')} ${styled(`id=${message.messageId}`, 'dim')}; ` +
+    `${formatSender(message.sender)}` +
     `${styled('text=', 'dim')}` +
     `${JSON.stringify(message.message.replace(/\s+/g, ' ') || '(no text content)')}`
   ).join('\n');
@@ -515,6 +528,7 @@ export async function startCombustion({
     [configuration.puppetName ?? '', ...aliases].flatMap(identityNameVariants),
   );
   const answeredIncomingMessageIds = new Set<string>();
+  const declinedIncomingMessageIds = new Set<string>();
   const isBotAuthoredMessage = (message: {
     sender?: unknown;
     direction?: unknown;
@@ -549,6 +563,22 @@ export async function startCombustion({
         break;
       }
       answeredIncomingMessageIds.delete(oldestMessageId);
+    }
+  };
+  const rememberDeclinedIncomingMessage = (
+    messages: readonly { messageId?: string; message: string; direction?: unknown }[],
+  ): void => {
+    const latestIncoming = findLatestIncomingMessage(messages);
+    if (!latestIncoming?.messageId) {
+      return;
+    }
+    declinedIncomingMessageIds.add(latestIncoming.messageId);
+    while (declinedIncomingMessageIds.size > MESSAGE_HISTORY_LIMIT) {
+      const oldestMessageId = declinedIncomingMessageIds.values().next().value;
+      if (oldestMessageId === undefined) {
+        break;
+      }
+      declinedIncomingMessageIds.delete(oldestMessageId);
     }
   };
   const detectedAtByMessageId = new Map<string, number>();
@@ -1147,6 +1177,7 @@ export async function startCombustion({
     packetBuilderState.nextPacketNumber = nextPacketNumber;
     contextStore.clear();
     answeredIncomingMessageIds.clear();
+    declinedIncomingMessageIds.clear();
     seenMessageIds = new Set(baseline.map(message => message.messageId).filter(Boolean));
     appendContextMessages(contextStore, baseline, packetScheduler, packetBuilderState);
     packetBuilderState = buildPacketTurn({
@@ -1277,15 +1308,17 @@ export async function startCombustion({
       `\n${styled('[COMBUSTION]', 'cyan')} ` +
       styled(`Starting Combustion for ${configuration.messageDestination}.`, 'bold'),
     );
-    let personalityInstruction = getPersonalityInstruction(
-      resolveBotPersonalityMode(configuration),
-      configuration.customPersonalityInstruction,
-    );
-    const identityInstruction = getBotIdentityInstruction({
+    let personalityMode = resolveBotPersonalityMode(configuration);
+    let customPersonalityInstruction = configuration.customPersonalityInstruction;
+    const identity = {
       name: configuration.puppetName ?? '',
       aliases,
+    };
+    let systemInstruction = composeProductionSystemInstruction({
+      identity,
+      personalityMode,
+      customPersonalityInstruction,
     });
-    let systemInstruction = composeSystemInstruction(identityInstruction, personalityInstruction);
     const processPacket = createPacketProcessor<
       PacketBuilderMessage,
       string,
@@ -1295,7 +1328,31 @@ export async function startCombustion({
     >({
       page,
       apiKey,
-      generateReply: async (requestApiKey, messages) => {
+      adjudicateReply: async (requestApiKey, packet, messages) => {
+        try {
+          const result = await adjudicateNvidiaReply(
+            requestApiKey,
+            messages as unknown as readonly BackreadMessage[],
+            { identity },
+          );
+          if (result.decision === 'approve') {
+            return 'approve';
+          }
+          console.log(
+            `${styled('[adjudication]', 'yellow')} ${packet.packetId ?? 'unknown'} ` +
+            `rejected: ${result.reason}`,
+          );
+        } catch (error) {
+          console.log(
+            `${styled('[adjudication]', 'yellow')} ${packet.packetId ?? 'unknown'} ` +
+            `failed closed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        rememberDeclinedIncomingMessage(messages);
+        return 'reject';
+      },
+      generateReply: async (requestApiKey, messages, packet) => {
+        assertReplyApproved(packet, 'combustion-reply-generation');
         const startedAt = performance.now();
         const latestIncoming = findLatestIncomingMessage(messages);
         const participantNames = collectParticipantNames({
@@ -1308,8 +1365,9 @@ export async function startCombustion({
             messages as unknown as readonly BackreadMessage[],
             {
               systemInstruction: retry
-                ? composeSystemInstruction(systemInstruction, ANTI_ECHO_RETRY_INSTRUCTION)
+                ? appendRetryInstruction(systemInstruction, ANTI_ECHO_RETRY_INSTRUCTION)
                 : systemInstruction,
+              identity,
             },
           );
           const normalizedReply = stripLeadingParticipantMentions(
@@ -1333,6 +1391,17 @@ export async function startCombustion({
             console.log(
               `${styled('[reply]', 'cyan')} removed speaker label: ` +
               `${JSON.stringify(removedPrefix)}`,
+            );
+          }
+          const postNormalizationIdentity = validateReplyIdentity(normalizedReply, {
+            name: configuration.puppetName ?? '',
+            aliases,
+            participantNames,
+          });
+          if (!postNormalizationIdentity.valid) {
+            throw new NvidiaIdentityError(
+              postNormalizationIdentity.reason,
+              'The reply changed identity during normalization and was not sent.',
             );
           }
           return normalizedReply;
@@ -1490,11 +1559,13 @@ export async function startCombustion({
         ));
         return;
       }
-      if (latestMessage && answeredIncomingMessageIds.has(latestMessage.messageId)) {
+      if (latestMessage &&
+          (answeredIncomingMessageIds.has(latestMessage.messageId) ||
+           declinedIncomingMessageIds.has(latestMessage.messageId))) {
         console.log(formatSubsystemStatus(
           'rng',
           `${styled('Skipping dice roll:', 'yellow')} ` +
-          'latest incoming message was already answered.',
+          'latest incoming message was already answered or declined.',
         ));
         return;
       }
@@ -1543,12 +1614,13 @@ export async function startCombustion({
           console.log(formatSubsystemStatus('rng', 'No cooldown; normal polling resumes'));
           return;
         }
-        if (answeredIncomingMessageIds.has(latestIncomingMessage.messageId)) {
+        if (answeredIncomingMessageIds.has(latestIncomingMessage.messageId) ||
+            declinedIncomingMessageIds.has(latestIncomingMessage.messageId)) {
           rngOperationActive = false;
           console.log(formatSubsystemStatus(
             'rng',
             `${styled('Skipped:', 'yellow')} ` +
-            'the newest incoming message was already answered',
+            'the newest incoming message was already answered or declined',
           ));
           console.log(formatSubsystemStatus('rng', 'No cooldown; normal polling resumes'));
           return;
@@ -1624,9 +1696,14 @@ export async function startCombustion({
       setTemperament(temperament) {
         botTemperament = temperament;
       },
-      setPersonality(instruction) {
-        personalityInstruction = instruction;
-        systemInstruction = composeSystemInstruction(identityInstruction, personalityInstruction);
+      setPersonality(nextMode, nextCustomInstruction) {
+        personalityMode = nextMode;
+        customPersonalityInstruction = nextCustomInstruction;
+        systemInstruction = composeProductionSystemInstruction({
+          identity,
+          personalityMode,
+          customPersonalityInstruction,
+        });
       },
       changeDestination,
       async stop() {

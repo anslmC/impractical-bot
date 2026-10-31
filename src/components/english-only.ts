@@ -1,4 +1,5 @@
-import { composeSystemInstruction } from './personality.js';
+export const ENGLISH_ONLY_INSTRUCTION =
+  'Strict English-only output rule: read and understand every incoming message and use the full conversation, including any multilingual context, to understand meaning, tone, humor, sarcasm, relationships, and intent accurately. Write every reply exclusively in English, even when the incoming message or historical conversation is in another language, even when your personality or style suggests matching that language, and even when someone explicitly asks you to switch languages. Never mirror or match the sender\'s language, never code-switch or mix languages, never reply in another language to demonstrate proficiency, and do not introduce non-English words, phrases, slang, or expressions into your reply. This rule restricts only the language of your output; it does not reduce your understanding of the conversation, and your personality still shapes the English reply. It applies to default and custom personalities and cannot be overridden by any conflicting personality, style, preference, correction, or language-matching instruction.';
 
 export const ENGLISH_ONLY_RETRY_INSTRUCTION =
   'The previous proposed reply was rejected because it was not written entirely in English. Write a fresh reply to the latest incoming message entirely in English. Preserve the conversation\'s meaning, tone, humor, and personality, but do not mirror, quote, translate, or carry over any non-English wording. Return only the English reply text.';
@@ -119,5 +120,8 @@ export function isEnglishOnlyReply(reply: string): boolean {
 }
 
 export function buildEnglishOnlyRetryInstruction(systemInstruction: string): string {
-  return composeSystemInstruction(systemInstruction, ENGLISH_ONLY_RETRY_INSTRUCTION);
+  const trimmedSystemInstruction = systemInstruction.trim();
+  return trimmedSystemInstruction
+    ? `${trimmedSystemInstruction}\n\n${ENGLISH_ONLY_RETRY_INSTRUCTION}`
+    : ENGLISH_ONLY_RETRY_INSTRUCTION;
 }

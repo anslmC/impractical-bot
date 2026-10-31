@@ -15,19 +15,33 @@ import { config as loadDotenv, parse } from 'dotenv';
 import { resolveConfigurationPaths } from '../config/configuration.js';
 import type { BackreadMessage } from '../components/backread.js';
 import {
-  buildEnglishOnlyRetryInstruction,
+  ENGLISH_ONLY_RETRY_INSTRUCTION,
   isEnglishOnlyReply,
 } from '../components/english-only.js';
-import { ENGLISH_ONLY_INSTRUCTION } from '../components/personality.js';
+import {
+  IDENTITY_RETRY_INSTRUCTION,
+  validateReplyIdentity,
+  type IdentityValidationContext,
+  type IdentityViolationReason,
+} from '../components/identity-policy.js';
+import {
+  appendRetryInstruction,
+  type BotIdentity,
+} from '../components/personality.js';
+import {
+  buildReplyAdjudicationInstruction,
+  parseReplyAdjudicationContent,
+  type ReplyAdjudicationResult,
+} from '../components/reply-adjudication.js';
 import { stripParticipantSpeakerLabel } from '../components/reply-normalization.js';
 
 const NVIDIA_CHAT_COMPLETIONS_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
 const NVIDIA_CHAT_COMPLETIONS_MODEL = 'nvidia/nemotron-3.5-lightning-30b-a3b';
 const DEFAULT_REQUEST_TIMEOUT_MS = 50_000;
 const REPLY_MAX_TOKENS = 256;
+const ADJUDICATION_MAX_TOKENS = 128;
 const MAX_ASSISTANT_HISTORY_TURNS = 3;
 const VALIDATION_MAX_TOKENS = 4096;
-const DEFAULT_SYSTEM_INSTRUCTION = 'Write a short, natural Messenger reply that matches the conversation\'s tone and directly addresses the latest incoming message. Aim for roughly 3–12 words when appropriate, but do not force an exact word count; use more words when needed for a natural answer. ' + `${ENGLISH_ONLY_INSTRUCTION} ` + 'Avoid Messenger-style @participant mentions and address people by their ordinary names without an @ prefix. Avoid unsolicited email copy, calls to action, headings, labels, and unrelated prefixes such as "Verse 3.1". Return only the reply text. This reply is a proposal until the application sends it.';
 
 export type NvidiaApiKeyErrorKind = 'authentication' | 'network' | 'service';
 
@@ -47,10 +61,30 @@ export class NvidiaRequestError extends Error {
   }
 }
 
+export class NvidiaIdentityError extends Error {
+  constructor(
+    readonly reason: IdentityViolationReason,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = 'NvidiaIdentityError';
+  }
+}
+
 export interface NvidiaRequestOptions {
   fetch?: typeof fetch;
-  systemInstruction?: string;
   timeoutMs?: number;
+}
+
+export interface NvidiaReplyRequestOptions extends NvidiaRequestOptions {
+  systemInstruction: string;
+  identity: BotIdentity;
+}
+
+export interface NvidiaAdjudicationOptions extends NvidiaRequestOptions {
+  identity: BotIdentity;
+  participantNames?: readonly string[];
 }
 
 export type NvidiaValidationOptions = NvidiaRequestOptions;
@@ -274,24 +308,59 @@ function limitAssistantHistory(
   return kept.reverse();
 }
 
-export async function generateNvidiaReply(
-  apiKey: string,
-  messages: readonly BackreadMessage[],
-  options: NvidiaRequestOptions = {},
-): Promise<string> {
-  if (!apiKey.trim() || /[\r\n]/.test(apiKey)) {
-    throw new NvidiaApiKeyError('authentication', 'The NVIDIA API key is empty or malformed.');
-  }
+function normalizeIdentityValue(value: string): string {
+  return value
+    .normalize('NFC')
+    .replace(/^@+/u, '')
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .toLowerCase();
+}
 
+function identityComparableNames(identity: BotIdentity): Set<string> {
+  return new Set(
+    [identity.name, ...(identity.aliases ?? [])]
+      .map(normalizeIdentityValue)
+      .filter(Boolean),
+  );
+}
+
+function collectParticipantNames(
+  messages: readonly BackreadMessage[],
+  identity: BotIdentity,
+): string[] {
+  const ownNames = identityComparableNames(identity);
   const participantNames: string[] = [];
+  const seen = new Set<string>();
   for (const message of messages) {
     const senderName = typeof message.sender === 'string' ? message.sender.trim() : '';
-    if (senderName && senderName !== 'UNKNOWN' && senderName !== 'You' &&
-        !participantNames.includes(senderName)) {
-      participantNames.push(senderName);
+    const comparable = normalizeIdentityValue(senderName);
+    if (!senderName || comparable === 'unknown' || comparable === 'you' ||
+        ownNames.has(comparable) || seen.has(comparable)) {
+      continue;
     }
+    seen.add(comparable);
+    participantNames.push(senderName);
   }
+  return participantNames;
+}
 
+function createIdentityContext(
+  identity: BotIdentity,
+  participantNames: readonly string[],
+): IdentityValidationContext {
+  return {
+    name: identity.name,
+    aliases: identity.aliases,
+    participantNames,
+  };
+}
+
+function buildConversationTurns(
+  messages: readonly BackreadMessage[],
+  participantNames: readonly string[],
+  identityContext: IdentityValidationContext,
+): ConversationTurn[] {
   const conversationMessages: ConversationTurn[] = [];
   for (const message of messages) {
     if (message.direction !== 'INCOMING' && message.direction !== 'OUTGOING') {
@@ -304,19 +373,25 @@ export async function generateNvidiaReply(
     const isIncoming = message.direction === 'INCOMING';
     const senderName = typeof message.sender === 'string' ? message.sender.trim() : '';
     const sender = isIncoming && senderName && senderName !== 'UNKNOWN'
-      ? `${senderName}: `
+      ? `[from ${senderName}] `
       : '';
     const turnContent = isIncoming
       ? content
       : stripParticipantSpeakerLabel(content, participantNames);
+    if (!isIncoming && !validateReplyIdentity(turnContent, identityContext).valid) {
+      continue;
+    }
     conversationMessages.push({
       role: isIncoming ? 'user' : 'assistant',
       content: `${sender}${turnContent}`,
     });
   }
-  if (conversationMessages.length === 0) {
-    throw new Error('No usable Messenger messages are available to generate a reply.');
-  }
+  return conversationMessages;
+}
+
+function selectRequestTurns(
+  conversationMessages: readonly ConversationTurn[],
+): ConversationTurn[] | null {
   let latestIncomingIndex = -1;
   for (let index = conversationMessages.length - 1; index >= 0; index -= 1) {
     if (conversationMessages[index].role === 'user') {
@@ -325,102 +400,187 @@ export async function generateNvidiaReply(
     }
   }
   if (latestIncomingIndex === -1) {
-    throw new Error('No incoming Messenger messages are available to generate a reply.');
+    return null;
   }
-  const requestMessages = limitAssistantHistory(
+  return limitAssistantHistory(
     conversationMessages.slice(0, latestIncomingIndex + 1),
   );
+}
 
-  const requestCompletion = async (systemInstruction: string): Promise<string> => {
-    let response: Response;
-    try {
-      response = await (options.fetch ?? fetch)(NVIDIA_CHAT_COMPLETIONS_URL, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: NVIDIA_CHAT_COMPLETIONS_MODEL,
-          messages: [
-            { role: 'system', content: systemInstruction },
-            ...requestMessages,
-          ],
-          chat_template_kwargs: { enable_thinking: false },
-          max_tokens: REPLY_MAX_TOKENS,
-          stream: false,
-        }),
-        signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS),
-      });
-    } catch (error) {
+interface CompletionRequestOptions {
+  apiKey: string;
+  systemInstruction: string;
+  messages: readonly ConversationTurn[];
+  fetch?: typeof fetch;
+  timeoutMs?: number;
+  maxTokens: number;
+  responseFormat?: unknown;
+  networkMessage: string;
+  pendingMessage: string;
+  failureMessage: string;
+  malformedMessage: string;
+  emptyMessage: string;
+}
+
+async function requestNvidiaCompletion({
+  apiKey,
+  systemInstruction,
+  messages,
+  fetch: fetchImplementation,
+  timeoutMs,
+  maxTokens,
+  responseFormat,
+  networkMessage,
+  pendingMessage,
+  failureMessage,
+  malformedMessage,
+  emptyMessage,
+}: CompletionRequestOptions): Promise<string> {
+  let response: Response;
+  try {
+    response = await (fetchImplementation ?? fetch)(NVIDIA_CHAT_COMPLETIONS_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: NVIDIA_CHAT_COMPLETIONS_MODEL,
+        messages: [
+          { role: 'system', content: systemInstruction },
+          ...messages,
+        ],
+        ...(responseFormat === undefined ? {} : { response_format: responseFormat }),
+        chat_template_kwargs: { enable_thinking: false },
+        max_tokens: maxTokens,
+        stream: false,
+      }),
+      signal: AbortSignal.timeout(timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS),
+    });
+  } catch (error) {
+    throw new NvidiaRequestError(
+      'network',
+      networkMessage,
+      { cause: error },
+    );
+  }
+
+  const failure = response.status === 200
+    ? undefined
+    : await readErrorResponse(response, apiKey);
+  if (response.status === 401) {
+    throw new NvidiaApiKeyError(
+      'authentication',
+      `NVIDIA rejected the API key. ${formatHttpFailure(failure!.status, failure!.body)}`,
+    );
+  }
+  if (response.status === 202) {
+    throw new NvidiaRequestError(
+      'service',
+      `${pendingMessage} ${formatHttpFailure(failure!.status, failure!.body)} Try again later.`,
+    );
+  }
+  if (response.status !== 200) {
+    throw new NvidiaRequestError(
+      'service',
+      `${failureMessage} ${formatHttpFailure(failure!.status, failure!.body)}`,
+    );
+  }
+
+  let body: unknown;
+  try {
+    body = await response.json() as unknown;
+  } catch (error) {
+    if (error instanceof SyntaxError) {
       throw new NvidiaRequestError(
-        'network',
+        'service',
+        malformedMessage,
+        { cause: error },
+      );
+    }
+    throw new NvidiaRequestError(
+      'network',
+      'The NVIDIA reply response could not be read. Try again.',
+      { cause: error },
+    );
+  }
+  if (!isCompletionResponse(body)) {
+    throw new NvidiaRequestError('service', malformedMessage);
+  }
+
+  const content = (body as { choices: { message: { content: string } }[] })
+    .choices[0].message.content.trim();
+  if (!content) {
+    throw new NvidiaRequestError('service', emptyMessage);
+  }
+  return content;
+}
+
+export async function generateNvidiaReply(
+  apiKey: string,
+  messages: readonly BackreadMessage[],
+  options: NvidiaReplyRequestOptions,
+): Promise<string> {
+  if (!apiKey.trim() || /[\r\n]/.test(apiKey)) {
+    throw new NvidiaApiKeyError('authentication', 'The NVIDIA API key is empty or malformed.');
+  }
+  if (!options.systemInstruction.trim()) {
+    throw new Error('A complete system instruction is required to generate a reply.');
+  }
+  if (!options.identity.name.trim()) {
+    throw new Error('A configured bot identity is required to generate a reply.');
+  }
+
+  const participantNames = collectParticipantNames(messages, options.identity);
+  const identityContext = createIdentityContext(options.identity, participantNames);
+  const requestMessages = selectRequestTurns(
+    buildConversationTurns(messages, participantNames, identityContext),
+  );
+  if (!requestMessages) {
+    throw new Error('No usable Messenger messages are available to generate a reply.');
+  }
+
+  const requestCompletion = (systemInstruction: string): Promise<string> =>
+    requestNvidiaCompletion({
+      apiKey,
+      systemInstruction,
+      messages: requestMessages,
+      fetch: options.fetch,
+      timeoutMs: options.timeoutMs,
+      maxTokens: REPLY_MAX_TOKENS,
+      networkMessage:
         'Unable to reach NVIDIA to generate a reply. Check the network connection and try again.',
-        { cause: error },
-      );
-    }
+      pendingMessage: 'NVIDIA accepted the reply request but left it pending.',
+      failureMessage: 'NVIDIA could not generate a reply.',
+      malformedMessage: 'NVIDIA returned an unexpected reply response.',
+      emptyMessage: 'NVIDIA returned an empty reply.',
+    });
 
-    const failure = response.status === 200
-      ? undefined
-      : await readErrorResponse(response, apiKey);
-    if (response.status === 401) {
-      throw new NvidiaApiKeyError(
-        'authentication',
-        `NVIDIA rejected the API key. ${formatHttpFailure(failure!.status, failure!.body)}`,
-      );
-    }
-    if (response.status === 202) {
-      throw new NvidiaRequestError(
-        'service',
-        `NVIDIA accepted the reply request but left it pending. ` +
-        `${formatHttpFailure(failure!.status, failure!.body)} Try again later.`,
-      );
-    }
-    if (response.status !== 200) {
-      throw new NvidiaRequestError(
-        'service',
-        `NVIDIA could not generate a reply. ${formatHttpFailure(failure!.status, failure!.body)}`,
-      );
-    }
-
-    let body: unknown;
-    try {
-      body = await response.json() as unknown;
-    } catch (error) {
-      if (error instanceof SyntaxError) {
-        throw new NvidiaRequestError(
-          'service',
-          'NVIDIA returned an unexpected reply response.',
-          { cause: error },
-        );
-      }
-      throw new NvidiaRequestError(
-        'network',
-        'The NVIDIA reply response could not be read. Try again.',
-        { cause: error },
-      );
-    }
-    if (!isCompletionResponse(body)) {
-      throw new NvidiaRequestError('service', 'NVIDIA returned an unexpected reply response.');
-    }
-
-    const reply = (body as { choices: { message: { content: string } }[] })
-      .choices[0].message.content.trim();
-    if (!reply) {
-      throw new NvidiaRequestError('service', 'NVIDIA returned an empty reply.');
-    }
-    return reply;
-  };
-
-  const systemInstruction = options.systemInstruction ?? DEFAULT_SYSTEM_INSTRUCTION;
+  const systemInstruction = options.systemInstruction.trim();
   const firstReply = await requestCompletion(systemInstruction);
-  if (isEnglishOnlyReply(firstReply)) {
+  const firstLanguageValid = isEnglishOnlyReply(firstReply);
+  const firstIdentityResult = validateReplyIdentity(firstReply, identityContext);
+  if (firstLanguageValid && firstIdentityResult.valid) {
     return firstReply;
   }
 
+  const retryInstructions: string[] = [];
+  if (!firstLanguageValid) {
+    retryInstructions.push(ENGLISH_ONLY_RETRY_INSTRUCTION);
+  }
+  if (!firstIdentityResult.valid) {
+    retryInstructions.push(IDENTITY_RETRY_INSTRUCTION);
+  }
   const retryReply = await requestCompletion(
-    buildEnglishOnlyRetryInstruction(systemInstruction),
+    appendRetryInstruction(systemInstruction, ...retryInstructions),
   );
+  const retryIdentityResult = validateReplyIdentity(retryReply, identityContext);
+  if (!retryIdentityResult.valid) {
+    throw new NvidiaIdentityError(
+      retryIdentityResult.reason,
+      'NVIDIA repeatedly returned a reply with an invalid identity. The reply was not sent.',
+    );
+  }
   if (!isEnglishOnlyReply(retryReply)) {
     throw new NvidiaRequestError(
       'service',
@@ -428,4 +588,74 @@ export async function generateNvidiaReply(
     );
   }
   return retryReply;
+}
+
+export async function adjudicateNvidiaReply(
+  apiKey: string,
+  messages: readonly BackreadMessage[],
+  options: NvidiaAdjudicationOptions,
+): Promise<ReplyAdjudicationResult> {
+  if (!apiKey.trim() || /[\r\n]/.test(apiKey)) {
+    throw new NvidiaApiKeyError('authentication', 'The NVIDIA API key is empty or malformed.');
+  }
+  if (!options.identity.name.trim()) {
+    throw new Error('A configured bot identity is required to adjudicate a reply.');
+  }
+
+  const ownNames = identityComparableNames(options.identity);
+  const seen = new Set<string>();
+  const participantNames: string[] = [];
+  for (const name of [
+    ...(options.participantNames ?? []),
+    ...collectParticipantNames(messages, options.identity),
+  ]) {
+    const normalized = name.trim();
+    const comparable = normalizeIdentityValue(normalized);
+    if (!normalized || comparable === 'unknown' || comparable === 'you' ||
+        ownNames.has(comparable) || seen.has(comparable)) {
+      continue;
+    }
+    seen.add(comparable);
+    participantNames.push(normalized);
+  }
+
+  const identityContext = createIdentityContext(options.identity, participantNames);
+  const requestMessages = selectRequestTurns(
+    buildConversationTurns(messages, participantNames, identityContext),
+  );
+  if (!requestMessages) {
+    return {
+      decision: 'reject',
+      reason: 'no incoming messages are available for adjudication',
+    };
+  }
+
+  try {
+    const content = await requestNvidiaCompletion({
+      apiKey,
+      systemInstruction: buildReplyAdjudicationInstruction({
+        identity: options.identity,
+        participantNames,
+      }),
+      messages: requestMessages,
+      fetch: options.fetch,
+      timeoutMs: options.timeoutMs,
+      maxTokens: ADJUDICATION_MAX_TOKENS,
+      responseFormat: { type: 'json_object' },
+      networkMessage:
+        'Unable to reach NVIDIA to adjudicate the reply. The packet was rejected.',
+      pendingMessage: 'NVIDIA accepted the adjudication request but left it pending.',
+      failureMessage: 'NVIDIA could not adjudicate the reply.',
+      malformedMessage: 'NVIDIA returned an unexpected adjudication response.',
+      emptyMessage: 'NVIDIA returned an empty adjudication.',
+    });
+    return parseReplyAdjudicationContent(content);
+  } catch (error) {
+    return {
+      decision: 'reject',
+      reason: error instanceof Error
+        ? `adjudication failed: ${error.message}`
+        : 'adjudication failed',
+    };
+  }
 }

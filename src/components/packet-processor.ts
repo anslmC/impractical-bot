@@ -1,4 +1,10 @@
 import type { PauseGate } from './pause-gate.js';
+import {
+  ReplyRejectedError,
+  assertReplyApproved,
+  type ReplyDecision,
+  type ResolvedReplyDecision,
+} from './reply-adjudication.js';
 import { formatTerminalText, type TerminalStyle } from './terminal-formatting.js';
 
 const DEBUG_RELIABILITY_WARNING =
@@ -25,6 +31,7 @@ export interface ProcessablePacket<Message = unknown> {
   packetId?: string;
   contextMessages?: Message[];
   newMessages?: Message[];
+  reply?: ReplyDecision;
 }
 
 export interface ComposeReplyOptions {
@@ -40,7 +47,16 @@ export interface PacketProcessorOptions<
 > {
   page: PageType;
   apiKey: ApiKey;
-  generateReply: (apiKey: ApiKey, messages: Message[]) => Reply | Promise<Reply>;
+  adjudicateReply?: (
+    apiKey: ApiKey,
+    packet: ProcessablePacket<Message>,
+    messages: Message[],
+  ) => ResolvedReplyDecision | Promise<ResolvedReplyDecision>;
+  generateReply: (
+    apiKey: ApiKey,
+    messages: Message[],
+    packet: ProcessablePacket<Message>,
+  ) => Reply | Promise<Reply>;
   composeReply: (
     page: PageType,
     reply: Awaited<Reply>,
@@ -84,6 +100,7 @@ export function createPacketProcessor<
 >({
   page,
   apiKey,
+  adjudicateReply,
   generateReply,
   composeReply,
   pauseGate,
@@ -97,9 +114,11 @@ export function createPacketProcessor<
     throw new TypeError('generateReply and composeReply must be functions.');
   }
 
+  const adjudications = new WeakMap<object, Promise<ResolvedReplyDecision>>();
+
   return async packet => {
     const packetId = packet?.packetId ?? 'unknown';
-    let stage = 'reply-generation';
+    let stage = 'reply-adjudication';
     console.log(`\n${formatPacketStage(
       packetId,
       'start',
@@ -111,8 +130,45 @@ export function createPacketProcessor<
         ...(packet.contextMessages ?? []),
         ...(packet.newMessages ?? []),
       ];
+
+      if (packet.reply === 'pending') {
+        if (typeof adjudicateReply !== 'function') {
+          packet.reply = 'reject';
+          throw new ReplyRejectedError('no adjudicator is available for a pending packet');
+        }
+        let adjudication = adjudications.get(packet);
+        if (!adjudication) {
+          console.log(formatPacketStage(packetId, 'reply-adjudication-start'));
+          adjudication = (async () => {
+            try {
+              const decision = await adjudicateReply(apiKey, packet, messages);
+              packet.reply = decision === 'approve' ? 'approve' : 'reject';
+              return packet.reply;
+            } catch {
+              packet.reply = 'reject';
+              return 'reject' as const;
+            }
+          })();
+          adjudications.set(packet, adjudication);
+        }
+        const decision = await adjudication;
+        console.log(
+          formatPacketStage(
+            packetId,
+            'reply-adjudication-complete',
+            `decision=${styled(decision, decision === 'approve' ? 'green' : 'yellow')}`,
+            decision === 'approve' ? 'green' : 'yellow',
+          ),
+        );
+        if (decision !== 'approve') {
+          throw new ReplyRejectedError('adjudicator rejected this packet');
+        }
+      }
+
+      assertReplyApproved(packet, 'reply-generation');
+      stage = 'reply-generation';
       console.log(formatPacketStage(packetId, 'reply-generation-start'));
-      const reply = await generateReply(apiKey, messages);
+      const reply = await generateReply(apiKey, messages, packet);
       console.log(
         formatPacketStage(
           packetId,
@@ -125,6 +181,7 @@ export function createPacketProcessor<
       assertPacketCurrent(isCurrent, packet);
       await waitForPacketWork(pauseGate);
       assertPacketCurrent(isCurrent, packet);
+      assertReplyApproved(packet, 'composition');
       console.log(formatPacketStage(packetId, 'composition-start'));
       const composition = await composeReply(
         page,
@@ -132,6 +189,7 @@ export function createPacketProcessor<
         pauseGate || isCurrent
           ? {
             beforeSend: async () => {
+              assertReplyApproved(packet, 'send');
               await waitForPacketWork(pauseGate);
               assertPacketCurrent(isCurrent, packet);
             },

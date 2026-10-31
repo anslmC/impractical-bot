@@ -28,6 +28,10 @@ function messageLine(id: string, content: string): string {
   return `  - id=${id}; text=${JSON.stringify(content)}`;
 }
 
+function senderMessageLine(id: string, sender: string, content: string): string {
+  return `  - id=${id}; sender=${JSON.stringify(sender)}; text=${JSON.stringify(content)}`;
+}
+
 interface BlockOptions {
   added?: string[];
   retained?: string[];
@@ -118,6 +122,25 @@ test('multiple messages keep attribution, order, and subdued metadata', () => {
   assert.doesNotMatch(plain, /id=m1/);
   assert.doesNotMatch(plain, /text=/);
   assert.match(rows.join('\n'), /\u001b\[2m  m1\u001b\[0m$/m, 'ids are dim metadata');
+});
+
+test('sender-prefixed context store lines keep their message content', () => {
+  const rows = present(contextBlock({
+    added: [senderMessageLine('m3', 'Katsuyo', 'Yukinon do you hear anselmo?')],
+    retained: [
+      senderMessageLine('m1', 'Alex', 'older context'),
+      senderMessageLine('m2', 'Blair', 'middle context'),
+      senderMessageLine('m3', 'Katsuyo', 'Yukinon do you hear anselmo?'),
+    ],
+  }));
+  const plain = rows.join('\n');
+
+  assert.match(plain, /^  RECENT MESSAGES \(1\)$/m);
+  assert.match(plain, /^  RETAINED STORE \(2\)$/m);
+  assert.match(plain, /Yukinon do you hear anselmo\?/);
+  assert.match(plain, /older context/);
+  assert.match(plain, /middle context/);
+  assert.doesNotMatch(plain, /sender=/);
 });
 
 test('retained and evicted sections follow the block order', () => {

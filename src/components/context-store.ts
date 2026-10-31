@@ -1,6 +1,7 @@
 export interface ContextMessage {
   messageId: string;
   message: string;
+  sender?: string;
   mention?: boolean;
   [key: string]: unknown;
 }

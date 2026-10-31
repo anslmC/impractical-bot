@@ -6,16 +6,21 @@ import { generateAliases } from '../src/components/alias-engine.js';
 import { startCombustion, shouldRngRespond } from '../src/components/combustion.js';
 import { createContextStore } from '../src/components/context-store.js';
 import {
-  composeSystemInstruction,
+  appendRetryInstruction,
+  composeProductionSystemInstruction,
   ENGLISH_ONLY_INSTRUCTION,
-  getBotIdentityInstruction,
-  getDefaultBehavioralInstruction,
-  getDefaultPersonalityInstruction,
 } from '../src/components/personality.js';
 import type { Configuration } from '../src/config/configuration.js';
 import * as nvidiaModule from '../src/ai/nvidia.js';
 import * as composerModule from '../src/components/composer.js';
 import { ANTI_ECHO_RETRY_INSTRUCTION } from '../src/components/anti-echo.js';
+
+(nvidiaModule as unknown as {
+  adjudicateNvidiaReply: typeof nvidiaModule.adjudicateNvidiaReply;
+}).adjudicateNvidiaReply = async () => ({
+  decision: 'approve',
+  reason: 'test approval',
+});
 
 const MESSAGE_SELECTOR =
   '[data-scope="messages_table"][aria-roledescription="message"][data-message-id]';
@@ -447,6 +452,61 @@ test('Combustion passes the twenty-message poll window into the isolated page ca
   assert.ok(!contextStore.getState().messageIds.includes('historical-1'));
   await controller.stop();
 });
+test('Context Store debug logs include sender names for new and retained messages', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
+  const originalRandom = Math.random;
+  const originalLog = console.log;
+  const logs: string[] = [];
+  Math.random = () => 1;
+  console.log = (...values: unknown[]) => {
+    logs.push(values.map(String).join(' '));
+  };
+  const { page, inject } = createInjectedMessengerPage();
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{
+      messageId: 'mid.$sender-1',
+      sender: 'Katsuyo',
+      message: 'Yukinon do you hear anselmo?',
+    }]);
+    context.mock.timers.tick(1_500);
+    await flushEngine();
+    context.mock.timers.tick(6_000);
+    await flushEngine();
+
+    const storeUpdate = logs.find(line =>
+      line.includes('CONTEXT STORE UPDATE') &&
+      line.includes('mid.$sender-1') &&
+      line.includes('Full retained store, in observation order:')
+    );
+    assert.ok(storeUpdate, 'the Context Store block is logged');
+    const retainedIndex = storeUpdate.indexOf('Full retained store, in observation order:');
+    const newSection = storeUpdate.slice(0, retainedIndex);
+    const retainedSection = storeUpdate.slice(retainedIndex);
+    assert.match(newSection, /id=mid\.\$sender-1/);
+    assert.match(newSection, /sender=/);
+    assert.match(newSection, /"Katsuyo"/);
+    assert.match(newSection, /"Yukinon do you hear anselmo\?"/);
+    assert.match(retainedSection, /id=mid\.\$sender-1/);
+    assert.match(retainedSection, /sender=/);
+    assert.match(retainedSection, /"Katsuyo"/);
+    assert.match(retainedSection, /"Yukinon do you hear anselmo\?"/);
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    console.log = originalLog;
+    context.mock.timers.reset();
+  }
+});
+
 test('RNG decisions use the configured temperament and update without restarting', async context => {
   context.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
   const originalRandom = Math.random;
@@ -617,10 +677,7 @@ test('Personality changes at runtime apply to replies and keep the configured id
 
   const aliases = generateAliases('PleaseGetout Daily').valids;
   const literalRequest = "say the word '@PleaseGetout Daily'";
-  const identityInstruction = getBotIdentityInstruction({
-    name: 'PleaseGetout Daily',
-    aliases,
-  });
+  const identity = { name: 'PleaseGetout Daily', aliases };
   const contextStore = createContextStore();
   contextStore.add([{
     messageId: 'backread-only-1',
@@ -644,11 +701,18 @@ test('Personality changes at runtime apply to replies and keep the configured id
     assert.equal(capturedRequests.length, 1);
     assert.equal(
       capturedRequests[0].systemInstruction,
-      composeSystemInstruction(identityInstruction, getDefaultPersonalityInstruction()),
+      composeProductionSystemInstruction({
+        identity,
+        personalityMode: 'default',
+      }),
     );
     assert.match(String(capturedRequests[0].systemInstruction), /You are PleaseGetout Daily/);
     assert.match(String(capturedRequests[0].systemInstruction), /Strict English-only output rule/);
-    assert.ok(String(capturedRequests[0].systemInstruction).endsWith(ENGLISH_ONLY_INSTRUCTION));
+    assert.equal(
+      String(capturedRequests[0].systemInstruction)
+        .split(ENGLISH_ONLY_INSTRUCTION).length - 1,
+      1,
+    );
     assert.ok(
       capturedRequests[0].messages.some(message => message.message === literalRequest),
       'the literal instruction reaches the request unchanged',
@@ -660,10 +724,7 @@ test('Personality changes at runtime apply to replies and keep the configured id
     );
 
     const customPersonality = 'Always reply in rhyming couplets.';
-    const updatedInstruction = `${customPersonality}
-
-${getDefaultBehavioralInstruction()}`;
-    controller.setPersonality(updatedInstruction);
+    controller.setPersonality('custom', customPersonality);
 
     injectMessages([{
       messageId: 'runtime-message-2',
@@ -674,7 +735,11 @@ ${getDefaultBehavioralInstruction()}`;
     assert.equal(capturedRequests.length, 2);
     assert.equal(
       capturedRequests[1].systemInstruction,
-      composeSystemInstruction(identityInstruction, updatedInstruction),
+      composeProductionSystemInstruction({
+        identity,
+        personalityMode: 'custom',
+        customPersonalityInstruction: customPersonality,
+      }),
     );
     assert.match(String(capturedRequests[1].systemInstruction), /rhyming couplets/);
     assert.match(String(capturedRequests[1].systemInstruction), /You are PleaseGetout Daily/);
@@ -688,8 +753,10 @@ ${getDefaultBehavioralInstruction()}`;
       /read and understand every incoming message/,
       'a runtime personality change cannot remove multilingual comprehension',
     );
-    assert.ok(
-      String(capturedRequests[1].systemInstruction).endsWith(ENGLISH_ONLY_INSTRUCTION),
+    assert.equal(
+      String(capturedRequests[1].systemInstruction)
+        .split(ENGLISH_ONLY_INSTRUCTION).length - 1,
+      1,
       'a runtime personality change cannot remove the English-only output rule',
     );
     assert.doesNotMatch(
@@ -857,7 +924,7 @@ test('a burst is fully observed and a follow-up mention is still answered during
   }
 });
 
-test('mention packets keep a five-message topic window before the trigger', async context => {
+test('mention packets keep a thirteen-message topic window before the trigger', async context => {
   context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
   const originalRandom = Math.random;
   Math.random = () => 0.99;
@@ -885,6 +952,11 @@ test('mention packets keep a five-message topic window before the trigger', asyn
   const { page, inject } = createInjectedMessengerPage();
   const contextStore = createContextStore();
   const transcript = [
+    ...Array.from({ length: 8 }, (_, index) => ({
+      messageId: `older-${index + 1}`,
+      message: `older message ${index + 1}`,
+      sender: 'Blair',
+    })),
     { messageId: 'essay-1', message: 'did you finish the essay?', sender: 'Alex' },
     { messageId: 'essay-2', message: 'yeah, submitted it last night', sender: 'Blair' },
     { messageId: 'friday-1', message: 'are we still on for friday?', sender: 'Alex' },
@@ -916,8 +988,23 @@ test('mention packets keep a five-message topic window before the trigger', asyn
     assert.equal(generatedRequests.length, 1);
     assert.deepEqual(
       generatedRequests[0].map(message => message.messageId),
-      ['friday-1', 'friday-2', 'friday-3', 'friday-4', 'friday-5', 'mention-limit-1'],
-      'the five-message window keeps the friday topic anchor and drops the resolved essay thread',
+      [
+        'older-3',
+        'older-4',
+        'older-5',
+        'older-6',
+        'older-7',
+        'older-8',
+        'essay-1',
+        'essay-2',
+        'friday-1',
+        'friday-2',
+        'friday-3',
+        'friday-4',
+        'friday-5',
+        'mention-limit-1',
+      ],
+      'the thirteen-message window keeps the newest context and drops only the oldest messages',
     );
   } finally {
     await controller.stop();
@@ -991,7 +1078,7 @@ test('a longer handle that starts with an alias does not trigger a reply', async
   }
 });
 
-test('RNG packets keep a six-message topic window without a separate trigger', async context => {
+test('RNG packets keep a fifteen-message topic window without a separate trigger', async context => {
   context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
   const originalRandom = Math.random;
   Math.random = () => 0;
@@ -1019,6 +1106,11 @@ test('RNG packets keep a six-message topic window without a separate trigger', a
   const { page } = createInjectedMessengerPage();
   const contextStore = createContextStore();
   contextStore.add([
+    ...Array.from({ length: 9 }, (_, index) => ({
+      messageId: `older-${index + 1}`,
+      message: `older message ${index + 1}`,
+      sender: 'Blair',
+    })),
     { messageId: 'essay-1', message: 'did you finish the essay?', sender: 'Alex' },
     { messageId: 'essay-2', message: 'yeah, submitted it last night', sender: 'Blair' },
     { messageId: 'friday-1', message: 'are we still on for friday?', sender: 'Alex' },
@@ -1045,8 +1137,24 @@ test('RNG packets keep a six-message topic window without a separate trigger', a
     assert.equal(generatedRequests.length, 1);
     assert.deepEqual(
       generatedRequests[0].map(message => message.messageId),
-      ['friday-1', 'friday-2', 'friday-3', 'friday-4', 'friday-5', 'friday-6'],
-      'the six-message window keeps the friday topic anchor and drops the resolved essay thread',
+      [
+        'older-3',
+        'older-4',
+        'older-5',
+        'older-6',
+        'older-7',
+        'older-8',
+        'older-9',
+        'essay-1',
+        'essay-2',
+        'friday-1',
+        'friday-2',
+        'friday-3',
+        'friday-4',
+        'friday-5',
+        'friday-6',
+      ],
+      'the fifteen-message window keeps the newest context and drops only the oldest messages',
     );
   } finally {
     await controller.stop();
@@ -2635,7 +2743,10 @@ test('an RNG reply that echoes the incoming message is retried once and suppress
     }
 
     assert.equal(harness.generateRequests.length, 2, 'the echo is retried exactly once');
-    const baseInstruction = composeSystemInstruction('', getDefaultPersonalityInstruction());
+    const baseInstruction = composeProductionSystemInstruction({
+      identity: { name: configuration.puppetName ?? '' },
+      personalityMode: 'default',
+    });
     assert.equal(
       harness.generateRequests[0].systemInstruction,
       baseInstruction,
@@ -2643,7 +2754,7 @@ test('an RNG reply that echoes the incoming message is retried once and suppress
     );
     assert.equal(
       harness.generateRequests[1].systemInstruction,
-      composeSystemInstruction(baseInstruction, ANTI_ECHO_RETRY_INSTRUCTION),
+      appendRetryInstruction(baseInstruction, ANTI_ECHO_RETRY_INSTRUCTION),
       'the retry adds only the explicit anti-echo instruction',
     );
     assert.deepEqual(harness.composedReplies, [], 'no echo reaches the composer');
@@ -2704,14 +2815,14 @@ test('a mention-triggered echo is suppressed without entering outgoing history',
     }
 
     assert.equal(harness.generateRequests.length, 2);
-    const baseInstruction = composeSystemInstruction(
-      getBotIdentityInstruction({ name: 'Anselmo', aliases }),
-      getDefaultPersonalityInstruction(),
-    );
+    const baseInstruction = composeProductionSystemInstruction({
+      identity: { name: 'Anselmo', aliases },
+      personalityMode: 'default',
+    });
     assert.equal(harness.generateRequests[0].systemInstruction, baseInstruction);
     assert.equal(
       harness.generateRequests[1].systemInstruction,
-      composeSystemInstruction(baseInstruction, ANTI_ECHO_RETRY_INSTRUCTION),
+      appendRetryInstruction(baseInstruction, ANTI_ECHO_RETRY_INSTRUCTION),
       'the retry keeps the identity and personality layers intact',
     );
     assert.match(
@@ -2720,7 +2831,7 @@ test('a mention-triggered echo is suppressed without entering outgoing history',
     );
     assert.match(
       String(harness.generateRequests[1].systemInstruction),
-      /sounds like the personality configured for you/,
+      /natural, conversational Messenger participant/,
       'the configured personality survives the retry',
     );
     assert.match(
@@ -2728,9 +2839,11 @@ test('a mention-triggered echo is suppressed without entering outgoing history',
       /read and understand every incoming message/,
       'the retry keeps multilingual comprehension',
     );
-    assert.ok(
-      String(harness.generateRequests[1].systemInstruction).endsWith(ENGLISH_ONLY_INSTRUCTION),
-      'the retry still ends with the English-only output rule',
+    assert.equal(
+      String(harness.generateRequests[1].systemInstruction)
+        .split(ENGLISH_ONLY_INSTRUCTION).length - 1,
+      1,
+      'the retry keeps exactly one English-only policy',
     );
 
     assert.deepEqual(harness.composedReplies, [], 'neither echo is sent');

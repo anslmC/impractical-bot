@@ -16,7 +16,6 @@ import {
   type Configuration,
 } from '../src/config/configuration.js';
 import { generateAliases } from '../src/components/alias-engine.js';
-import { getDefaultPersonalityInstruction, getPersonalityInstruction } from '../src/components/personality.js';
 import type { BackreadResult } from '../src/components/backread.js';
 import type { CombustionController } from '../src/components/combustion.js';
 import { createContextStore } from '../src/components/context-store.js';
@@ -86,8 +85,8 @@ function createTestCombustionController(
     setTemperament(temperament) {
       onSetTemperament?.(temperament);
     },
-    setPersonality(instruction) {
-      onSetPersonality?.(instruction);
+    setPersonality(mode, customInstruction) {
+      onSetPersonality?.(mode, customInstruction);
     },
     async changeDestination(destination, options) {
       if (onChangeDestination) {
@@ -3259,7 +3258,10 @@ test('setpersonality updates a running engine and persists without restarting it
   saveConfiguration(validConfiguration, configurationFilePath);
   saveApplicationApiKey(configurationFilePath);
   const ready = deferred<void>();
-  const receivedInstructions: string[] = [];
+  const receivedInstructions: Array<{
+    mode: Parameters<CombustionController['setPersonality']>[0];
+    instruction: Parameters<CombustionController['setPersonality']>[1];
+  }> = [];
   let launchCalls = 0;
   const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
     validateNvidiaApiKey: async () => undefined,
@@ -3284,8 +3286,8 @@ test('setpersonality updates a running engine and persists without restarting it
       undefined,
       undefined,
       undefined,
-      instruction => {
-        receivedInstructions.push(instruction);
+      (mode, instruction) => {
+        receivedInstructions.push({ mode, instruction });
       },
     ),
   }, message => {
@@ -3303,7 +3305,7 @@ test('setpersonality updates a running engine and persists without restarting it
   assert.match(change.output.at(-1) ?? '', /Personality changed: custom/);
   assert.equal(launchCalls, 1);
   assert.deepEqual(receivedInstructions, [
-    getPersonalityInstruction('custom', 'Cold and impersonal.'),
+    { mode: 'custom', instruction: 'Cold and impersonal.' },
   ]);
   const saved = loadConfiguration(configurationFilePath);
   assert.equal(saved.status, 'valid');
@@ -3314,7 +3316,7 @@ test('setpersonality updates a running engine and persists without restarting it
 
   const revert = await captureCli(['setpersonality'], configurationFilePath, async () => 'default');
   assert.equal(revert.exitCode, 0);
-  assert.equal(receivedInstructions[1], getDefaultPersonalityInstruction());
+  assert.deepEqual(receivedInstructions[1], { mode: 'default', instruction: undefined });
 
   const stopped = await captureCli(['stop'], configurationFilePath);
   assert.equal(stopped.exitCode, 0);

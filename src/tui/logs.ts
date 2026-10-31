@@ -331,7 +331,8 @@ export interface ContextStorePresentation {
 
 const CONTEXT_STORE_HEADER = 'CONTEXT STORE UPDATE';
 const CONTEXT_STORE_BORDER = /^={8,}$/;
-const CONTEXT_STORE_MESSAGE = /^\s*-\s+id=([^;]*);\s+text=(.*)$/;
+const CONTEXT_STORE_MESSAGE =
+  /^\s*-\s+id=([^;]*);\s+(?:sender=.*?;\s+)?text=(.*)$/u;
 const CONTEXT_STORE_DEFERRED =
   /^Eviction details and aggregate contents skipped;/;
 const RETAINED_STORE_VISIBLE_LIMIT = 8;

@@ -49,7 +49,7 @@ import {
   composeMessengerReply,
   type ReplyCompositionResult,
 } from './components/composer.js';
-import { getPersonalityInstruction } from './components/personality.js';
+import { composeProductionSystemInstruction } from './components/personality.js';
 import { generateAliases } from './components/alias-engine.js';
 import {
   formatTerminalDiagnostic,
@@ -1231,11 +1231,10 @@ async function handleStart(
           }
 
           try {
-            const resolvedInstruction = getPersonalityInstruction(
+            combustionController.setPersonality(
               mode,
               mode === 'custom' ? instruction : undefined,
             );
-            combustionController.setPersonality(resolvedInstruction);
           } catch (error) {
             const latestRollback = readConfigurationForOwnedWrite(configurationFilePath);
             if (latestRollback.status !== 'valid') {
@@ -1395,8 +1394,25 @@ async function handleStart(
 
         if (ENABLE_DEBUG_AUTO_RESPONSE) {
           let reply: string | undefined;
+          const debugIdentity = {
+            name: configurationResult.configuration.puppetName ?? '',
+            aliases: aliasData.valids,
+          };
+          const debugSystemInstruction = composeProductionSystemInstruction({
+            identity: debugIdentity,
+            personalityMode: resolveBotPersonalityMode(configurationResult.configuration),
+            customPersonalityInstruction:
+              configurationResult.configuration.customPersonalityInstruction,
+          });
           try {
-            reply = await (runtime.generateNvidiaReply ?? generateNvidiaReply)(apiKey, backread.messages);
+            reply = await (runtime.generateNvidiaReply ?? generateNvidiaReply)(
+              apiKey,
+              backread.messages,
+              {
+                systemInstruction: debugSystemInstruction,
+                identity: debugIdentity,
+              },
+            );
           } catch (error) {
             writeError(getSafeNvidiaError(error, 'Unable to generate a Messenger reply.'));
           }

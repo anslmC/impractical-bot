@@ -2,10 +2,10 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   buildEnglishOnlyRetryInstruction,
+  ENGLISH_ONLY_INSTRUCTION,
   ENGLISH_ONLY_RETRY_INSTRUCTION,
   isEnglishOnlyReply,
 } from '../src/components/english-only.js';
-import { ENGLISH_ONLY_INSTRUCTION } from '../src/components/personality.js';
 
 const SMOKE_TEST_FAILURES = [
   "Hear you? Opo, talo na ako sa'yo ng tanong. Ano ba talaga ng bigay mo? :p",
@@ -46,12 +46,16 @@ test('non-Latin and accented non-English replies are rejected', () => {
   assert.equal(isEnglishOnlyReply('¿Cómo estás?'), false);
 });
 
-test('the retry instruction restores the final English-only output rule', () => {
-  const retryInstruction = buildEnglishOnlyRetryInstruction('Initial instruction.');
+test('the retry instruction appends without duplicating the canonical English-only policy', () => {
+  const retryInstruction = buildEnglishOnlyRetryInstruction(
+    `Initial instruction.\n\n${ENGLISH_ONLY_INSTRUCTION}`,
+  );
 
   assert.match(retryInstruction, /previous proposed reply was rejected/);
   assert.match(retryInstruction, /not written entirely in English/);
   assert.match(retryInstruction, /Preserve the conversation's meaning, tone, humor, and personality/);
-  assert.ok(retryInstruction.endsWith(ENGLISH_ONLY_INSTRUCTION));
+  assert.ok(retryInstruction.startsWith('Initial instruction.'));
+  assert.ok(retryInstruction.endsWith(ENGLISH_ONLY_RETRY_INSTRUCTION));
+  assert.equal(retryInstruction.split(ENGLISH_ONLY_INSTRUCTION).length - 1, 1);
   assert.ok(ENGLISH_ONLY_RETRY_INSTRUCTION.length > 0);
 });

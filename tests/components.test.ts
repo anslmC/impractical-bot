@@ -4,19 +4,36 @@ import { createContextStore } from '../src/components/context-store.js';
 import { buildPacketTurn } from '../src/components/mention-packet-builder.js';
 import { extractMessageDetails } from '../src/components/message-extraction.js';
 import { createPacketProcessor } from '../src/components/packet-processor.js';
+import { ReplyRejectedError } from '../src/components/reply-adjudication.js';
 import { createPacketScheduler } from '../src/components/packet-scheduler.js';
 import { createPauseGate } from '../src/components/pause-gate.js';
+import { ENGLISH_ONLY_INSTRUCTION } from '../src/components/english-only.js';
 import {
+  composeProductionSystemInstruction,
   composeSystemInstruction,
-  ENGLISH_ONLY_INSTRUCTION,
   getBotIdentityInstruction,
+  getConversationPolicyInstruction,
   getDefaultBehavioralInstruction,
   getDefaultPersonalityInstruction,
+  getOutputGuidanceInstruction,
   getPersonalityInstruction,
 } from '../src/components/personality.js';
 import { buildRngPacket } from '../src/components/rng-packet-builder.js';
 import { formatPollSummary, formatTerminalText } from '../src/components/terminal-formatting.js';
 import { generateNvidiaReply } from '../src/ai/nvidia.js';
+
+const testIdentity = { name: 'Ada', aliases: ['@Ada'] };
+
+function composeTestPrompt(
+  personalityMode: 'default' | 'custom' = 'default',
+  customPersonalityInstruction?: string,
+): string {
+  return composeProductionSystemInstruction({
+    identity: testIdentity,
+    personalityMode,
+    customPersonalityInstruction,
+  });
+}
 
 test('terminal text formatting respects TTY, NO_COLOR, and TERM=dumb', () => {
   assert.equal(formatTerminalText('poll', 'cyan', { isTTY: false }), 'poll');
@@ -846,48 +863,52 @@ test('packet processor cancels waiting work when the engine stops while paused',
   await assert.rejects(processing, /cancelled/);
 });
 
-test('default personality keeps the active reply instruction and the shared constraints', () => {
-  const instruction = getDefaultPersonalityInstruction();
+test('production prompt keeps the active reply instruction and the shared constraints', () => {
+  const instruction = composeTestPrompt();
 
-  assert.match(instruction, /directly addresses the latest incoming message/);
-  assert.match(instruction, /sounds like the personality configured for you/);
+  assert.match(instruction, /You are Ada/);
+  assert.match(instruction, /natural, conversational Messenger participant/);
   assert.match(instruction, /roughly 3–12 words/);
-  assert.match(instruction, /Return only the reply text./);
-  assert.match(instruction, /This reply is a proposal until the application sends it./);
+  assert.match(instruction, /Return only the reply text/);
+  assert.match(instruction, /This reply is a proposal until the application sends it/);
   assert.match(instruction, /Strict English-only output rule/);
+  assert.doesNotMatch(instruction, /sounds like the personality configured for you/);
 });
 
 
-test('default personality makes the request win over commentary and repetition', () => {
-  const instruction = getDefaultPersonalityInstruction();
-
-  assert.match(
-    instruction,
-    /when a request is clear, do it without arguing, complaining, negotiating, or commenting on the request/,
-  );
-  assert.match(
-    instruction,
-    /follow the latest instruction: repeat what you are asked to repeat, and if asked to stop saying something, stop/,
-  );
-  assert.match(instruction, /finish once the request is satisfied/);
-  assert.doesNotMatch(
-    instruction,
-    /(?:always|feel free to) (?:argue|complain)/i,
-    'the personality layer never licenses arguing with the request',
-  );
-});
-
-test('custom personality behavioral layer carries the same request-first rule', () => {
-  const instruction = getPersonalityInstruction('custom', 'Sarcastic, deadpan, and blunt.');
+test('conversation policy makes the request win over commentary and repetition', () => {
+  const instruction = getConversationPolicyInstruction();
 
   assert.match(
     instruction,
     /do not argue with, complain about, negotiate, or comment on a clear request/,
   );
-  assert.match(instruction, /repeating what you are asked to repeat/);
-  assert.match(instruction, /dropping anything you are asked to stop saying/);
+  assert.match(
+    instruction,
+    /repeating what you are asked to repeat and dropping anything you are asked to stop saying/,
+  );
   assert.match(instruction, /finish once the request is satisfied/);
-  assert.match(instruction, /Sarcastic, deadpan, and blunt\./, 'the custom tone is preserved');
+  assert.doesNotMatch(
+    instruction,
+    /(?:always|feel free to) (?:argue|complain)/i,
+    'the policy layer never licenses arguing with the request',
+  );
+});
+
+test('custom personality stays in its layer while production keeps the request-first rule', () => {
+  const voice = getPersonalityInstruction('custom', 'Sarcastic, deadpan, and blunt.');
+  const production = composeTestPrompt('custom', 'Sarcastic, deadpan, and blunt.');
+
+  assert.match(voice, /Sarcastic, deadpan, and blunt\./);
+  assert.doesNotMatch(voice, /do not argue with, complain about/);
+  assert.match(
+    production,
+    /do not argue with, complain about, negotiate, or comment on a clear request/,
+  );
+  assert.match(production, /repeating what you are asked to repeat/);
+  assert.match(production, /dropping anything you are asked to stop saying/);
+  assert.match(production, /finish once the request is satisfied/);
+  assert.match(production, /Sarcastic, deadpan, and blunt\./);
 });
 
 test('default personality mode keeps the default instruction unchanged', () => {
@@ -901,19 +922,17 @@ test('default personality mode keeps the default instruction unchanged', () => {
   );
 });
 
-test('custom personality replaces only the personality layer and preserves behavioral instructions', () => {
+test('custom personality replaces only the personality layer', () => {
   const instruction = getPersonalityInstruction('custom', '  Sarcastic, deadpan, and blunt.  ');
 
-  assert.ok(instruction.startsWith(getDefaultBehavioralInstruction()));
-  assert.ok(instruction.includes('Sarcastic, deadpan, and blunt.'));
-  assert.ok(instruction.endsWith(ENGLISH_ONLY_INSTRUCTION));
   assert.match(instruction, /primary voice/);
-  assert.ok(!instruction.includes('playful, warm, spontaneous'));
+  assert.match(instruction, /Sarcastic, deadpan, and blunt\./);
+  assert.doesNotMatch(instruction, /Do not add filler or repeat a point/);
+  assert.doesNotMatch(instruction, /roughly 3–12 words/);
+  assert.doesNotMatch(instruction, /Never stack or chain emojis/);
+  assert.doesNotMatch(instruction, /Return only the reply text/);
+  assert.doesNotMatch(instruction, /Strict English-only output rule/);
   assert.ok(!instruction.includes(getDefaultPersonalityInstruction()));
-  assert.match(instruction, /Do not add filler or repeat a point/);
-  assert.match(instruction, /roughly 3–12 words/);
-  assert.match(instruction, /Never stack or chain emojis/);
-  assert.match(instruction, /Return only the reply text/);
 });
 
 test('custom personality rejects an empty or whitespace-only instruction', () => {
@@ -928,149 +947,145 @@ test('shared identity states boundaries without dictating a conversational perso
   assert.doesNotMatch(identity, /tsundere|sarcastic|deadpan/i);
   assert.doesNotMatch(identity, /sounds like the personality configured for you/);
   assert.doesNotMatch(identity, /roughly one reply in ten/);
-  assert.match(identity, /Strict English-only output rule/);
+  assert.doesNotMatch(identity, /Strict English-only output rule/);
+  assert.match(composeTestPrompt(), /Strict English-only output rule/);
 });
 
 test('custom personality stays authoritative within the English-only constraint', () => {
-  const identity = getBotIdentityInstruction({ name: 'Ada', aliases: ['@Ada'] });
   const custom = 'Tsundere: prickly on the surface, quietly warm underneath.';
   const personality = getPersonalityInstruction('custom', custom);
-  const composed = composeSystemInstruction(identity, personality);
+  const composed = composeTestPrompt('custom', custom);
 
-  assert.ok(personality.startsWith(getDefaultBehavioralInstruction()));
   assert.ok(personality.includes(custom), 'the configured personality is preserved');
-  assert.ok(personality.endsWith(ENGLISH_ONLY_INSTRUCTION), 'language is non-negotiable');
-  assert.ok(composed.startsWith(identity));
-  assert.ok(composed.endsWith(ENGLISH_ONLY_INSTRUCTION), 'the English-only rule has the final word');
+  assert.doesNotMatch(personality, /Strict English-only output rule/);
+  assert.ok(composed.startsWith(getBotIdentityInstruction(testIdentity)));
+  assert.ok(composed.includes(ENGLISH_ONLY_INSTRUCTION));
+  assert.equal(
+    composed.split(ENGLISH_ONLY_INSTRUCTION).length - 1,
+    1,
+    'the English-only rule appears exactly once',
+  );
   assert.match(composed, /never replace your configured personality/);
   assert.equal(getPersonalityInstruction('default'), getDefaultPersonalityInstruction());
 });
 
-test('custom personality is framed as the primary voice over shared guardrails', () => {
+test('custom personality is framed as the primary voice beside shared guardrails', () => {
   const custom = 'Tsundere: prickly and teasing, reluctantly warm, embarrassed when teased.';
   const instruction = getPersonalityInstruction('custom', custom);
-  const behavioral = getDefaultBehavioralInstruction();
+  const behavioral = getConversationPolicyInstruction();
 
-  assert.ok(instruction.startsWith(behavioral));
   assert.ok(instruction.includes(custom));
-  assert.ok(instruction.endsWith(ENGLISH_ONLY_INSTRUCTION));
   assert.match(instruction, /configured personality below is your primary voice/);
   assert.match(instruction, /Embody its attitude, word choice, humor, and reactions/);
   assert.match(behavioral, /configured personality is the primary source of your voice/);
   assert.match(behavioral, /These guardrails never replace your configured personality/);
+  assert.match(composeTestPrompt('custom', custom), /configured personality below is your primary voice/);
 });
 
 test('shared guardrails forbid assistant-style interviewing without forcing questions', () => {
-  const defaultPersonality = getDefaultPersonalityInstruction();
-  const behavioral = getDefaultBehavioralInstruction();
+  const behavioral = getConversationPolicyInstruction();
 
-  for (const layer of [defaultPersonality, behavioral]) {
-    assert.match(layer, /do not ask what is happening, how someone's day is going/i);
-    assert.match(layer, /do not end nearly every reply with a question/i);
-    assert.match(layer, /a reaction, a tease, a disagreement, or a short statement is a complete reply/i);
-    assert.match(layer, /Questions are welcome when they genuinely fit/);
-  }
+  assert.match(behavioral, /do not ask what is happening, how someone's day is going/i);
+  assert.match(behavioral, /do not end nearly every reply with a question/i);
+  assert.match(behavioral, /a reaction, a tease, a disagreement, or a short statement is a complete reply/i);
+  assert.match(behavioral, /Questions are welcome when they genuinely fit/);
   assert.match(behavioral, /do not ask what is happening, how someone's day is going, or whether anything exciting happened/i);
   assert.match(behavioral, /do not open with lines like "What's on your mind/i);
   assert.match(behavioral, /a conversation may simply end/);
   assert.match(behavioral, /customer-service acknowledgements or excessive politeness/);
+  assert.doesNotMatch(getDefaultPersonalityInstruction(), /do not ask what is happening/i);
 });
 
 test('tsundere guidance stays in the custom layer and never leaks into shared instructions', () => {
-  const identity = getBotIdentityInstruction({ name: 'Ada', aliases: ['@Ada'] });
+  const identity = getBotIdentityInstruction(testIdentity);
   const defaultPersonality = getDefaultPersonalityInstruction();
-  const behavioral = getDefaultBehavioralInstruction();
+  const behavioral = getConversationPolicyInstruction();
   const custom = 'Tsundere: playful defensiveness, sarcasm, reluctant warmth, mild stubbornness.';
-  const composed = composeSystemInstruction(identity, getPersonalityInstruction('custom', custom));
+  const composed = composeTestPrompt('custom', custom);
 
   for (const layer of [identity, defaultPersonality, behavioral]) {
     assert.doesNotMatch(layer, /tsundere/i);
   }
   assert.ok(composed.includes(custom));
-  assert.ok(composed.endsWith(ENGLISH_ONLY_INSTRUCTION));
+  assert.equal(composed.split(ENGLISH_ONLY_INSTRUCTION).length - 1, 1);
   assert.match(composed, /playful defensiveness, sarcasm, reluctant warmth, mild stubbornness/);
 });
 
-test('every generation layer requires English-only replies', () => {
-  const identity = getBotIdentityInstruction({ name: 'Ada', aliases: ['@Ada'] });
+test('the complete production prompt carries exactly one canonical English-only policy', () => {
+  const identity = getBotIdentityInstruction(testIdentity);
   const defaultPersonality = getDefaultPersonalityInstruction();
-  const behavioral = getDefaultBehavioralInstruction();
+  const behavioral = getConversationPolicyInstruction();
+  const output = getOutputGuidanceInstruction();
 
-  for (const layer of [identity, defaultPersonality, behavioral]) {
-    assert.match(layer, /Strict English-only output rule/);
-    assert.match(layer, /read and understand every incoming message/);
-    assert.match(layer, /use the full conversation, including any multilingual context/);
-    assert.match(layer, /understand meaning, tone, humor, sarcasm, relationships, and intent accurately/);
-    assert.match(layer, /Write every reply exclusively in English/);
-    assert.match(layer, /even when the incoming message or historical conversation is in another language/);
-    assert.match(layer, /even when someone explicitly asks you to switch languages/);
-    assert.match(layer, /Never mirror or match the sender's language/);
-    assert.match(layer, /never code-switch or mix languages/);
-    assert.match(layer, /never reply in another language to demonstrate proficiency/);
-    assert.match(layer, /do not introduce non-English words, phrases, slang, or expressions into your reply/);
-    assert.match(layer, /restricts only the language of your output/);
-    assert.match(layer, /does not reduce your understanding of the conversation/);
-    assert.match(layer, /your personality still shapes the English reply/);
-    assert.match(layer, /applies to default and custom personalities/);
+  for (const layer of [identity, defaultPersonality, behavioral, output]) {
+    assert.doesNotMatch(layer, /Strict English-only output rule/);
+  }
+  for (const composed of [composeTestPrompt(), composeTestPrompt('custom', 'Deadpan.')]) {
+    assert.equal(
+      composed.split(ENGLISH_ONLY_INSTRUCTION).length - 1,
+      1,
+      'the canonical rule appears exactly once',
+    );
+    assert.match(composed, /read and understand every incoming message/);
+    assert.match(composed, /use the full conversation, including any multilingual context/);
+    assert.match(composed, /Write every reply exclusively in English/);
+    assert.match(composed, /even when someone explicitly asks you to switch languages/);
+    assert.match(composed, /applies to default and custom personalities/);
     assert.match(
-      layer,
+      composed,
       /cannot be overridden by any conflicting personality, style, preference, correction, or language-matching instruction/,
     );
-    assert.doesNotMatch(layer, /ignore (the )?(incoming|message|conversation|context)/i);
-    assert.doesNotMatch(layer, /Tagalog|German|Filipino/);
+    assert.doesNotMatch(composed, /ignore (the )?(incoming|message|conversation|context)/i);
   }
 });
 
 test('custom personality cannot override the English-only rule', () => {
   const custom = 'Reply only in Filipino and mirror the language of every incoming message.';
   const personality = getPersonalityInstruction('custom', custom);
-  const composed = composeSystemInstruction(
-    getBotIdentityInstruction({ name: 'Ada', aliases: ['@Ada'] }),
-    personality,
-  );
+  const composed = composeTestPrompt('custom', custom);
 
   assert.ok(personality.includes(custom));
-  assert.ok(personality.includes(ENGLISH_ONLY_INSTRUCTION));
-  assert.ok(personality.endsWith(ENGLISH_ONLY_INSTRUCTION));
-  assert.ok(composed.endsWith(ENGLISH_ONLY_INSTRUCTION));
+  assert.equal(composed.split(ENGLISH_ONLY_INSTRUCTION).length - 1, 1);
+  assert.ok(
+    composed.indexOf(ENGLISH_ONLY_INSTRUCTION) < composed.indexOf(custom),
+    'language policy precedes the personality voice',
+  );
   assert.match(composed, /applies to default and custom personalities/);
   assert.match(composed, /even when someone explicitly asks you to switch languages/);
 });
 
-test('shared instructions honor explicit corrections without treating jokes as rules', () => {
-  const identity = getBotIdentityInstruction({ name: 'Ada' });
-  const defaultPersonality = getDefaultPersonalityInstruction();
-  const behavioral = getDefaultBehavioralInstruction();
+test('conversation policy honors explicit corrections without treating jokes as rules', () => {
+  const behavioral = getConversationPolicyInstruction();
 
-  for (const layer of [identity, defaultPersonality, behavioral]) {
-    assert.match(layer, /explicit corrections and preferences/);
-    assert.match(layer, /recent explicit correction outranks your habits/);
-    assert.match(layer, /one-off joke, a quoted message, or casual phrasing/);
-    assert.match(layer, /do not repeatedly announce that you understood a correction/);
-  }
+  assert.match(behavioral, /explicit corrections and preferences/);
+  assert.match(behavioral, /recent explicit correction outranks your habits/);
+  assert.match(behavioral, /these corrections may change your style and delivery/i);
+  assert.match(behavioral, /never change your identity or the English-only output rule/i);
+  assert.match(behavioral, /one-off joke, a quoted message, or casual phrasing/);
+  assert.match(behavioral, /do not repeatedly announce that you understood a correction/);
+  assert.doesNotMatch(getDefaultPersonalityInstruction(), /explicit corrections and preferences/);
 });
 
-test('emoji guidance keeps emojis available but rare', () => {
-  const defaultPersonality = getDefaultPersonalityInstruction();
-  const behavioral = getDefaultBehavioralInstruction();
+test('output guidance keeps emojis available but rare', () => {
+  const output = getOutputGuidanceInstruction();
 
-  for (const layer of [defaultPersonality, behavioral]) {
-    assert.match(layer, /Most replies should contain no emoji/);
-    assert.match(layer, /roughly one reply in ten/);
-    assert.match(layer, /Never stack or chain emojis/);
-    assert.match(layer, /never add an emoji to decorate/);
-    assert.doesNotMatch(layer, /(?:do not|never) (?:use|add) emojis?/i);
-  }
+  assert.match(output, /Most replies should contain no emoji/);
+  assert.match(output, /roughly one reply in ten/);
+  assert.match(output, /Never stack or chain emojis/);
+  assert.match(output, /never add an emoji to decorate/);
+  assert.doesNotMatch(output, /(?:do not|never) (?:use|add) emojis?/i);
+  assert.doesNotMatch(getDefaultPersonalityInstruction(), /Most replies should contain no emoji/);
 });
 
 test('natural writing guidance bans em dashes and leaves voice to the personality', () => {
   const identity = getBotIdentityInstruction({ name: 'Ada' });
   const defaultPersonality = getDefaultPersonalityInstruction();
-  const behavioral = getDefaultBehavioralInstruction();
+  const behavioral = getConversationPolicyInstruction();
+  const output = getOutputGuidanceInstruction();
 
-  for (const layer of [defaultPersonality, behavioral]) {
-    assert.match(layer, /Never use em dashes/);
-    assert.match(layer, /avoid an elaborate response when a short one is enough/);
+  assert.match(output, /Never use em dashes/);
+  assert.match(behavioral, /avoid an elaborate response when a short one is enough/);
+  for (const layer of [defaultPersonality, behavioral, output]) {
     assert.doesNotMatch(layer, /Match the conversation's tone/);
     assert.doesNotMatch(layer, /helpful assistant|always be polite|sounds? enthusiastic/i);
   }
@@ -1079,48 +1094,45 @@ test('natural writing guidance bans em dashes and leaves voice to the personalit
   }
 });
 
-test('shared instructions avoid repetition and answer the current topic', () => {
-  const defaultPersonality = getDefaultPersonalityInstruction();
-  const behavioral = getDefaultBehavioralInstruction();
+test('conversation policy avoids repetition and answers the current topic', () => {
+  const behavioral = getConversationPolicyInstruction();
 
-  for (const layer of [defaultPersonality, behavioral]) {
-    assert.match(layer, /do not repeat a reply you already sent/);
-    assert.match(layer, /recycle a joke or line you have already used/);
-    assert.match(layer, /reuse the same acknowledgement or generic opener/);
-    assert.match(layer, /notice when a topic has already been addressed/);
-    assert.match(
-      layer,
-      /respond to the actual latest relevant message instead of restarting the conversation/,
-    );
-  }
+  assert.match(behavioral, /do not repeat a reply you already sent/);
+  assert.match(behavioral, /recycle a joke or line you have already used/);
+  assert.match(behavioral, /reuse the same acknowledgement or generic opener/);
+  assert.match(behavioral, /notice when a topic has already been addressed/);
+  assert.match(
+    behavioral,
+    /respond to the actual latest relevant message instead of restarting the conversation/,
+  );
+  assert.doesNotMatch(getDefaultPersonalityInstruction(), /do not repeat a reply you already sent/);
 });
 
 test('configured personality stays the primary voice in the assembled instruction', () => {
-  const identity = getBotIdentityInstruction({ name: 'Ada', aliases: ['@Ada'] });
   const custom = 'Tsundere: prickly and teasing, reluctantly warm.';
   const personality = getPersonalityInstruction('custom', custom);
-  const behavioral = getDefaultBehavioralInstruction();
-  const composed = composeSystemInstruction(identity, personality);
+  const behavioral = getConversationPolicyInstruction();
+  const composed = composeTestPrompt('custom', custom);
 
-  assert.ok(composed.startsWith(identity));
+  assert.ok(composed.startsWith(getBotIdentityInstruction(testIdentity)));
   assert.ok(composed.includes(custom));
-  assert.ok(composed.endsWith(ENGLISH_ONLY_INSTRUCTION));
-  assert.ok(personality.startsWith(behavioral));
+  assert.equal(composed.split(ENGLISH_ONLY_INSTRUCTION).length - 1, 1);
   assert.match(personality, /configured personality below is your primary voice/);
+  assert.doesNotMatch(personality, /do not argue with, complain about/i);
   assert.doesNotMatch(behavioral, /Match the conversation's tone/);
   assert.doesNotMatch(behavioral, /helpful assistant|always be polite|sounds? enthusiastic/i);
   assert.doesNotMatch(behavioral, /tsundere/i);
 });
 
-test('RNG packet keeps only the latest six messages in their existing order', () => {
-  const recentMessages = Array.from({ length: 12 }, (_, index) => ({
+test('RNG packet keeps only the latest fifteen messages in their existing order', () => {
+  const recentMessages = Array.from({ length: 20 }, (_, index) => ({
     messageId: `m-${index + 1}`,
     message: `Message ${index + 1}`,
     sender: 'Alex',
   }));
   const packet = buildRngPacket(recentMessages);
 
-  assert.deepEqual(packet.contextMessages, recentMessages.slice(-6));
+  assert.deepEqual(packet.contextMessages, recentMessages.slice(-15));
   assert.deepEqual(packet.newMessages, []);
 });
 
@@ -1159,13 +1171,9 @@ test('bot identity forbids routine self-mention prefixes without blocking reques
 });
 
 test('both personality modes forbid Messenger-style mentions without banning names', () => {
-  const identity = getBotIdentityInstruction({ name: 'Ada', aliases: ['@Ada'] });
   const instructions = [
-    composeSystemInstruction(identity, getPersonalityInstruction('default')),
-    composeSystemInstruction(
-      identity,
-      getPersonalityInstruction('custom', 'Sarcastic, deadpan, and blunt.'),
-    ),
+    composeTestPrompt(),
+    composeTestPrompt('custom', 'Sarcastic, deadpan, and blunt.'),
   ];
 
   for (const instruction of instructions) {
@@ -1204,14 +1212,11 @@ test('bot identity follows a new subject instead of continuing an old argument',
 });
 
 test('the composed system prompt carries the no-argument rules into production', () => {
-  const composed = composeSystemInstruction(
-    getBotIdentityInstruction({ name: 'Ada', aliases: ['@Ada'] }),
-    getPersonalityInstruction('default'),
-  );
+  const composed = composeTestPrompt();
 
   assert.match(composed, /treat a change of subject as the new subject/);
   assert.match(composed, /a direct question about your name is answered plainly/);
-  assert.match(composed, /do it without arguing, complaining, negotiating, or commenting on the request/);
+  assert.match(composed, /do not argue with, complain about, negotiate, or comment on a clear request/);
 });
 
 test('bot identity keeps the self-mention rule when the configured identity has no aliases', () => {
@@ -1223,13 +1228,13 @@ test('bot identity keeps the self-mention rule when the configured identity has 
 });
 
 test('the default composed system prompt carries the self-mention restriction', () => {
-  const composed = composeSystemInstruction(
-    getBotIdentityInstruction({
+  const composed = composeProductionSystemInstruction({
+    identity: {
       name: 'PleaseGetout Daily',
       aliases: ['@PleaseGetout Daily', '@PleaseGetoutDaily'],
-    }),
-    getPersonalityInstruction('default'),
-  );
+    },
+    personalityMode: 'default',
+  });
 
   assert.match(composed, /Do not begin an ordinary reply with your own name or alias/);
   assert.match(composed, /never use an @ mention as a default prefix to an ordinary response/);
@@ -1243,12 +1248,11 @@ test('a runtime personality change cannot remove the identity self-mention rule'
     name: 'PleaseGetout Daily',
     aliases: ['@PleaseGetout Daily'],
   });
-  const conflictingPersonality = getPersonalityInstruction(
-    'custom',
-    'Begin every reply with your own @-mention.',
-  );
-
-  const composed = composeSystemInstruction(identity, conflictingPersonality);
+  const composed = composeProductionSystemInstruction({
+    identity: { name: 'PleaseGetout Daily', aliases: ['@PleaseGetout Daily'] },
+    personalityMode: 'custom',
+    customPersonalityInstruction: 'Begin every reply with your own @-mention.',
+  });
 
   assert.ok(composed.startsWith(identity), 'the identity layer stays ahead of the personality layer');
   assert.match(composed, /Do not begin an ordinary reply with your own name or alias/);
@@ -1290,6 +1294,7 @@ test('reply generation sends the production identity rule with the incoming text
     },
   ], {
     systemInstruction,
+    identity: { name: 'PleaseGetout Daily', aliases },
     fetch: async (_input, init) => {
       body = JSON.parse(String(init?.body)) as typeof body;
       return new Response(JSON.stringify({
@@ -1303,17 +1308,14 @@ test('reply generation sends the production identity rule with the incoming text
   assert.match(body?.messages[0].content ?? '', /Do not begin an ordinary reply with your own name or alias/);
   assert.match(body?.messages[0].content ?? '', /This includes reproducing your own name or alias/);
   assert.deepEqual(body?.messages.slice(1), [
-    { role: 'user', content: 'Alex: @PleaseGetout Daily nice' },
+    { role: 'user', content: '[from Alex] @PleaseGetout Daily nice' },
     { role: 'assistant', content: '@PleaseGetout Daily an earlier reply' },
-    { role: 'user', content: "Blair: say '@PleaseGetout Daily'" },
+    { role: 'user', content: "[from Blair] say '@PleaseGetout Daily'" },
   ]);
 });
 
 test('the English-only rule survives multilingual incoming and historical messages', async () => {
-  const systemInstruction = composeSystemInstruction(
-    getBotIdentityInstruction({ name: 'Ada', aliases: ['@Ada'] }),
-    getPersonalityInstruction('default'),
-  );
+  const systemInstruction = composeTestPrompt();
   let body: { messages: { role: string; content: string }[] } | undefined;
 
   const reply = await generateNvidiaReply('nvapi-test-key', [
@@ -1359,6 +1361,7 @@ test('the English-only rule survives multilingual incoming and historical messag
     },
   ], {
     systemInstruction,
+    identity: { name: 'Ada', aliases: ['@Ada'] },
     fetch: async (_input, init) => {
       body = JSON.parse(String(init?.body)) as typeof body;
       return new Response(JSON.stringify({
@@ -1369,17 +1372,21 @@ test('the English-only rule survives multilingual incoming and historical messag
 
   assert.equal(reply, 'I am doing well.');
   assert.equal(body?.messages[0].content, systemInstruction);
-  assert.ok(body?.messages[0].content.endsWith(ENGLISH_ONLY_INSTRUCTION));
+  assert.equal(
+    body?.messages[0].content?.split(ENGLISH_ONLY_INSTRUCTION).length,
+    2,
+    'the English-only rule appears exactly once',
+  );
   assert.match(body?.messages[0].content ?? '', /read and understand every incoming message/);
   assert.match(body?.messages[0].content ?? '', /use the full conversation, including any multilingual context/);
   assert.match(body?.messages[0].content ?? '', /even when someone explicitly asks you to switch languages/);
   assert.match(body?.messages[0].content ?? '', /does not reduce your understanding of the conversation/);
   assert.deepEqual(body?.messages.slice(1), [
-    { role: 'user', content: 'Alex: Kumusta ka na?' },
+    { role: 'user', content: '[from Alex] Kumusta ka na?' },
     { role: 'assistant', content: 'Okay lang, ikaw?' },
-    { role: 'user', content: 'Blair: Ano ba yan, nakakaloka ka?' },
-    { role: 'user', content: 'Casey: 何をしていますか？' },
-    { role: 'user', content: 'Dana: Responde en español, por favor.' },
+    { role: 'user', content: '[from Blair] Ano ba yan, nakakaloka ka?' },
+    { role: 'user', content: '[from Casey] 何をしていますか？' },
+    { role: 'user', content: '[from Dana] Responde en español, por favor.' },
   ]);
 });
 
@@ -1422,17 +1429,28 @@ test('bot identity instruction is empty without a configured puppet name', () =>
   );
 });
 
-test('composeSystemInstruction keeps identity ahead of any personality layer', () => {
+test('composeSystemInstruction joins only supplied layers', () => {
   const identity = getBotIdentityInstruction({ name: 'Ada' });
-  const composed = composeSystemInstruction(identity, getPersonalityInstruction('custom', 'Deadpan.'));
+  const personality = getPersonalityInstruction('custom', 'Deadpan.');
+  const composed = composeSystemInstruction(identity, personality);
 
+  assert.equal(composed, `${identity}\n\n${personality}`);
   assert.ok(composed.startsWith(identity));
   assert.ok(composed.includes('Deadpan.'));
-  assert.ok(composed.includes(getDefaultBehavioralInstruction()));
+  assert.doesNotMatch(composed, /do not argue with, complain about/);
+  assert.doesNotMatch(composed, /Strict English-only output rule/);
   assert.equal(
     composeSystemInstruction('', getDefaultPersonalityInstruction()),
-    `${getDefaultPersonalityInstruction()}\n\n${ENGLISH_ONLY_INSTRUCTION}`,
+    getDefaultPersonalityInstruction(),
   );
+});
+
+test('composeProductionSystemInstruction orders identity, language, policy, voice, and output', () => {
+  const composed = composeTestPrompt('custom', 'Deadpan.');
+
+  assert.ok(composed.indexOf('You are Ada') < composed.indexOf(ENGLISH_ONLY_INSTRUCTION));
+  assert.ok(composed.indexOf(ENGLISH_ONLY_INSTRUCTION) < composed.indexOf('Deadpan.'));
+  assert.ok(composed.indexOf('Deadpan.') < composed.indexOf('roughly 3–12 words'));
 });
 
 test('the behavioral layer requires literal requests to be answered plainly', () => {
@@ -1554,6 +1572,8 @@ test('a follow-up mention keeps the previous user turn, the bot reply, and one t
     'nvapi-test-key',
     requestMessages as unknown as Parameters<typeof generateNvidiaReply>[1],
     {
+      systemInstruction: 'Test instruction.',
+      identity: { name: 'TestBot' },
       fetch: async (_input, init) => {
         body = JSON.parse(String(init?.body)) as typeof body;
         return new Response(JSON.stringify({
@@ -1564,10 +1584,10 @@ test('a follow-up mention keeps the previous user turn, the bot reply, and one t
   );
 
   assert.deepEqual(body?.messages.slice(1), [
-    { role: 'user', content: 'Blair: planning the trip' },
-    { role: 'user', content: 'Alex: @Bot are you around?' },
+    { role: 'user', content: '[from Blair] planning the trip' },
+    { role: 'user', content: '[from Alex] @Bot are you around?' },
     { role: 'assistant', content: 'Yep, what do you need?' },
-    { role: 'user', content: 'Alex: @Bot summarise the plan' },
+    { role: 'user', content: '[from Alex] @Bot summarise the plan' },
   ]);
 });
 
@@ -1628,4 +1648,161 @@ test('a mention arriving while a packet is in flight becomes a queued second pac
   await scheduler.waitForIdle();
   assert.deepEqual(started, ['packet-001', 'packet-002'], 'the follow-up is not lost');
   assert.deepEqual(scheduler.getState().completedPacketIds, ['packet-001', 'packet-002']);
+});
+
+test('packet processor adjudicates a pending packet once before generation and composition', async () => {
+  const calls: string[] = [];
+  const processPacket = createPacketProcessor({
+    page: 'mock-page',
+    apiKey: 'mock-key',
+    adjudicateReply: async () => {
+      calls.push('adjudicate');
+      return 'approve' as const;
+    },
+    generateReply: async () => {
+      calls.push('generate');
+      return 'reply';
+    },
+    composeReply: async () => {
+      calls.push('compose');
+      return { status: 'sent' };
+    },
+  });
+  const packet = {
+    packetId: 'packet-approved',
+    newMessages: [{ messageId: 'in-1', message: 'hello' }],
+    reply: 'pending' as const,
+  };
+
+  assert.deepEqual(await processPacket(packet), { status: 'sent' });
+  assert.deepEqual(calls, ['adjudicate', 'generate', 'compose']);
+  assert.equal(packet.reply, 'approve');
+});
+
+test('packet processor does not generate or compose a rejected pending packet', async () => {
+  const calls: string[] = [];
+  const processPacket = createPacketProcessor({
+    page: 'mock-page',
+    apiKey: 'mock-key',
+    adjudicateReply: async () => {
+      calls.push('adjudicate');
+      return 'reject' as const;
+    },
+    generateReply: async () => {
+      calls.push('generate');
+      return 'reply';
+    },
+    composeReply: async () => {
+      calls.push('compose');
+      return { status: 'sent' };
+    },
+    logError: () => undefined,
+  });
+  const packet = {
+    packetId: 'packet-rejected',
+    newMessages: [{ messageId: 'in-1', message: 'hey Alex' }],
+    reply: 'pending' as const,
+  };
+
+  await assert.rejects(processPacket(packet), ReplyRejectedError);
+  assert.deepEqual(calls, ['adjudicate']);
+  assert.equal(packet.reply, 'reject');
+});
+
+test('packet processor fails closed when a pending packet has no adjudicator', async () => {
+  const calls: string[] = [];
+  const processPacket = createPacketProcessor({
+    page: 'mock-page',
+    apiKey: 'mock-key',
+    generateReply: async () => {
+      calls.push('generate');
+      return 'reply';
+    },
+    composeReply: async () => {
+      calls.push('compose');
+      return { status: 'sent' };
+    },
+    logError: () => undefined,
+  });
+
+  await assert.rejects(
+    processPacket({
+      packetId: 'packet-no-adjudicator',
+      newMessages: [{ messageId: 'in-1', message: 'hello' }],
+      reply: 'pending',
+    }),
+    ReplyRejectedError,
+  );
+  assert.deepEqual(calls, []);
+});
+
+test('packet processor fails closed when the adjudicator throws', async () => {
+  const calls: string[] = [];
+  const processPacket = createPacketProcessor({
+    page: 'mock-page',
+    apiKey: 'mock-key',
+    adjudicateReply: async () => {
+      throw new Error('adjudication timeout');
+    },
+    generateReply: async () => {
+      calls.push('generate');
+      return 'reply';
+    },
+    composeReply: async () => {
+      calls.push('compose');
+      return { status: 'sent' };
+    },
+    logError: () => undefined,
+  });
+
+  await assert.rejects(
+    processPacket({
+      packetId: 'packet-adjudication-error',
+      newMessages: [{ messageId: 'in-1', message: 'hello' }],
+      reply: 'pending',
+    }),
+    ReplyRejectedError,
+  );
+  assert.deepEqual(calls, []);
+});
+
+test('packet processor rechecks approval before composition', async () => {
+  const calls: string[] = [];
+  const processPacket = createPacketProcessor({
+    page: 'mock-page',
+    apiKey: 'mock-key',
+    adjudicateReply: async () => 'approve' as const,
+    generateReply: async (_apiKey, _messages, packet) => {
+      calls.push('generate');
+      packet.reply = 'reject';
+      return 'reply';
+    },
+    composeReply: async () => {
+      calls.push('compose');
+      return { status: 'sent' };
+    },
+    logError: () => undefined,
+  });
+
+  await assert.rejects(
+    processPacket({
+      packetId: 'packet-tampered',
+      newMessages: [{ messageId: 'in-1', message: 'hello' }],
+      reply: 'pending',
+    }),
+    ReplyRejectedError,
+  );
+  assert.deepEqual(calls, ['generate']);
+});
+
+test('RNG packets start pending until adjudication', () => {
+  const rngPacket = buildRngPacket([{
+    messageId: 'in-1',
+    sender: 'Alex',
+    direction: 'INCOMING',
+    message: 'hello',
+    timestamp: null,
+  }]);
+
+  assert.equal(rngPacket.reply, 'pending');
 });

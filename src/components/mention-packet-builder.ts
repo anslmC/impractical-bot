@@ -1,3 +1,5 @@
+import type { ReplyDecision } from './reply-adjudication.js';
+
 export interface PacketBuilderMessage {
   messageId: string;
   message: string;
@@ -11,6 +13,7 @@ export interface PacketBuilderPacket {
   newMessages: PacketBuilderMessage[];
   mentionMessages: PacketBuilderMessage[];
   contextMessages: PacketBuilderMessage[];
+  reply: ReplyDecision;
 }
 
 export interface PacketBuilderState {
@@ -165,6 +168,7 @@ export function buildPacketTurn({
       contextMessages: [...contextById.values()]
         .slice(contextLimit === undefined ? 0 : -contextLimit)
         .map(message => ({ ...message })),
+      reply: 'pending',
     };
     nextPacketNumber += 1;
   }

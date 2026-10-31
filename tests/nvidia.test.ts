@@ -6,13 +6,23 @@ import { test, type TestContext } from 'node:test';
 import {
   loadNvidiaApiKey,
   NvidiaApiKeyError,
+  NvidiaIdentityError,
   NvidiaRequestError,
+  adjudicateNvidiaReply,
   generateNvidiaReply,
   resolveNvidiaEnvironmentPath,
   saveNvidiaApiKey,
   validateNvidiaApiKey,
 } from '../src/ai/nvidia.js';
-import { ENGLISH_ONLY_INSTRUCTION } from '../src/components/personality.js';
+import {
+  ENGLISH_ONLY_INSTRUCTION,
+  ENGLISH_ONLY_RETRY_INSTRUCTION,
+} from '../src/components/english-only.js';
+import { IDENTITY_RETRY_INSTRUCTION } from '../src/components/identity-policy.js';
+import {
+  generateReplyWithAntiEchoGuard,
+  isEchoReply,
+} from '../src/components/anti-echo.js';
 
 function createEnvironmentPath(context: TestContext): string {
   const directory = mkdtempSync(join(tmpdir(), 'impractical-bot-nvidia-'));
@@ -24,6 +34,18 @@ function successfulCompletion(content = 'O'): Response {
   return new Response(JSON.stringify({
     choices: [{ message: { role: 'assistant', content } }],
   }), { status: 200 });
+}
+
+function generateTestReply(
+  apiKey: string,
+  messages: Parameters<typeof generateNvidiaReply>[1],
+  options: Partial<Parameters<typeof generateNvidiaReply>[2]> = {},
+): Promise<string> {
+  return generateNvidiaReply(apiKey, messages, {
+    systemInstruction: 'Test system instruction.',
+    identity: { name: 'TestBot' },
+    ...options,
+  });
 }
 
 function messengerMessage(
@@ -125,7 +147,7 @@ test('reply generation sends known-direction messages in order and extracts trim
   let requestedUrl = '';
   let requestedOptions: RequestInit | undefined;
 
-  const reply = await generateNvidiaReply('nvapi-test-key', [{
+  const reply = await generateTestReply('nvapi-test-key', [{
     id: 'incoming-1',
     timestamp: { original: null, normalized: null, resolved: false },
     sender: 'Alex',
@@ -174,31 +196,22 @@ test('reply generation sends known-direction messages in order and extracts trim
     messages: [
       {
         role: 'system',
-        content: 'Write a short, natural Messenger reply that matches the conversation\'s tone and directly addresses the latest incoming message. Aim for roughly 3–12 words when appropriate, but do not force an exact word count; use more words when needed for a natural answer. ' + ENGLISH_ONLY_INSTRUCTION + ' Avoid Messenger-style @participant mentions and address people by their ordinary names without an @ prefix. Avoid unsolicited email copy, calls to action, headings, labels, and unrelated prefixes such as "Verse 3.1". Return only the reply text. This reply is a proposal until the application sends it.',
+        content: 'Test system instruction.',
       },
-      { role: 'user', content: 'Alex: Are you free tomorrow?' },
+      { role: 'user', content: '[from Alex] Are you free tomorrow?' },
       { role: 'assistant', content: 'I think so.' },
-      { role: 'user', content: 'Blair: Great, what time works?' },
+      { role: 'user', content: '[from Blair] Great, what time works?' },
     ],
     chat_template_kwargs: { enable_thinking: false },
     max_tokens: 256,
     stream: false,
   });
-  const fallbackInstruction = String(body.messages[0].content);
-  assert.match(fallbackInstruction, /Strict English-only output rule/);
-  assert.match(fallbackInstruction, /read and understand every incoming message/);
-  assert.match(fallbackInstruction, /use the full conversation, including any multilingual context/);
-  assert.match(fallbackInstruction, /even when someone explicitly asks you to switch languages/);
-  assert.match(fallbackInstruction, /do not introduce non-English words, phrases, slang, or expressions into your reply/);
-  assert.match(fallbackInstruction, /restricts only the language of your output/);
-  assert.match(fallbackInstruction, /does not reduce your understanding of the conversation/);
-  assert.ok(fallbackInstruction.includes(ENGLISH_ONLY_INSTRUCTION));
 });
 
 test('reply generation uses a supplied system instruction before conversation messages', async () => {
   let requestedOptions: RequestInit | undefined;
 
-  await generateNvidiaReply('nvapi-test-key', [{
+  await generateTestReply('nvapi-test-key', [{
     id: 'incoming-1',
     timestamp: { original: null, normalized: null, resolved: false },
     sender: 'Alex',
@@ -216,7 +229,7 @@ test('reply generation uses a supplied system instruction before conversation me
   const body = JSON.parse(String(requestedOptions?.body));
   assert.deepEqual(body.messages, [
     { role: 'system', content: 'Supplied instruction.' },
-    { role: 'user', content: 'Alex: Hello.' },
+    { role: 'user', content: '[from Alex] Hello.' },
   ]);
 });
 
@@ -224,7 +237,7 @@ test('a non-English reply is retried without dropping multilingual context', asy
   const bodies: { messages: { role: string; content: string }[] }[] = [];
   let call = 0;
 
-  const reply = await generateNvidiaReply('nvapi-test-key', [{
+  const reply = await generateTestReply('nvapi-test-key', [{
     id: 'incoming-1',
     timestamp: { original: null, normalized: null, resolved: false },
     sender: 'Alex',
@@ -259,24 +272,29 @@ test('a non-English reply is retried without dropping multilingual context', asy
   assert.equal(call, 2, 'the rejected reply is retried exactly once');
   assert.equal(reply, 'I hear you. What are you actually asking?');
   assert.deepEqual(bodies[0].messages.slice(1), [
-    { role: 'user', content: 'Alex: dont speak atagalog' },
+    { role: 'user', content: '[from Alex] dont speak atagalog' },
     {
       role: 'assistant',
       content: 'Okay lang naman yan. :p Ang sagot ko ay nakapag-alam ka naman...',
     },
-    { role: 'user', content: 'Blair: Ano ba yan, nakakaloka ka?' },
+    { role: 'user', content: '[from Blair] Ano ba yan, nakakaloka ka?' },
   ]);
   assert.deepEqual(bodies[1].messages.slice(1), bodies[0].messages.slice(1));
   assert.match(bodies[1].messages[0].content, /previous proposed reply was rejected/);
   assert.match(bodies[1].messages[0].content, /not written entirely in English/);
-  assert.ok(bodies[1].messages[0].content.endsWith(ENGLISH_ONLY_INSTRUCTION));
+  assert.ok(bodies[1].messages[0].content.endsWith(ENGLISH_ONLY_RETRY_INSTRUCTION));
+  assert.equal(
+    bodies[1].messages[0].content.split(ENGLISH_ONLY_INSTRUCTION).length - 1,
+    0,
+    'the retry does not duplicate the canonical policy when the caller did not supply it',
+  );
 });
 
 test('a persistently non-English reply is suppressed instead of sent', async () => {
   let call = 0;
 
   await assert.rejects(
-    generateNvidiaReply('nvapi-test-key', [{
+    generateTestReply('nvapi-test-key', [{
       id: 'incoming-1',
       timestamp: { original: null, normalized: null, resolved: false },
       sender: 'Alex',
@@ -294,10 +312,160 @@ test('a persistently non-English reply is suppressed instead of sent', async () 
   assert.equal(call, 2, 'there is no unbounded retry loop');
 });
 
+test('an invalid identity is retried once with the identity correction', async () => {
+  const bodies: { messages: { role: string; content: string }[] }[] = [];
+  let call = 0;
+
+  const reply = await generateTestReply('nvapi-test-key', [{
+    id: 'incoming-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Alex',
+    direction: 'INCOMING',
+    message: 'who are you?',
+    ariaLabel: null,
+  }], {
+    systemInstruction: 'Production instruction.',
+    identity: { name: 'Yukinon', aliases: ['@Yukinon', 'Yuki'] },
+    fetch: async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as typeof bodies[number]);
+      call += 1;
+      return call === 1
+        ? successfulCompletion('I am Nemotron.')
+        : successfulCompletion('I am Yukinon.');
+    },
+  });
+
+  assert.equal(call, 2, 'the rejected identity is retried exactly once');
+  assert.equal(reply, 'I am Yukinon.');
+  assert.ok(bodies[1].messages[0].content.startsWith('Production instruction.'));
+  assert.ok(bodies[1].messages[0].content.endsWith(IDENTITY_RETRY_INSTRUCTION));
+  assert.equal(
+    bodies[1].messages[0].content.split(IDENTITY_RETRY_INSTRUCTION).length - 1,
+    1,
+  );
+});
+
+test('a persistently invalid identity is withheld instead of sent', async () => {
+  let call = 0;
+
+  await assert.rejects(
+    generateTestReply('nvapi-test-key', [{
+      id: 'incoming-1',
+      timestamp: { original: null, normalized: null, resolved: false },
+      sender: 'Alex',
+      direction: 'INCOMING',
+      message: 'who are you?',
+      ariaLabel: null,
+    }], {
+      identity: { name: 'Yukinon' },
+      fetch: async () => {
+        call += 1;
+        return successfulCompletion('I am ChatGPT.');
+      },
+    }),
+    error => {
+      assert.ok(error instanceof NvidiaIdentityError);
+      assert.equal(error.reason, 'provider-model-identity');
+      return true;
+    },
+  );
+  assert.equal(call, 2, 'there is no unbounded identity retry loop');
+});
+
+test('language and identity violations share one bounded corrective retry', async () => {
+  const bodies: { messages: { role: string; content: string }[] }[] = [];
+  let call = 0;
+
+  const reply = await generateTestReply('nvapi-test-key', [{
+    id: 'incoming-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Alex',
+    direction: 'INCOMING',
+    message: 'sino ka?',
+    ariaLabel: null,
+  }], {
+    systemInstruction: 'Production instruction.',
+    identity: { name: 'Yukinon' },
+    fetch: async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as typeof bodies[number]);
+      call += 1;
+      return call === 1
+        ? successfulCompletion('I am Nemotron, ang AI model na tumutulong sa iyo.')
+        : successfulCompletion('I am Yukinon.');
+    },
+  });
+
+  assert.equal(call, 2, 'both violations are corrected in a single retry');
+  assert.equal(reply, 'I am Yukinon.');
+  const retryInstruction = bodies[1].messages[0].content;
+  assert.ok(retryInstruction.includes(ENGLISH_ONLY_RETRY_INSTRUCTION));
+  assert.ok(retryInstruction.includes(IDENTITY_RETRY_INSTRUCTION));
+});
+
+test('generation requires a complete system instruction and a configured identity', async () => {
+  const messages = [{
+    id: 'incoming-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Alex',
+    direction: 'INCOMING' as const,
+    message: 'hello',
+    ariaLabel: null,
+  }];
+
+  await assert.rejects(
+    generateNvidiaReply('nvapi-test-key', messages, {
+      systemInstruction: '   ',
+      identity: { name: 'Yukinon' },
+      fetch: async () => successfulCompletion('hi'),
+    }),
+    /complete system instruction is required/,
+  );
+  await assert.rejects(
+    generateNvidiaReply('nvapi-test-key', messages, {
+      systemInstruction: 'Production instruction.',
+      identity: { name: '   ' },
+      fetch: async () => successfulCompletion('hi'),
+    }),
+    /configured bot identity is required/,
+  );
+});
+
+test('the combined validation and anti-echo path makes at most four completion calls', async () => {
+  const tagalog = 'Hear you? Opo, talo na ako sa\'yo ng tanong. Ano ba talaga ng bigay mo? :p';
+  const replies = [tagalog, 'what', tagalog, 'nothing much'];
+  let call = 0;
+
+  const result = await generateReplyWithAntiEchoGuard({
+    generate: ({ retry }) => generateTestReply('nvapi-test-key', [{
+      id: 'incoming-1',
+      timestamp: { original: null, normalized: null, resolved: false },
+      sender: 'Alex',
+      direction: 'INCOMING',
+      message: 'what',
+      ariaLabel: null,
+    }], {
+      systemInstruction: retry ? 'Production instruction with anti-echo.' : 'Production instruction.',
+      identity: { name: 'Yukinon' },
+      fetch: async () => {
+        const content = replies[call] ?? 'unexpected extra call';
+        call += 1;
+        return successfulCompletion(content);
+      },
+    }),
+    isEcho: reply => isEchoReply(reply, 'what'),
+  });
+
+  assert.equal(call, 4, 'two bounded corrections leave four calls as the maximum');
+  assert.equal(result.status, 'accepted');
+  if (result.status === 'accepted') {
+    assert.equal(result.reply, 'nothing much');
+  }
+});
+
 test('reply generation keeps one API turn per Messenger message and ends with the incoming turn', async () => {
   let requestedOptions: RequestInit | undefined;
 
-  await generateNvidiaReply('nvapi-test-key', [{
+  await generateTestReply('nvapi-test-key', [{
     id: 'incoming-1',
     timestamp: { original: null, normalized: null, resolved: false },
     sender: 'Alex',
@@ -341,18 +509,18 @@ test('reply generation keeps one API turn per Messenger message and ends with th
 
   const body = JSON.parse(String(requestedOptions?.body));
   assert.deepEqual(body.messages.slice(1), [
-    { role: 'user', content: 'Alex: First incoming.' },
-    { role: 'user', content: 'Blair: Second incoming.' },
+    { role: 'user', content: '[from Alex] First incoming.' },
+    { role: 'user', content: '[from Blair] Second incoming.' },
     { role: 'assistant', content: 'First outgoing.' },
     { role: 'assistant', content: 'Second outgoing.' },
-    { role: 'user', content: 'Casey: Latest incoming.' },
+    { role: 'user', content: '[from Casey] Latest incoming.' },
   ]);
 });
 
 test('reply generation drops assistant turns that trail the latest incoming message', async () => {
   let requestedOptions: RequestInit | undefined;
 
-  await generateNvidiaReply('nvapi-test-key', [{
+  await generateTestReply('nvapi-test-key', [{
     id: 'incoming-1',
     timestamp: { original: null, normalized: null, resolved: false },
     sender: 'Alex',
@@ -375,7 +543,7 @@ test('reply generation drops assistant turns that trail the latest incoming mess
 
   const body = JSON.parse(String(requestedOptions?.body));
   assert.deepEqual(body.messages.slice(1), [
-    { role: 'user', content: 'Alex: Can you check this?' },
+    { role: 'user', content: '[from Alex] Can you check this?' },
   ]);
 });
 
@@ -394,7 +562,7 @@ test('reply generation bounds stale assistant history while keeping every user t
   ]).flat();
   const latest = messengerMessage('in-new', 'Blair', 'INCOMING', 'what time is the match?');
 
-  await generateNvidiaReply('nvapi-test-key', [...context, latest], {
+  await generateTestReply('nvapi-test-key', [...context, latest], {
     fetch: async (_input, init) => {
       requestedOptions = init;
       return successfulCompletion('Eight, I think.');
@@ -420,21 +588,21 @@ test('reply generation bounds stale assistant history while keeping every user t
   assert.deepEqual(
     turns.filter(turn => turn.role === 'user').map(turn => turn.content),
     [
-      'Alex: say your name (1)',
-      'Alex: say your name (2)',
-      'Alex: say your name (3)',
-      'Alex: say your name (4)',
-      'Alex: say your name (5)',
-      'Alex: say your name (6)',
-      'Alex: say your name (7)',
-      'Alex: say your name (8)',
-      'Blair: what time is the match?',
+      '[from Alex] say your name (1)',
+      '[from Alex] say your name (2)',
+      '[from Alex] say your name (3)',
+      '[from Alex] say your name (4)',
+      '[from Alex] say your name (5)',
+      '[from Alex] say your name (6)',
+      '[from Alex] say your name (7)',
+      '[from Alex] say your name (8)',
+      '[from Blair] what time is the match?',
     ],
     'every human instruction is kept, in chronological order, with its sender',
   );
   assert.deepEqual(turns.at(-1), {
     role: 'user',
-    content: 'Blair: what time is the match?',
+    content: '[from Blair] what time is the match?',
   });
   assert.equal(
     turns.filter(turn => turn.content.includes('what time is the match?')).length,
@@ -451,7 +619,7 @@ test('reply generation bounds stale assistant history while keeping every user t
 test('reply generation keeps the reply that contextualizes the latest message', async () => {
   let requestedOptions: RequestInit | undefined;
 
-  await generateNvidiaReply('nvapi-test-key', [
+  await generateTestReply('nvapi-test-key', [
     messengerMessage('in-1', 'Alex', 'INCOMING', 'book the 7pm table'),
     messengerMessage('out-1', 'You', 'OUTGOING', 'Booked for 7pm.'),
     messengerMessage('in-2', 'Blair', 'INCOMING', 'and the taxi?'),
@@ -464,16 +632,16 @@ test('reply generation keeps the reply that contextualizes the latest message', 
 
   const body = JSON.parse(String(requestedOptions?.body));
   assert.deepEqual(body.messages.slice(1), [
-    { role: 'user', content: 'Alex: book the 7pm table' },
+    { role: 'user', content: '[from Alex] book the 7pm table' },
     { role: 'assistant', content: 'Booked for 7pm.' },
-    { role: 'user', content: 'Blair: and the taxi?' },
+    { role: 'user', content: '[from Blair] and the taxi?' },
   ]);
 });
 
 test('reply generation drops a participant speaker label from assistant history', async () => {
   let requestedOptions: RequestInit | undefined;
 
-  await generateNvidiaReply('nvapi-test-key', [
+  await generateTestReply('nvapi-test-key', [
     messengerMessage('in-1', 'Anselmo', 'INCOMING', 'you the grumpy one lmao'),
     messengerMessage('out-1', 'You', 'OUTGOING', 'Anselmo: whatever you say kid, keep dreaming'),
     messengerMessage('out-2', 'You', 'OUTGOING', 'You have no taste, Anselmo.'),
@@ -487,10 +655,10 @@ test('reply generation drops a participant speaker label from assistant history'
 
   const body = JSON.parse(String(requestedOptions?.body));
   assert.deepEqual(body.messages.slice(1), [
-    { role: 'user', content: 'Anselmo: you the grumpy one lmao' },
+    { role: 'user', content: '[from Anselmo] you the grumpy one lmao' },
     { role: 'assistant', content: 'whatever you say kid, keep dreaming' },
     { role: 'assistant', content: 'You have no taste, Anselmo.' },
-    { role: 'user', content: 'Anselmo: ok whatever' },
+    { role: 'user', content: '[from Anselmo] ok whatever' },
   ]);
 });
 
@@ -498,7 +666,7 @@ test('reply generation preserves the literal trigger and attributes prior bot ou
   let requestedOptions: RequestInit | undefined;
   const literalRequest = "say the word '@PleaseGetout Daily'";
 
-  await generateNvidiaReply('nvapi-test-key', [{
+  await generateTestReply('nvapi-test-key', [{
     id: 'incoming-1',
     timestamp: { original: null, normalized: null, resolved: false },
     sender: 'Alex',
@@ -528,9 +696,9 @@ test('reply generation preserves the literal trigger and attributes prior bot ou
 
   const body = JSON.parse(String(requestedOptions?.body));
   assert.deepEqual(body.messages.slice(1), [
-    { role: 'user', content: 'Alex: hey' },
+    { role: 'user', content: '[from Alex] hey' },
     { role: 'assistant', content: 'Hey, what is up?' },
-    { role: 'user', content: `Blair: ${literalRequest}` },
+    { role: 'user', content: `[from Blair] ${literalRequest}` },
   ]);
   assert.equal(
     body.messages.filter((message: { content: string }) =>
@@ -558,7 +726,7 @@ test('reply generation includes every message once and never repeats the latest 
     ariaLabel: null,
   }];
 
-  await generateNvidiaReply('nvapi-test-key', messages, {
+  await generateTestReply('nvapi-test-key', messages, {
     fetch: async (_input, init) => {
       requestedOptions = init;
       return successfulCompletion('ok');
@@ -567,15 +735,15 @@ test('reply generation includes every message once and never repeats the latest 
 
   const body = JSON.parse(String(requestedOptions?.body));
   assert.deepEqual(body.messages.slice(1), [
-    { role: 'user', content: 'Alex: same text' },
-    { role: 'user', content: 'Blair: same text' },
+    { role: 'user', content: '[from Alex] same text' },
+    { role: 'user', content: '[from Blair] same text' },
   ]);
 });
 
 test('reply generation omits the sender prefix when the sender is unknown', async () => {
   let requestedOptions: RequestInit | undefined;
 
-  await generateNvidiaReply('nvapi-test-key', [{
+  await generateTestReply('nvapi-test-key', [{
     id: 'incoming-1',
     timestamp: { original: null, normalized: null, resolved: false },
     sender: 'UNKNOWN',
@@ -603,7 +771,7 @@ test('reply generation rejects when no known-direction non-empty context is avai
   };
 
   await assert.rejects(
-    generateNvidiaReply('nvapi-test-key', [{
+    generateTestReply('nvapi-test-key', [{
       id: 'unknown-1',
       timestamp: { original: null, normalized: null, resolved: false },
       sender: 'UNKNOWN',
@@ -632,7 +800,7 @@ test('reply generation rejects empty output and malformed responses', async () =
     new Response(JSON.stringify({ choices: [{ message: { content: 7 } }] }), { status: 200 }),
   ]) {
     await assert.rejects(
-      generateNvidiaReply('nvapi-test-key', context, { fetch: async () => response }),
+      generateTestReply('nvapi-test-key', context, { fetch: async () => response }),
       error => {
         assert.ok(error instanceof NvidiaRequestError);
         assert.equal(error.kind, 'service');
@@ -653,7 +821,7 @@ test('reply generation preserves authentication and reports HTTP status and body
   }];
 
   await assert.rejects(
-    generateNvidiaReply('nvapi-test-key', context, {
+    generateTestReply('nvapi-test-key', context, {
       fetch: async () => new Response('', { status: 401 }),
     }),
     error => {
@@ -672,7 +840,7 @@ test('reply generation preserves authentication and reports HTTP status and body
     NVIDIA_API_KEY: apiKey,
   });
   await assert.rejects(
-    generateNvidiaReply(apiKey, context, {
+    generateTestReply(apiKey, context, {
       fetch: async () => new Response(responseBody, { status: 422 }),
     }),
     error => {
@@ -687,7 +855,7 @@ test('reply generation preserves authentication and reports HTTP status and body
   );
 
   await assert.rejects(
-    generateNvidiaReply('nvapi-test-key', context, {
+    generateTestReply('nvapi-test-key', context, {
       fetch: async () => new Response('request pending', { status: 202 }),
     }),
     error => {
@@ -705,7 +873,7 @@ test('reply generation preserves the original network exception as cause', async
   const networkFailure = new TypeError(`Connection failed using Bearer ${apiKey}`);
 
   await assert.rejects(
-    generateNvidiaReply(apiKey, [{
+    generateTestReply(apiKey, [{
       id: 'incoming-1',
       timestamp: { original: null, normalized: null, resolved: false },
       sender: 'Alex',
@@ -784,4 +952,123 @@ test('NVIDIA service and unexpected-response failures are not reported as invali
       return true;
     },
   );
+});
+test('adjudication requests a strict JSON participation decision with identity context', async () => {
+  let requestedOptions: RequestInit | undefined;
+  const result = await adjudicateNvidiaReply('nvapi-test-key', [
+    messengerMessage('in-1', 'Alex', 'INCOMING', 'Yukinon, are you around?'),
+    messengerMessage('out-1', 'You', 'OUTGOING', 'I am here.'),
+    messengerMessage('in-2', 'Blair', 'INCOMING', 'Alex, can you send the file?'),
+  ], {
+    identity: { name: 'Yukinon', aliases: ['Yuki'] },
+    fetch: async (_input, init) => {
+      requestedOptions = init;
+      return successfulCompletion('{"decision":"reject","reason":"addressed to Alex"}');
+    },
+  });
+
+  assert.deepEqual(result, { decision: 'reject', reason: 'addressed to Alex' });
+  const body = JSON.parse(String(requestedOptions?.body));
+  assert.equal(body.response_format.type, 'json_object');
+  assert.equal(body.max_tokens, 128);
+  assert.match(body.messages[0].content, /identity is exactly "Yukinon"/);
+  assert.match(body.messages[0].content, /Other identified participants: Alex, Blair/);
+  assert.deepEqual(body.messages.slice(1), [
+    { role: 'user', content: '[from Alex] Yukinon, are you around?' },
+    { role: 'assistant', content: 'I am here.' },
+    { role: 'user', content: '[from Blair] Alex, can you send the file?' },
+  ]);
+});
+
+test('adjudication labels known senders as authors and leaves unknown senders unlabeled', async () => {
+  let requestedOptions: RequestInit | undefined;
+  await adjudicateNvidiaReply('nvapi-test-key', [
+    messengerMessage('in-1', 'Katsuyo', 'INCOMING', 'Yukinon'),
+    messengerMessage('out-1', 'You', 'OUTGOING', 'An earlier reply.'),
+    messengerMessage('in-2', 'Katsuyo', 'INCOMING', 'Hello yukinon can you hear me?'),
+    messengerMessage('in-3', 'Katsuyo', 'INCOMING', 'Anselmo can you hear me?'),
+    messengerMessage('in-4', 'Katsuyo', 'INCOMING', 'Can you hear me?'),
+    messengerMessage('in-5', 'UNKNOWN', 'INCOMING', 'no sender label'),
+  ], {
+    identity: { name: 'Yukinon' },
+    fetch: async (_input, init) => {
+      requestedOptions = init;
+      return successfulCompletion('{"decision":"approve","reason":"direct question"}');
+    },
+  });
+
+  const body = JSON.parse(String(requestedOptions?.body));
+  assert.deepEqual(body.messages.slice(1), [
+    { role: 'user', content: '[from Katsuyo] Yukinon' },
+    { role: 'assistant', content: 'An earlier reply.' },
+    { role: 'user', content: '[from Katsuyo] Hello yukinon can you hear me?' },
+    { role: 'user', content: '[from Katsuyo] Anselmo can you hear me?' },
+    { role: 'user', content: '[from Katsuyo] Can you hear me?' },
+    { role: 'user', content: 'no sender label' },
+  ]);
+  assert.doesNotMatch(body.messages[1].content, /Katsuyo:/);
+});
+
+test('adjudication drops the configured identity from the participant list', async () => {
+  let systemInstruction = '';
+  await adjudicateNvidiaReply('nvapi-test-key', [
+    messengerMessage('in-1', 'Alex', 'INCOMING', 'hello'),
+  ], {
+    identity: { name: 'Yukinon', aliases: ['Yuki'] },
+    participantNames: ['Yukinon', 'Yuki', 'Alex', 'Alex'],
+    fetch: async (_input, init) => {
+      systemInstruction = JSON.parse(String(init?.body)).messages[0].content;
+      return successfulCompletion('{"decision":"approve","reason":"greeting"}');
+    },
+  });
+
+  assert.match(systemInstruction, /Other identified participants: Alex\./);
+  assert.doesNotMatch(systemInstruction, /Other identified participants:.*Yuki/);
+});
+
+test('adjudication fails closed on malformed, empty, and failed responses', async () => {
+  const messages = [
+    messengerMessage('in-1', 'Alex', 'INCOMING', 'hello'),
+  ];
+  const options = { identity: { name: 'Yukinon' } };
+
+  const malformed = await adjudicateNvidiaReply('nvapi-test-key', messages, {
+    ...options,
+    fetch: async () => successfulCompletion('not json'),
+  });
+  assert.equal(malformed.decision, 'reject');
+
+  const empty = await adjudicateNvidiaReply('nvapi-test-key', messages, {
+    ...options,
+    fetch: async () => successfulCompletion(''),
+  });
+  assert.equal(empty.decision, 'reject');
+
+  const failed = await adjudicateNvidiaReply('nvapi-test-key', messages, {
+    ...options,
+    fetch: async () => new Response('', { status: 500 }),
+  });
+  assert.equal(failed.decision, 'reject');
+
+  const network = await adjudicateNvidiaReply('nvapi-test-key', messages, {
+    ...options,
+    fetch: async () => { throw new TypeError('network down'); },
+  });
+  assert.equal(network.decision, 'reject');
+});
+
+test('adjudication rejects without a request when no incoming message is available', async () => {
+  let fetchCalls = 0;
+  const result = await adjudicateNvidiaReply('nvapi-test-key', [
+    messengerMessage('out-1', 'You', 'OUTGOING', 'already replied'),
+  ], {
+    identity: { name: 'Yukinon' },
+    fetch: async () => {
+      fetchCalls += 1;
+      return successfulCompletion('{"decision":"approve","reason":"ok"}');
+    },
+  });
+
+  assert.equal(result.decision, 'reject');
+  assert.equal(fetchCalls, 0);
 });
