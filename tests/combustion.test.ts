@@ -2623,14 +2623,15 @@ test('an RNG reply that echoes the incoming message is retried once and suppress
     }
 
     assert.equal(harness.generateRequests.length, 2, 'the echo is retried exactly once');
+    const baseInstruction = composeSystemInstruction('', getDefaultPersonalityInstruction());
     assert.equal(
       harness.generateRequests[0].systemInstruction,
-      getDefaultPersonalityInstruction(),
+      baseInstruction,
       'the first attempt uses the unmodified system instruction',
     );
     assert.equal(
       harness.generateRequests[1].systemInstruction,
-      composeSystemInstruction(getDefaultPersonalityInstruction(), ANTI_ECHO_RETRY_INSTRUCTION),
+      composeSystemInstruction(baseInstruction, ANTI_ECHO_RETRY_INSTRUCTION),
       'the retry adds only the explicit anti-echo instruction',
     );
     assert.deepEqual(harness.composedReplies, [], 'no echo reaches the composer');

@@ -43,6 +43,7 @@ import {
 } from './message-identity.js';
 import { createPacketProcessor } from './packet-processor.js';
 import {
+  stripLeadingParticipantMentions,
   stripParticipantSpeakerLabel,
   stripSelfIdentifyingPrefix,
 } from './reply-normalization.js';
@@ -1311,10 +1312,14 @@ export async function startCombustion({
                 : systemInstruction,
             },
           );
-          const normalizedReply = stripParticipantSpeakerLabel(
-            stripSelfIdentifyingPrefix(
-              reply,
-              { name: configuration.puppetName ?? '', aliases },
+          const normalizedReply = stripLeadingParticipantMentions(
+            stripParticipantSpeakerLabel(
+              stripSelfIdentifyingPrefix(
+                reply,
+                { name: configuration.puppetName ?? '', aliases },
+                messages,
+              ),
+              participantNames,
               messages,
             ),
             participantNames,

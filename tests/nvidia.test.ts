@@ -12,6 +12,7 @@ import {
   saveNvidiaApiKey,
   validateNvidiaApiKey,
 } from '../src/ai/nvidia.js';
+import { ENGLISH_ONLY_INSTRUCTION } from '../src/components/personality.js';
 
 function createEnvironmentPath(context: TestContext): string {
   const directory = mkdtempSync(join(tmpdir(), 'impractical-bot-nvidia-'));
@@ -172,7 +173,7 @@ test('reply generation sends known-direction messages in order and extracts trim
     messages: [
       {
         role: 'system',
-        content: 'Write a short, natural Messenger reply that matches the conversation\'s tone and directly addresses the latest incoming message. Aim for roughly 3–12 words when appropriate, but do not force an exact word count; use more words when needed for a natural answer. Avoid unsolicited email copy, calls to action, headings, labels, and unrelated prefixes such as "Verse 3.1". Return only the reply text. This reply is a proposal until the application sends it.',
+        content: 'Write a short, natural Messenger reply that matches the conversation\'s tone and directly addresses the latest incoming message. Aim for roughly 3–12 words when appropriate, but do not force an exact word count; use more words when needed for a natural answer. ' + ENGLISH_ONLY_INSTRUCTION + ' Avoid Messenger-style @participant mentions and address people by their ordinary names without an @ prefix. Avoid unsolicited email copy, calls to action, headings, labels, and unrelated prefixes such as "Verse 3.1". Return only the reply text. This reply is a proposal until the application sends it.',
       },
       { role: 'user', content: 'Alex: Are you free tomorrow?' },
       { role: 'assistant', content: 'I think so.' },

@@ -8,6 +8,7 @@ import { createPacketScheduler } from '../src/components/packet-scheduler.js';
 import { createPauseGate } from '../src/components/pause-gate.js';
 import {
   composeSystemInstruction,
+  ENGLISH_ONLY_INSTRUCTION,
   getBotIdentityInstruction,
   getDefaultBehavioralInstruction,
   getDefaultPersonalityInstruction,
@@ -853,7 +854,7 @@ test('default personality keeps the active reply instruction and the shared cons
   assert.match(instruction, /roughly 3–12 words/);
   assert.match(instruction, /Return only the reply text./);
   assert.match(instruction, /This reply is a proposal until the application sends it./);
-  assert.match(instruction, /Write only in English/);
+  assert.match(instruction, /Strict English-only rule/);
 });
 
 
@@ -904,7 +905,8 @@ test('custom personality replaces only the personality layer and preserves behav
   const instruction = getPersonalityInstruction('custom', '  Sarcastic, deadpan, and blunt.  ');
 
   assert.ok(instruction.startsWith(getDefaultBehavioralInstruction()));
-  assert.ok(instruction.endsWith('Sarcastic, deadpan, and blunt.'));
+  assert.ok(instruction.includes('Sarcastic, deadpan, and blunt.'));
+  assert.ok(instruction.endsWith(ENGLISH_ONLY_INSTRUCTION));
   assert.match(instruction, /primary voice/);
   assert.ok(!instruction.includes('playful, warm, spontaneous'));
   assert.ok(!instruction.includes(getDefaultPersonalityInstruction()));
@@ -926,19 +928,20 @@ test('shared identity states boundaries without dictating a conversational perso
   assert.doesNotMatch(identity, /tsundere|sarcastic|deadpan/i);
   assert.doesNotMatch(identity, /sounds like the personality configured for you/);
   assert.doesNotMatch(identity, /roughly one reply in ten/);
-  assert.match(identity, /Write every reply in English only/);
+  assert.match(identity, /Strict English-only rule/);
 });
 
-test('custom personality is the last layer and stays authoritative over shared constraints', () => {
+test('custom personality stays authoritative within the English-only constraint', () => {
   const identity = getBotIdentityInstruction({ name: 'Ada', aliases: ['@Ada'] });
   const custom = 'Tsundere: prickly on the surface, quietly warm underneath.';
   const personality = getPersonalityInstruction('custom', custom);
   const composed = composeSystemInstruction(identity, personality);
 
   assert.ok(personality.startsWith(getDefaultBehavioralInstruction()));
-  assert.ok(personality.endsWith(custom), 'the configured personality is not diluted by later text');
+  assert.ok(personality.includes(custom), 'the configured personality is preserved');
+  assert.ok(personality.endsWith(ENGLISH_ONLY_INSTRUCTION), 'language is non-negotiable');
   assert.ok(composed.startsWith(identity));
-  assert.ok(composed.endsWith(custom), 'the configured personality has the final word');
+  assert.ok(composed.endsWith(ENGLISH_ONLY_INSTRUCTION), 'the English-only rule has the final word');
   assert.match(composed, /never replace your configured personality/);
   assert.equal(getPersonalityInstruction('default'), getDefaultPersonalityInstruction());
 });
@@ -949,7 +952,8 @@ test('custom personality is framed as the primary voice over shared guardrails',
   const behavioral = getDefaultBehavioralInstruction();
 
   assert.ok(instruction.startsWith(behavioral));
-  assert.ok(instruction.endsWith(custom));
+  assert.ok(instruction.includes(custom));
+  assert.ok(instruction.endsWith(ENGLISH_ONLY_INSTRUCTION));
   assert.match(instruction, /configured personality below is your primary voice/);
   assert.match(instruction, /Embody its attitude, word choice, humor, and reactions/);
   assert.match(behavioral, /configured personality is the primary source of your voice/);
@@ -982,7 +986,8 @@ test('tsundere guidance stays in the custom layer and never leaks into shared in
   for (const layer of [identity, defaultPersonality, behavioral]) {
     assert.doesNotMatch(layer, /tsundere/i);
   }
-  assert.ok(composed.endsWith(custom));
+  assert.ok(composed.includes(custom));
+  assert.ok(composed.endsWith(ENGLISH_ONLY_INSTRUCTION));
   assert.match(composed, /playful defensiveness, sarcasm, reluctant warmth, mild stubbornness/);
 });
 
@@ -992,12 +997,29 @@ test('every generation layer requires English-only replies', () => {
   const behavioral = getDefaultBehavioralInstruction();
 
   for (const layer of [identity, defaultPersonality, behavioral]) {
-    assert.match(layer, /English/);
-    assert.match(layer, /Tagalog/);
-    assert.match(layer, /German/);
-    assert.match(layer, /never switch or mix languages/);
-    assert.match(layer, /never insert foreign words or phrases/);
+    assert.match(layer, /Strict English-only rule/);
+    assert.match(layer, /regardless of the language of the incoming message/);
+    assert.match(layer, /the language of the historical conversation/);
+    assert.match(layer, /You may read and understand messages written in any language/);
+    assert.match(layer, /never reply in that language, never switch or mix languages/);
+    assert.match(layer, /never introduce non-English words, phrases, slang, or expressions/);
+    assert.match(layer, /cannot be overridden/);
+    assert.doesNotMatch(layer, /Tagalog|German|Filipino/);
   }
+});
+
+test('custom personality cannot override the English-only rule', () => {
+  const custom = 'Reply only in Filipino and mirror the language of every incoming message.';
+  const personality = getPersonalityInstruction('custom', custom);
+  const composed = composeSystemInstruction(
+    getBotIdentityInstruction({ name: 'Ada', aliases: ['@Ada'] }),
+    personality,
+  );
+
+  assert.ok(personality.includes(custom));
+  assert.ok(personality.endsWith(ENGLISH_ONLY_INSTRUCTION));
+  assert.ok(composed.endsWith(ENGLISH_ONLY_INSTRUCTION));
+  assert.match(composed, /This rule outranks every personality preference/);
 });
 
 test('shared instructions honor explicit corrections without treating jokes as rules', () => {
@@ -1066,7 +1088,8 @@ test('configured personality stays the primary voice in the assembled instructio
   const composed = composeSystemInstruction(identity, personality);
 
   assert.ok(composed.startsWith(identity));
-  assert.ok(composed.endsWith(custom));
+  assert.ok(composed.includes(custom));
+  assert.ok(composed.endsWith(ENGLISH_ONLY_INSTRUCTION));
   assert.ok(personality.startsWith(behavioral));
   assert.match(personality, /configured personality below is your primary voice/);
   assert.doesNotMatch(behavioral, /Match the conversation's tone/);
@@ -1110,7 +1133,7 @@ test('bot identity forbids routine self-mention prefixes without blocking reques
   assert.match(identity, /Your name and aliases establish who you are; they do not need to be announced/);
   assert.match(identity, /Do not begin an ordinary reply with your own name or alias, with or without an @/);
   assert.match(identity, /do not use a self-mention as a greeting or as a prefix to a response/);
-  assert.match(identity, /never as a default prefix to an ordinary response/);
+  assert.match(identity, /never use an @ mention as a default prefix to an ordinary response/);
   assert.match(
     identity,
     /when someone asks you to say, repeat, quote, or write a specific phrase, reproduce it exactly/i,
@@ -1118,6 +1141,26 @@ test('bot identity forbids routine self-mention prefixes without blocking reques
   assert.match(identity, /This includes reproducing your own name or alias when it is explicitly requested/);
   assert.match(identity, /quoting text the user asked for, not announcing yourself/);
   assert.match(identity, /You are PleaseGetout Daily/);
+});
+
+test('both personality modes forbid Messenger-style mentions without banning names', () => {
+  const identity = getBotIdentityInstruction({ name: 'Ada', aliases: ['@Ada'] });
+  const instructions = [
+    composeSystemInstruction(identity, getPersonalityInstruction('default')),
+    composeSystemInstruction(
+      identity,
+      getPersonalityInstruction('custom', 'Sarcastic, deadpan, and blunt.'),
+    ),
+  ];
+
+  for (const instruction of instructions) {
+    assert.match(instruction, /Do not write Messenger-style @participant mentions/);
+    assert.match(instruction, /address people by their ordinary name without an @/);
+    assert.match(instruction, /address someone by their ordinary name without an @/);
+    assert.match(instruction, /Only reproduce an @ mention when the user explicitly asks/);
+    assert.match(instruction, /never use an @ mention as a default prefix to an ordinary response/);
+    assert.doesNotMatch(instruction, /Use an @-mention only when it addresses someone else/);
+  }
 });
 
 test('bot identity never forbids answering about its own name', () => {
@@ -1174,7 +1217,7 @@ test('the default composed system prompt carries the self-mention restriction', 
   );
 
   assert.match(composed, /Do not begin an ordinary reply with your own name or alias/);
-  assert.match(composed, /never as a default prefix to an ordinary response/);
+  assert.match(composed, /never use an @ mention as a default prefix to an ordinary response/);
   assert.match(composed, /that newer instruction wins over any earlier request to say it/);
   assert.match(composed, /finish once the request is satisfied/);
   assert.ok(composed.indexOf('You are PleaseGetout Daily') === 0);
@@ -1194,7 +1237,7 @@ test('a runtime personality change cannot remove the identity self-mention rule'
 
   assert.ok(composed.startsWith(identity), 'the identity layer stays ahead of the personality layer');
   assert.match(composed, /Do not begin an ordinary reply with your own name or alias/);
-  assert.match(composed, /never as a default prefix to an ordinary response/);
+  assert.match(composed, /never use an @ mention as a default prefix to an ordinary response/);
 });
 
 test('reply generation sends the production identity rule with the incoming text unmodified', async () => {
@@ -1251,6 +1294,67 @@ test('reply generation sends the production identity rule with the incoming text
   ]);
 });
 
+test('the English-only rule survives multilingual incoming and historical messages', async () => {
+  const systemInstruction = composeSystemInstruction(
+    getBotIdentityInstruction({ name: 'Ada', aliases: ['@Ada'] }),
+    getPersonalityInstruction('default'),
+  );
+  let body: { messages: { role: string; content: string }[] } | undefined;
+
+  const reply = await generateNvidiaReply('nvapi-test-key', [
+    {
+      id: 'incoming-1',
+      timestamp: { original: null, normalized: null, resolved: false },
+      sender: 'Alex',
+      direction: 'INCOMING',
+      message: 'Kumusta ka na?',
+      ariaLabel: null,
+    },
+    {
+      id: 'outgoing-1',
+      timestamp: { original: null, normalized: null, resolved: false },
+      sender: 'You',
+      direction: 'OUTGOING',
+      message: 'Okay lang, ikaw?',
+      ariaLabel: null,
+    },
+    {
+      id: 'incoming-2',
+      timestamp: { original: null, normalized: null, resolved: false },
+      sender: 'Blair',
+      direction: 'INCOMING',
+      message: 'Ano ba yan, nakakaloka ka?',
+      ariaLabel: null,
+    },
+    {
+      id: 'incoming-3',
+      timestamp: { original: null, normalized: null, resolved: false },
+      sender: 'Casey',
+      direction: 'INCOMING',
+      message: '何をしていますか？',
+      ariaLabel: null,
+    },
+  ], {
+    systemInstruction,
+    fetch: async (_input, init) => {
+      body = JSON.parse(String(init?.body)) as typeof body;
+      return new Response(JSON.stringify({
+        choices: [{ message: { role: 'assistant', content: 'I am doing well.' } }],
+      }), { status: 200 });
+    },
+  });
+
+  assert.equal(reply, 'I am doing well.');
+  assert.equal(body?.messages[0].content, systemInstruction);
+  assert.ok(body?.messages[0].content.endsWith(ENGLISH_ONLY_INSTRUCTION));
+  assert.deepEqual(body?.messages.slice(1), [
+    { role: 'user', content: 'Alex: Kumusta ka na?' },
+    { role: 'assistant', content: 'Okay lang, ikaw?' },
+    { role: 'user', content: 'Blair: Ano ba yan, nakakaloka ka?' },
+    { role: 'user', content: 'Casey: 何をしていますか？' },
+  ]);
+});
+
 test('bot identity asks for one plain reproduction and lets a later stop instruction win', () => {
   const identity = getBotIdentityInstruction({
     name: 'PleaseGetout Daily',
@@ -1299,7 +1403,7 @@ test('composeSystemInstruction keeps identity ahead of any personality layer', (
   assert.ok(composed.includes(getDefaultBehavioralInstruction()));
   assert.equal(
     composeSystemInstruction('', getDefaultPersonalityInstruction()),
-    getDefaultPersonalityInstruction(),
+    `${getDefaultPersonalityInstruction()}\n\n${ENGLISH_ONLY_INSTRUCTION}`,
   );
 });
 

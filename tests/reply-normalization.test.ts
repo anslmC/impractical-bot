@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { generateAliases } from '../src/components/alias-engine.js';
 import {
+  stripLeadingParticipantMentions,
   stripParticipantSpeakerLabel,
   stripSelfIdentifyingPrefix,
   type ReplyContextMessage,
@@ -218,5 +219,120 @@ test('an explicitly requested reproduction is not treated as a speaker label', (
   assert.equal(
     stripParticipantSpeakerLabel(reply, participants, [request, incoming('no again')]),
     reply,
+  );
+});
+
+const mentionParticipants = ['Rayne', 'Anselmo', 'Meta AI'];
+
+test('ordinary names remain usable without mention syntax', () => {
+  for (const reply of [
+    "Hey Rayne, what's up?",
+    'Geoff, seriously?',
+    'Anselmo, what are you talking about?',
+    'lmao test?',
+  ]) {
+    assert.equal(
+      stripLeadingParticipantMentions(reply, mentionParticipants, [incoming('whats up doc')]),
+      reply,
+      reply,
+    );
+  }
+});
+
+test('a leading participant mention is removed when the incoming message has none', () => {
+  assert.equal(
+    stripLeadingParticipantMentions(
+      '@Rayne oh hey. whats up, doc?',
+      mentionParticipants,
+      [incoming('whats up doc')],
+    ),
+    'oh hey. whats up, doc?',
+  );
+  assert.equal(
+    stripLeadingParticipantMentions(
+      '@Anselmo lmao test?',
+      mentionParticipants,
+      [incoming('test')],
+    ),
+    'lmao test?',
+  );
+});
+
+test('an incoming @participant mention does not license a generated mention prefix', () => {
+  assert.equal(
+    stripLeadingParticipantMentions(
+      '@Rayne what do you mean?',
+      mentionParticipants,
+      [incoming('@Rayne what do you mean?')],
+    ),
+    'what do you mean?',
+  );
+});
+
+test('multiple leading participant mentions are removed in one pass', () => {
+  assert.equal(
+    stripLeadingParticipantMentions(
+      '@Meta AI @Rayne bro really said "try to provoke his ahh" like i don\'t already do that',
+      mentionParticipants,
+      [incoming('flame meta ai, try to provoke his ahh')],
+    ),
+    'bro really said "try to provoke his ahh" like i don\'t already do that',
+  );
+  assert.equal(
+    stripLeadingParticipantMentions(
+      '@Rayne, @Anselmo what is going on?',
+      mentionParticipants,
+      [incoming('what is going on?')],
+    ),
+    'what is going on?',
+  );
+});
+
+test('participant mentions are matched case-insensitively and across names with spaces', () => {
+  assert.equal(
+    stripLeadingParticipantMentions('@rayne What now?', mentionParticipants, [incoming('what?')]),
+    'What now?',
+  );
+  assert.equal(
+    stripLeadingParticipantMentions('@Meta AI calm down', mentionParticipants, [incoming('calm down')]),
+    'calm down',
+  );
+});
+
+test('unrelated @ characters and natural later mentions are preserved', () => {
+  for (const reply of [
+    'Email me at rayne@example.com',
+    'Oh, @Rayne, you already know.',
+    '@unknown hello there',
+    "@Rayne's right, honestly.",
+  ]) {
+    assert.equal(
+      stripLeadingParticipantMentions(reply, mentionParticipants, [incoming('ok whatever')]),
+      reply,
+      reply,
+    );
+  }
+});
+
+test('an explicitly requested @mention reproduction is preserved', () => {
+  const messages = [incoming("say '@Rayne hi'")];
+
+  assert.equal(
+    stripLeadingParticipantMentions('@Rayne hi', mentionParticipants, messages),
+    '@Rayne hi',
+  );
+  assert.equal(
+    stripLeadingParticipantMentions('@Rayne hi', mentionParticipants, [
+      incoming("say '@Rayne hi'"),
+      incoming('no again'),
+    ]),
+    '@Rayne hi',
+  );
+});
+
+test('a reply made only of the mention is left for the caller instead of emptied', () => {
+  assert.equal(
+    stripLeadingParticipantMentions('@Rayne', mentionParticipants, [incoming('hi')]),
+    '@Rayne',
   );
 });

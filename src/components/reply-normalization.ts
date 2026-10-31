@@ -148,3 +148,42 @@ export function stripParticipantSpeakerLabel(
   }
   return reply;
 }
+
+export function stripLeadingParticipantMentions(
+  reply: string,
+  participantNames: readonly string[],
+  messages: readonly ReplyContextMessage[] = [],
+): string {
+  const trimmedReply = reply.trim();
+  const forms = participantForms(participantNames);
+  if (!trimmedReply || forms.length === 0 ||
+      isRequestedNameReference(forms, messages)) {
+    return reply;
+  }
+
+  let current = trimmedReply;
+  for (;;) {
+    let mentionMatch: RegExpExecArray | null = null;
+    for (const form of forms) {
+      const pattern = new RegExp(
+        `^@${escapeRegExp(form).replace(/\s+/gu, '\\s+')}` +
+          `(?![\\p{L}\\p{N}_'’])(?:\\s*[:：,;]\\s*|\\s+|$)`,
+        'iu',
+      );
+      const match = pattern.exec(current);
+      if (match) {
+        mentionMatch = match;
+        break;
+      }
+    }
+    if (!mentionMatch) {
+      break;
+    }
+    const remainder = current.slice(mentionMatch[0].length).trim();
+    if (!remainder) {
+      return reply;
+    }
+    current = remainder;
+  }
+  return current === trimmedReply ? reply : current;
+}
