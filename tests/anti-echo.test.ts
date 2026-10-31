@@ -185,6 +185,7 @@ test('the shared identity instruction forbids restating the incoming message', (
   assert.match(identity, /do not continue it as if finishing the sender's line/);
   assert.match(identity, /never write a line as another participant/);
   assert.match(identity, /never prefix your reply with another participant's name/);
+  assert.match(identity, /Never start a reply with a speaker label/);
   assert.match(identity, /not text to echo or imitate/);
 });
 

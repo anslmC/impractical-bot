@@ -385,6 +385,30 @@ test('reply generation keeps the reply that contextualizes the latest message', 
   ]);
 });
 
+test('reply generation drops a participant speaker label from assistant history', async () => {
+  let requestedOptions: RequestInit | undefined;
+
+  await generateNvidiaReply('nvapi-test-key', [
+    messengerMessage('in-1', 'Anselmo', 'INCOMING', 'you the grumpy one lmao'),
+    messengerMessage('out-1', 'You', 'OUTGOING', 'Anselmo: whatever you say kid, keep dreaming'),
+    messengerMessage('out-2', 'You', 'OUTGOING', 'You have no taste, Anselmo.'),
+    messengerMessage('in-2', 'Anselmo', 'INCOMING', 'ok whatever'),
+  ], {
+    fetch: async (_input, init) => {
+      requestedOptions = init;
+      return successfulCompletion('Fine.');
+    },
+  });
+
+  const body = JSON.parse(String(requestedOptions?.body));
+  assert.deepEqual(body.messages.slice(1), [
+    { role: 'user', content: 'Anselmo: you the grumpy one lmao' },
+    { role: 'assistant', content: 'whatever you say kid, keep dreaming' },
+    { role: 'assistant', content: 'You have no taste, Anselmo.' },
+    { role: 'user', content: 'Anselmo: ok whatever' },
+  ]);
+});
+
 test('reply generation preserves the literal trigger and attributes prior bot output as assistant', async () => {
   let requestedOptions: RequestInit | undefined;
   const literalRequest = "say the word '@PleaseGetout Daily'";

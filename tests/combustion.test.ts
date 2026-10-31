@@ -2774,6 +2774,96 @@ test('legitimate short replies from both trigger paths are still sent', async co
   }
 });
 
+test('participant speaker labels never reach the composer from either trigger path', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  const harness = installAntiEchoPipelineMocks([
+    'Anselmo: Nothing much.',
+    'Anselmo: Yeah, I am here, Anselmo.',
+  ]);
+  const { page, inject } = createInjectedMessengerPage();
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page,
+    contextStore,
+    configuration: { ...configuration, puppetName: 'PleaseGetout Daily' },
+    aliases: generateAliases('PleaseGetout Daily').valids,
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'label-1', sender: 'Anselmo', message: '@PleaseGetout Daily what?' }]);
+    for (let poll = 0; poll < 3; poll += 1) {
+      context.mock.timers.tick(3_000);
+      await flushEngine();
+    }
+    assert.deepEqual(
+      harness.composedReplies,
+      ['Nothing much.'],
+      'the mention reply reaches the composer without the sender label',
+    );
+
+    Math.random = () => 0;
+    inject([{ messageId: 'label-2', sender: 'Anselmo', message: 'Are you there?' }]);
+    for (let poll = 0; poll < 5; poll += 1) {
+      context.mock.timers.tick(3_000);
+      await flushEngine();
+    }
+    assert.deepEqual(
+      harness.composedReplies,
+      ['Nothing much.', 'Yeah, I am here, Anselmo.'],
+      'the RNG reply is cleaned the same way while a natural name reference survives',
+    );
+    assert.equal(
+      harness.generateRequests.length,
+      2,
+      'neither cleaned reply is treated as an echo and retried',
+    );
+    assert.deepEqual(contextStore.getState().messageIds, ['label-1', 'label-2']);
+  } finally {
+    await controller.stop();
+    harness.restore();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+  }
+});
+
+test('a reply that echoes with a speaker label is still retried and suppressed', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0;
+  const harness = installAntiEchoPipelineMocks([
+    'Anselmo: can you hear me?',
+    'Anselmo: can you hear me?',
+  ]);
+  const { page, inject } = createInjectedMessengerPage();
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration: { ...configuration, puppetName: 'PleaseGetout Daily' },
+    aliases: generateAliases('PleaseGetout Daily').valids,
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'label-echo-1', sender: 'Anselmo', message: 'can you hear me?' }]);
+    for (let poll = 0; poll < 5; poll += 1) {
+      context.mock.timers.tick(3_000);
+      await flushEngine();
+    }
+    assert.equal(harness.generateRequests.length, 2, 'the echo is still retried once');
+    assert.deepEqual(harness.composedReplies, [], 'the labelled echo never reaches the composer');
+  } finally {
+    await controller.stop();
+    harness.restore();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+  }
+});
+
 test('a failing anti-echo retry does not crash Combustion or send the echo', async context => {
   context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
   const originalRandom = Math.random;

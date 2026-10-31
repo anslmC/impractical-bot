@@ -37,24 +37,37 @@ function selfReferenceForms({ name, aliases = [] }: SelfIdentity): string[] {
   return [...forms].sort((left, right) => right.length - left.length);
 }
 
-function mentionsSelf(text: string, identity: SelfIdentity): boolean {
-  return selfReferenceForms(identity).some(form =>
-    text.toLowerCase().includes(form.toLowerCase()),
-  );
+function participantForms(participantNames: readonly string[]): string[] {
+  const forms = new Set<string>();
+  for (const participantName of participantNames) {
+    const normalized = participantName
+      .trim()
+      .replace(/^@+/u, '')
+      .replace(/\s+/gu, ' ');
+    if (normalized) {
+      forms.add(normalized);
+    }
+  }
+  return [...forms].sort((left, right) => right.length - left.length);
 }
 
-function requestsReproduction(text: string, identity: SelfIdentity): boolean {
+function mentionsAnyName(text: string, names: readonly string[]): boolean {
+  const lowerText = text.toLowerCase();
+  return names.some(name => lowerText.includes(name.toLowerCase()));
+}
+
+function requestsReproduction(text: string, names: readonly string[]): boolean {
   return REPRODUCTION_CUE.test(text) &&
     !PROHIBITION_CUE.test(text) &&
-    mentionsSelf(text, identity);
+    mentionsAnyName(text, names);
 }
 
-function prohibitsSelfReference(text: string): boolean {
+function prohibitsNameReference(text: string): boolean {
   return PROHIBITION_CUE.test(text);
 }
 
-function isRequestedSelfReference(
-  identity: SelfIdentity,
+function isRequestedNameReference(
+  names: readonly string[],
   messages: readonly ReplyContextMessage[],
 ): boolean {
   const incoming = messages
@@ -64,15 +77,15 @@ function isRequestedSelfReference(
   if (!latest) {
     return false;
   }
-  if (requestsReproduction(latest, identity)) {
+  if (requestsReproduction(latest, names)) {
     return true;
   }
-  if (prohibitsSelfReference(latest)) {
+  if (prohibitsNameReference(latest)) {
     return false;
   }
   if (CONTINUATION_CUE.test(latest)) {
     const previous = incoming.at(-2);
-    return previous !== undefined && requestsReproduction(previous, identity);
+    return previous !== undefined && requestsReproduction(previous, names);
   }
   return false;
 }
@@ -83,14 +96,45 @@ export function stripSelfIdentifyingPrefix(
   messages: readonly ReplyContextMessage[] = [],
 ): string {
   const trimmedReply = reply.trim();
-  if (!trimmedReply || isRequestedSelfReference(identity, messages)) {
+  const forms = selfReferenceForms(identity);
+  if (!trimmedReply || isRequestedNameReference(forms, messages)) {
     return reply;
   }
 
-  for (const form of selfReferenceForms(identity)) {
+  for (const form of forms) {
     const pattern = new RegExp(
       `^\\s*${escapeRegExp(form)}(?![A-Za-z0-9_])(?:\\s*[:,\\-–—]?\\s+|$)`,
       'i',
+    );
+    const match = pattern.exec(trimmedReply);
+    if (!match) {
+      continue;
+    }
+    const remainder = trimmedReply.slice(match[0].length).trim();
+    if (!remainder) {
+      return reply;
+    }
+    return remainder;
+  }
+  return reply;
+}
+
+export function stripParticipantSpeakerLabel(
+  reply: string,
+  participantNames: readonly string[],
+  messages: readonly ReplyContextMessage[] = [],
+): string {
+  const trimmedReply = reply.trim();
+  const forms = participantForms(participantNames);
+  if (!trimmedReply || forms.length === 0 ||
+      isRequestedNameReference(forms, messages)) {
+    return reply;
+  }
+
+  for (const form of forms) {
+    const pattern = new RegExp(
+      `^\\s*@?${escapeRegExp(form).replace(/\s+/gu, '\\s+')}\\s*[:：]\\s*`,
+      'iu',
     );
     const match = pattern.exec(trimmedReply);
     if (!match) {

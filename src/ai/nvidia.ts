@@ -14,6 +14,7 @@ import { basename, dirname, join } from 'node:path';
 import { config as loadDotenv, parse } from 'dotenv';
 import { resolveConfigurationPaths } from '../config/configuration.js';
 import type { BackreadMessage } from '../components/backread.js';
+import { stripParticipantSpeakerLabel } from '../components/reply-normalization.js';
 
 const NVIDIA_CHAT_COMPLETIONS_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
 const NVIDIA_CHAT_COMPLETIONS_MODEL = 'nvidia/nemotron-3.5-lightning-30b-a3b';
@@ -277,6 +278,15 @@ export async function generateNvidiaReply(
     throw new NvidiaApiKeyError('authentication', 'The NVIDIA API key is empty or malformed.');
   }
 
+  const participantNames: string[] = [];
+  for (const message of messages) {
+    const senderName = typeof message.sender === 'string' ? message.sender.trim() : '';
+    if (senderName && senderName !== 'UNKNOWN' && senderName !== 'You' &&
+        !participantNames.includes(senderName)) {
+      participantNames.push(senderName);
+    }
+  }
+
   const conversationMessages: ConversationTurn[] = [];
   for (const message of messages) {
     if (message.direction !== 'INCOMING' && message.direction !== 'OUTGOING') {
@@ -291,9 +301,12 @@ export async function generateNvidiaReply(
     const sender = isIncoming && senderName && senderName !== 'UNKNOWN'
       ? `${senderName}: `
       : '';
+    const turnContent = isIncoming
+      ? content
+      : stripParticipantSpeakerLabel(content, participantNames);
     conversationMessages.push({
       role: isIncoming ? 'user' : 'assistant',
-      content: `${sender}${content}`,
+      content: `${sender}${turnContent}`,
     });
   }
   if (conversationMessages.length === 0) {

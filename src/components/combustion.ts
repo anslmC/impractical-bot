@@ -42,7 +42,10 @@ import {
   type DuplicateMessageRecord,
 } from './message-identity.js';
 import { createPacketProcessor } from './packet-processor.js';
-import { stripSelfIdentifyingPrefix } from './reply-normalization.js';
+import {
+  stripParticipantSpeakerLabel,
+  stripSelfIdentifyingPrefix,
+} from './reply-normalization.js';
 import { createPacketScheduler } from './packet-scheduler.js';
 import { createPauseGate } from './pause-gate.js';
 import {
@@ -1308,9 +1311,13 @@ export async function startCombustion({
                 : systemInstruction,
             },
           );
-          const normalizedReply = stripSelfIdentifyingPrefix(
-            reply,
-            { name: configuration.puppetName ?? '', aliases },
+          const normalizedReply = stripParticipantSpeakerLabel(
+            stripSelfIdentifyingPrefix(
+              reply,
+              { name: configuration.puppetName ?? '', aliases },
+              messages,
+            ),
+            participantNames,
             messages,
           );
           if (normalizedReply !== reply) {
@@ -1319,7 +1326,7 @@ export async function startCombustion({
               .slice(0, Math.max(0, trimmedReply.length - normalizedReply.length))
               .trim();
             console.log(
-              `${styled('[reply]', 'cyan')} removed self-identifying prefix: ` +
+              `${styled('[reply]', 'cyan')} removed speaker label: ` +
               `${JSON.stringify(removedPrefix)}`,
             );
           }
