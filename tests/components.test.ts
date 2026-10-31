@@ -691,6 +691,39 @@ test('packet scheduler discards queued work without interrupting the active pack
   assert.deepEqual(processed, ['packet-1']);
 });
 
+test('packet scheduler survives work discarded while paused before resume', async () => {
+  const pauseGate = createPauseGate();
+  const processed: string[] = [];
+  const unhandledRejections: unknown[] = [];
+  const onUnhandledRejection = (reason: unknown): void => {
+    unhandledRejections.push(reason);
+  };
+  process.on('unhandledRejection', onUnhandledRejection);
+  try {
+    const scheduler = createPacketScheduler(async packet => {
+      processed.push(packet.packetId);
+    }, { pauseGate });
+
+    pauseGate.pause();
+    assert.equal(scheduler.submit({ packetId: 'packet-1' }), true);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.deepEqual(scheduler.discardPending(), ['packet-1']);
+
+    pauseGate.resume();
+    await scheduler.waitForIdle();
+    for (let turn = 0; turn < 4; turn += 1) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+
+    assert.deepEqual(processed, []);
+    assert.equal(scheduler.getState().activePacket, null);
+    assert.deepEqual(scheduler.getState().pendingPackets, []);
+    assert.deepEqual(unhandledRejections, []);
+  } finally {
+    process.removeListener('unhandledRejection', onUnhandledRejection);
+  }
+});
+
 test('packet processor abandons a stale packet after reply generation', async () => {
   const calls: string[] = [];
   let destinationEpoch = 0;

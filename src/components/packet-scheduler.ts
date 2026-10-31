@@ -43,12 +43,16 @@ export function createPacketScheduler<Packet extends ScheduledPacket>(
             continue;
           }
         }
-        activePacket = pendingPackets.shift()!;
+        const packet = pendingPackets.shift();
+        if (!packet) {
+          break;
+        }
+        activePacket = packet;
         try {
-          await processPacket(activePacket);
-          completedPacketIds.push(activePacket.packetId);
+          await processPacket(packet);
+          completedPacketIds.push(packet.packetId);
         } catch {
-          failedPacketIds.push(activePacket.packetId);
+          failedPacketIds.push(packet.packetId);
         } finally {
           activePacket = null;
         }

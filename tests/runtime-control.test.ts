@@ -413,6 +413,86 @@ test('runtime control aborts an in-progress destination change when stopped', as
   assert.equal((await stop).status, 'stopped');
 });
 
+test('runtime control reports an aborted pause when the engine stops first', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  let releasePause!: () => void;
+  let pauseEntered!: () => void;
+  const entered = new Promise<void>(resolve => {
+    pauseEntered = resolve;
+  });
+  const release = new Promise<void>(resolve => {
+    releasePause = resolve;
+  });
+  let resolveShutdown!: () => void;
+  const shutdown = new Promise<void>(resolve => {
+    resolveShutdown = resolve;
+  });
+  const control = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => resolveShutdown(),
+    requestPause: async () => {
+      pauseEntered();
+      await release;
+    },
+  });
+  control.setState('running');
+
+  try {
+    const pause = requestRuntimePause(configurationPath);
+    await entered;
+    const stop = requestRuntimeStop(configurationPath);
+    await shutdown;
+    control.complete(0);
+    releasePause();
+
+    await assert.rejects(pause, /ABORTED/);
+    assert.equal((await stop).status, 'stopped');
+  } finally {
+    control.complete(1);
+    await control.close();
+  }
+});
+
+test('runtime control reports an aborted resume when the engine stops first', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  let releaseResume!: () => void;
+  let resumeEntered!: () => void;
+  const entered = new Promise<void>(resolve => {
+    resumeEntered = resolve;
+  });
+  const release = new Promise<void>(resolve => {
+    releaseResume = resolve;
+  });
+  let resolveShutdown!: () => void;
+  const shutdown = new Promise<void>(resolve => {
+    resolveShutdown = resolve;
+  });
+  const control = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => resolveShutdown(),
+    requestPause: () => undefined,
+    requestResume: async () => {
+      resumeEntered();
+      await release;
+    },
+  });
+  control.setState('running');
+
+  try {
+    assert.match(await sendRuntimeCommand(configurationPath, 'PAUSE'), /^PAUSED /);
+    const resume = requestRuntimeResume(configurationPath);
+    await entered;
+    const stop = requestRuntimeStop(configurationPath);
+    await shutdown;
+    control.complete(0);
+    releaseResume();
+
+    await assert.rejects(resume, /ABORTED/);
+    assert.equal((await stop).status, 'stopped');
+  } finally {
+    control.complete(1);
+    await control.close();
+  }
+});
+
 test('runtime control rejects unsupported and unknown commands without requesting shutdown', async context => {
   const configurationPath = temporaryConfigurationPath(context);
   let shutdownRequests = 0;

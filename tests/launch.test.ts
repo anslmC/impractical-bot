@@ -134,6 +134,7 @@ class StartupPage {
   readonly gotoUrls: string[] = [];
   loginDetected = false;
   loginIndicatorsAvailable = true;
+  loginIndicatorReads = 0;
   loginIndicatorError: Error | undefined;
   navigationCount = 0;
   pinVisible = false;
@@ -255,12 +256,13 @@ class StartupPage {
   }
 
   isVisible(key: string): boolean {
-    if (this.loginIndicatorError && (
-      key === 'role:heading:Create a post' ||
+    if (key === 'role:heading:Create a post' ||
       key === '[role="region"][aria-label="Create a post"]' ||
-      key === 'role:button:Messenger'
-    )) {
-      throw this.loginIndicatorError;
+      key === 'role:button:Messenger') {
+      this.loginIndicatorReads += 1;
+      if (this.loginIndicatorError) {
+        throw this.loginIndicatorError;
+      }
     }
     if (key === 'notification-dialog') {
       if (this.scenario === 'late-blockers' && this.events.includes('notification-checked')) {
@@ -503,11 +505,13 @@ test('startup opens Facebook in the existing blank tab when no Facebook tab is r
 test('startup detects login on a single Facebook tab', async () => {
   const page = new StartupPage(baseConfiguration.messageDestination!, 'no-pin');
   page.loginGate.resolve();
+  await Promise.resolve();
 
   await prepareConfiguredBrowser(browserForStartupPage(page), baseConfiguration);
 
   assert.equal(page.navigationCount, 1);
   assert.equal(page.loginDetected, true);
+  assert.equal(page.loginIndicatorReads, 3);
   assert.deepEqual(page.gotoUrls, [baseConfiguration.messageDestination]);
 });
 

@@ -195,6 +195,7 @@ interface PageConsoleMessage {
 function createWakerPage() {
   const document = new FakeDocument();
   const listeners = new Set<(message: PageConsoleMessage) => void>();
+  const loadListeners = new Set<() => void>();
   const windowObject: Record<string, unknown> = {};
   let observerSetupCalls = 0;
   let messageReadCalls = 0;
@@ -246,14 +247,28 @@ function createWakerPage() {
   log.appendChild(createMessage('baseline-1', 'hello'));
 
   const page = {
-    on(event: string, listener: (message: PageConsoleMessage) => void) {
-      assert.equal(event, 'console');
-      listeners.add(listener);
+    on(
+      event: string,
+      listener: ((message: PageConsoleMessage) => void) | (() => void),
+    ) {
+      if (event === 'console') {
+        listeners.add(listener as (message: PageConsoleMessage) => void);
+        return this;
+      }
+      assert.equal(event, 'load');
+      loadListeners.add(listener as () => void);
       return this;
     },
-    off(event: string, listener: (message: PageConsoleMessage) => void) {
-      assert.equal(event, 'console');
-      listeners.delete(listener);
+    off(
+      event: string,
+      listener: ((message: PageConsoleMessage) => void) | (() => void),
+    ) {
+      if (event === 'console') {
+        listeners.delete(listener as (message: PageConsoleMessage) => void);
+        return this;
+      }
+      assert.equal(event, 'load');
+      loadListeners.delete(listener as () => void);
       return this;
     },
     locator(selector: string) {
@@ -343,6 +358,12 @@ function createWakerPage() {
       observer?.disconnect();
       delete windowObject.__impracticalBotWakerObserver;
     },
+    simulateReload() {
+      this.simulateDocumentReplacement();
+      for (const listener of [...loadListeners]) {
+        listener();
+      }
+    },
     get observer() {
       return windowObject.__impracticalBotWakerObserver as
         | (FakeMutationObserver & { active: boolean })
@@ -355,7 +376,7 @@ function createWakerPage() {
       return messageReadCalls;
     },
     get listenerCount() {
-      return listeners.size;
+      return listeners.size + loadListeners.size;
     },
   };
 }
@@ -643,6 +664,45 @@ test('Combustion keeps waking after the message log element is replaced', async 
 
     assert.ok(wakerPage.messageReadCalls > readsBeforeWake);
     assert.ok(contextStore.getState().messageIds.includes('replacement-1'));
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+  }
+});
+
+test('Combustion recovers after an unexpected page reload while idle', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  const wakerPage = createWakerPage();
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page: wakerPage.page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    await advanceToIdle(context, wakerPage);
+    assert.equal(wakerPage.observer?.active, true);
+
+    wakerPage.simulateReload();
+    await advanceToIdle(context, wakerPage);
+
+    assert.ok(wakerPage.observer, 'the reloaded document gets a waker observer');
+    assert.equal(wakerPage.observer?.active, true);
+    assert.equal(wakerPage.observerSetupCalls, 2);
+
+    const readsBeforeWake = wakerPage.messageReadCalls;
+    wakerPage.appendMessage('after-reload-1', 'activity after reload');
+    await flush();
+
+    assert.ok(wakerPage.messageReadCalls > readsBeforeWake);
+    assert.ok(contextStore.getState().messageIds.includes('after-reload-1'));
   } finally {
     await controller.stop();
     Math.random = originalRandom;

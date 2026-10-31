@@ -35,18 +35,27 @@ const configuration: Configuration = {
 
 function createMockPage({ failObserverSetup = false, messageCount = 1 } = {}) {
   const listeners = new Set<(...args: unknown[]) => void>();
+  const loadListeners = new Set<(...args: unknown[]) => void>();
   let observerSetupCalls = 0;
   let observerCleanupCalls = 0;
   let baselineReadCalls = 0;
   const page = {
     on(event: string, listener: (...args: unknown[]) => void) {
-      assert.equal(event, 'console');
-      listeners.add(listener);
+      if (event === 'console') {
+        listeners.add(listener);
+        return this;
+      }
+      assert.equal(event, 'load');
+      loadListeners.add(listener);
       return this;
     },
     off(event: string, listener: (...args: unknown[]) => void) {
-      assert.equal(event, 'console');
-      listeners.delete(listener);
+      if (event === 'console') {
+        listeners.delete(listener);
+        return this;
+      }
+      assert.equal(event, 'load');
+      loadListeners.delete(listener);
       return this;
     },
     locator(selector: string) {
@@ -99,6 +108,9 @@ function createMockPage({ failObserverSetup = false, messageCount = 1 } = {}) {
     page,
     get listenerCount() {
       return listeners.size;
+    },
+    get loadListenerCount() {
+      return loadListeners.size;
     },
     get observerSetupCalls() {
       return observerSetupCalls;
@@ -205,6 +217,7 @@ test('Combustion uses the supplied seeded store and cleans up before stop resolv
   assert.equal(mockPage.baselineReadCalls, 1);
   assert.equal(mockPage.observerSetupCalls, 1);
   assert.equal(mockPage.listenerCount, 1);
+  assert.equal(mockPage.loadListenerCount, 1);
   assert.deepEqual(contextStore.getRecent(1), [{
     messageId: 'historical-1',
     message: 'hello',
@@ -216,6 +229,7 @@ test('Combustion uses the supplied seeded store and cleans up before stop resolv
   await controller.stop();
   await controller.stopped;
   assert.equal(mockPage.listenerCount, 0);
+  assert.equal(mockPage.loadListenerCount, 0);
   assert.equal(mockPage.observerCleanupCalls, 1);
 });
 
@@ -2152,6 +2166,93 @@ test('an in-flight RNG generation is never duplicated by a later poll', async co
     await controller.stop();
     Math.random = originalRandom;
     console.log = originalLog;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('a failed RNG reply does not start the reply cooldown', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  const originalLog = console.log;
+  const originalError = console.error;
+  const logs: string[] = [];
+  Math.random = () => 0;
+  console.log = (...values: unknown[]) => {
+    logs.push(values.map(String).join(' '));
+  };
+  console.error = () => undefined;
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  let generations = 0;
+  let composed = 0;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async () => {
+    generations += 1;
+    if (generations === 1) {
+      throw new Error('generation failed');
+    }
+    return 'second reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => {
+    composed += 1;
+    return { status: 'sent' };
+  };
+
+  const pollsTo = async (elapsedMs: number): Promise<void> => {
+    context.mock.timers.tick(elapsedMs);
+    await flushEngine();
+  };
+
+  const { page, inject } = createInjectedMessengerPage();
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'chat-1', sender: 'Alex', message: 'just chatting' }]);
+    await pollsTo(1_500);
+    await pollsTo(6_000);
+    assert.equal(generations, 1, 'the first opportunity is taken');
+    assert.equal(composed, 0, 'a failed generation is never sent');
+    assert.equal(
+      logs.filter(line => line.includes('Cooldown started')).length,
+      0,
+      'a failed reply does not start a cooldown',
+    );
+    assert.ok(
+      logs.some(line => line.includes('Processing completed:') && line.includes('failure')),
+      'the failure is reported',
+    );
+
+    await pollsTo(6_000);
+    assert.equal(generations, 1, 'no roll happens before the next 7-second deadline');
+    await pollsTo(1_500);
+    assert.equal(generations, 2, 'the next deadline is evaluated without waiting for a cooldown');
+    assert.equal(composed, 1, 'the successful retry is sent');
+    assert.equal(
+      logs.filter(line => line.includes('Cooldown started')).length,
+      1,
+      'only the successful reply starts a cooldown',
+    );
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    console.log = originalLog;
+    console.error = originalError;
     context.mock.timers.reset();
     (nvidiaModule as unknown as {
       generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;

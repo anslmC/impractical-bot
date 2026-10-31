@@ -413,14 +413,16 @@ export async function createRuntimeControl(
       state = 'changing';
       try {
         await runtimeHandlers.requestPause();
-        if (!isStopping()) {
-          state = 'paused';
+        if (isStopping()) {
+          return `ERROR ${instanceId} ABORTED\n`;
         }
+        state = 'paused';
         return `PAUSED ${instanceId}\n`;
       } catch {
-        if (!isStopping()) {
-          state = 'running';
+        if (isStopping()) {
+          return `ERROR ${instanceId} ABORTED\n`;
         }
+        state = 'running';
         return `ERROR ${instanceId} PAUSE_FAILED\n`;
       }
     }
@@ -444,14 +446,16 @@ export async function createRuntimeControl(
       state = 'changing';
       try {
         await runtimeHandlers.requestResume();
-        if (!isStopping()) {
-          state = 'running';
+        if (isStopping()) {
+          return `ERROR ${instanceId} ABORTED\n`;
         }
+        state = 'running';
         return `RESUMED ${instanceId}\n`;
       } catch {
-        if (!isStopping()) {
-          state = 'paused';
+        if (isStopping()) {
+          return `ERROR ${instanceId} ABORTED\n`;
         }
+        state = 'paused';
         return `ERROR ${instanceId} RESUME_FAILED\n`;
       }
     }

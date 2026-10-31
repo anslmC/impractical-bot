@@ -343,7 +343,7 @@ async function waitForSuccessLogin(pages: Page[], timeoutMs: number): Promise<vo
     for (let index = 0; index < indicatorsByPage.length; index += 1) {
       try {
         const indicators = indicatorsByPage[index];
-        if (await areLoginIndicatorsVisible(indicators) && await areLoginIndicatorsVisible(indicators)) {
+        if (await areLoginIndicatorsVisible(indicators)) {
           return;
         }
         inspectionErrors.delete(pages[index]);

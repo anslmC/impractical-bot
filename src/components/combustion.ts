@@ -467,6 +467,7 @@ export async function startCombustion({
     navigatePageToMessengerDestination(page, configuration, destination));
   let observerAttached = false;
   let stopRequested = false;
+  let loadListenerAttached = false;
   let destinationChangeInProgress = false;
   let pendingDestination: string | null = null;
   let destinationEpoch = 0;
@@ -542,7 +543,7 @@ export async function startCombustion({
       `Processing completed: ${styled(packetId, 'bold')} ` +
       `(${styled(outcome, succeeded ? 'green' : 'red')})`,
     ));
-    if (stopRequested || completedEpoch !== destinationEpoch) {
+    if (!succeeded || stopRequested || completedEpoch !== destinationEpoch) {
       return;
     }
     startRngCooldown();
@@ -558,9 +559,31 @@ export async function startCombustion({
     wakeSignal.resolve();
   };
   let wakerTransition: Promise<void> = Promise.resolve();
-  const setWakerActive = (active: boolean): Promise<void> => {
+  const setWakerActive = (active: boolean): Promise<boolean> => {
+    let succeeded = !active;
     wakerTransition = wakerTransition.then(async () => {
-      if (!observerAttached || stopRequested || wakerActive === active) {
+      if (stopRequested) {
+        return;
+      }
+      if (wakerActive === active && (observerAttached || !active)) {
+        succeeded = true;
+        return;
+      }
+      if (active && !observerAttached) {
+        try {
+          await attachWakerObserver();
+        } catch (error) {
+          if (!stopRequested) {
+            console.error(`[waker] Could not attach observer: ${error instanceof Error ? error.message : String(error)}`);
+          }
+          return;
+        }
+      }
+      if (!observerAttached) {
+        if (!active) {
+          wakerActive = false;
+          succeeded = true;
+        }
         return;
       }
       try {
@@ -574,6 +597,7 @@ export async function startCombustion({
           }
         }, active);
         wakerActive = active;
+        succeeded = true;
         console.log(active
           ? '[waker] Active; listening for potential message activity.'
           : '[waker] Standby; poller is responsible for checking messages.');
@@ -583,7 +607,7 @@ export async function startCombustion({
         }
       }
     });
-    return wakerTransition;
+    return wakerTransition.then(() => succeeded);
   };
   const enterIdle = async (): Promise<void> => {
     if (stopRequested || pauseGate.isPaused() || mode === 'idle') {
@@ -594,7 +618,15 @@ export async function startCombustion({
       'poller',
       styled('Idle; no genuinely new message was detected before the threshold.', 'dim'),
     ));
-    await setWakerActive(true);
+    const wakerReady = await setWakerActive(true);
+    if (!wakerReady) {
+      mode = 'polling';
+      if (!stopRequested && !pauseGate.isPaused()) {
+        console.error('[waker] Idle waker unavailable; continuing periodic polling.');
+        await resetIdleTimer();
+      }
+      return;
+    }
     pollDelayResolve?.();
   };
   const resetIdleTimer = async (): Promise<void> => {
@@ -713,6 +745,10 @@ export async function startCombustion({
         page.off('console', onConsole);
         listenerAttached = false;
       }
+      if (loadListenerAttached) {
+        page.off('load', onPageLoad);
+        loadListenerAttached = false;
+      }
       if (observerAttached) {
         try {
           await page.evaluate(() => {
@@ -792,6 +828,15 @@ export async function startCombustion({
       debug: DEBUG_ENGINE,
     });
     observerAttached = true;
+  };
+
+  const onPageLoad = (): void => {
+    if (stopRequested || destinationChangeInProgress) {
+      return;
+    }
+    observerAttached = false;
+    wakerActive = false;
+    signalPollerWake();
   };
 
   const onConsole = (message: ConsoleMessage): void => {
@@ -1309,6 +1354,8 @@ export async function startCombustion({
 
     page.on('console', onConsole);
     listenerAttached = true;
+    page.on('load', onPageLoad);
+    loadListenerAttached = true;
     await attachWakerObserver();
 
     const baseline = await readLatestMessages();
