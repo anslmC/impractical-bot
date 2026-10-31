@@ -131,7 +131,12 @@ function createInjectedMessengerPage() {
   const mockPage = createMockPage({ messageCount: 0 });
   const basePage = mockPage.page;
   const originalLocator = basePage.locator.bind(basePage);
-  const injectedMessages: Array<{ messageId: string; sender: string; message: string }> = [];
+  const injectedMessages: Array<{
+    messageId: string;
+    sender: string;
+    message: string;
+    ariaLabel?: string | null;
+  }> = [];
   let readCount = 0;
 
   (basePage as { locator: (selector: string) => unknown }).locator = (selector: string) => {
@@ -149,9 +154,12 @@ function createInjectedMessengerPage() {
             if (name === 'data-message-id') {
               return message.messageId;
             }
-            return name === 'aria-label'
-              ? `At October 18, 2026, 1:15 PM, ${message.sender}: ${message.message}`
-              : null;
+            if (name === 'aria-label') {
+              return message.ariaLabel === undefined
+                ? `At October 18, 2026, 1:15 PM, ${message.sender}: ${message.message}`
+                : message.ariaLabel;
+            }
+            return null;
           },
           cloneNode() {
             return {
@@ -173,10 +181,20 @@ function createInjectedMessengerPage() {
     get readCount() {
       return readCount;
     },
-    inject(messages: Array<{ messageId: string; sender: string; message: string }>) {
+    inject(messages: Array<{
+      messageId: string;
+      sender: string;
+      message: string;
+      ariaLabel?: string | null;
+    }>) {
       injectedMessages.push(...messages);
     },
-    replace(messages: Array<{ messageId: string; sender: string; message: string }>) {
+    replace(messages: Array<{
+      messageId: string;
+      sender: string;
+      message: string;
+      ariaLabel?: string | null;
+    }>) {
       injectedMessages.length = 0;
       injectedMessages.push(...messages);
     },
@@ -1277,6 +1295,212 @@ test('Combustion never treats its own outgoing alias as a mention trigger', asyn
   }
 });
 
+test('a mention reply and its outgoing aliases never trigger another response', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0;
+  const generatedRequests: Array<readonly { messageId: string; message: string }[]> = [];
+  let composeCalls = 0;
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    generatedRequests.push(messages as readonly { messageId: string; message: string }[]);
+    return 'mocked reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => {
+    composeCalls += 1;
+    return { status: 'sent' };
+  };
+
+  const pollsTo = async (elapsedMs: number): Promise<void> => {
+    context.mock.timers.tick(elapsedMs);
+    await flushEngine();
+  };
+
+  const { page, inject } = createInjectedMessengerPage();
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'mid.$joke-request', sender: 'Alex', message: '@Bot tell me a joke' }]);
+    await pollsTo(1_500);
+    await pollsTo(1_500);
+    assert.equal(generatedRequests.length, 1, 'the mention is answered once');
+    assert.equal(composeCalls, 1);
+
+    // Messenger can expose the bot's own reply under a numeric id and a mid$
+    // alias, and the alias can lack a parseable sender label. Neither form may
+    // become RNG input or open another packet.
+    inject([
+      { messageId: '7522124487334215680', sender: 'You', message: 'mocked reply' },
+      { messageId: 'mid.$gAAW_bot-reply-1', sender: 'You', message: 'mocked reply', ariaLabel: null },
+      { messageId: '7522124525331950808', sender: 'You', message: 'another bot line' },
+      { messageId: 'mid.$gAAW_bot-reply-2', sender: 'You', message: 'another bot line', ariaLabel: null },
+      { messageId: '7522124563343282250', sender: 'Bot', message: 'a mislabelled bot line' },
+      { messageId: 'mid.$gAAW_bot-reply-3', sender: 'Bot', message: 'a mislabelled bot line' },
+    ]);
+    for (let poll = 0; poll < 16; poll += 1) {
+      await pollsTo(1_500);
+    }
+
+    assert.equal(generatedRequests.length, 1, 'bot-authored outgoing aliases never generate another reply');
+    assert.equal(composeCalls, 1);
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('an RNG reply is not repeated for the same incoming turn after the cooldown', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0;
+  const generatedRequests: Array<readonly { messageId: string; message: string }[]> = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    generatedRequests.push(messages as readonly { messageId: string; message: string }[]);
+    return 'mocked reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => ({ status: 'sent' });
+
+  const pollsTo = async (elapsedMs: number): Promise<void> => {
+    context.mock.timers.tick(elapsedMs);
+    await flushEngine();
+  };
+
+  const { page, inject } = createInjectedMessengerPage();
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'mid.$chat-1', sender: 'Alex', message: 'just chatting' }]);
+    await pollsTo(1_500);
+    await pollsTo(6_000);
+    assert.equal(generatedRequests.length, 1, 'the incoming turn gets one RNG reply');
+    assert.equal(generatedRequests[0].at(-1)?.messageId, 'mid.$chat-1');
+
+    // Even if the sent reply is not observed before the cooldown ends, the same
+    // incoming turn must not be answered again.
+    for (let poll = 0; poll < 20; poll += 1) {
+      await pollsTo(1_500);
+    }
+    assert.equal(generatedRequests.length, 1, 'the answered turn stays answered');
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('a new incoming message after an RNG reply still gets its own opportunity', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0;
+  const generatedRequests: Array<readonly { messageId: string; message: string }[]> = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    generatedRequests.push(messages as readonly { messageId: string; message: string }[]);
+    return 'mocked reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => ({ status: 'sent' });
+
+  const pollsTo = async (elapsedMs: number): Promise<void> => {
+    context.mock.timers.tick(elapsedMs);
+    await flushEngine();
+  };
+
+  const { page, inject } = createInjectedMessengerPage();
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'mid.$chat-1', sender: 'Alex', message: 'just chatting' }]);
+    await pollsTo(1_500);
+    await pollsTo(6_000);
+    assert.equal(generatedRequests.length, 1);
+
+    inject([
+      { messageId: '7522124487334215680', sender: 'You', message: 'mocked reply' },
+      { messageId: 'mid.$gAAW_bot-reply-1', sender: 'You', message: 'mocked reply', ariaLabel: null },
+      { messageId: 'mid.$chat-2', sender: 'Blair', message: 'a genuinely new message' },
+    ]);
+    for (let poll = 0; poll < 16; poll += 1) {
+      await pollsTo(1_500);
+    }
+
+    assert.equal(generatedRequests.length, 2, 'the new incoming turn is still eligible');
+    assert.equal(
+      generatedRequests[1].at(-1)?.messageId,
+      'mid.$chat-2',
+      'the new incoming message is the trigger, not the answered turn or a bot alias',
+    );
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
 test('Combustion strips a self-identifying prefix before composing and keeps a requested alias', async context => {
   context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
   const originalRandom = Math.random;
@@ -1971,12 +2195,13 @@ test('an RNG cooldown that expires is noticed on the next poll, not the next cad
     assert.equal(replies.length, 1, 'still inside the cooldown');
     assert.equal(countRngRolls(logs), rollsWhenSent, 'blocked polls never roll');
 
+    inject([{ messageId: 'chat-2', sender: 'Alex', message: 'a new topic' }]);
     await pollsTo(1_500);
     assert.ok(logs.some(line => line.includes('Cooldown ended')));
     assert.equal(
       replies.length,
       2,
-      'the first poll after the original cooldown expiry rolls again',
+      'the first poll after the original cooldown expiry answers the new incoming message',
     );
     assert.ok(
       logs.some(line => line.includes('Cooldown started:') && line.includes('6s')),
@@ -2065,11 +2290,12 @@ test('a mention keeps priority over an RNG opportunity without consuming it', as
     await flushEngine();
     assert.ok(logs.some(line => line.includes('Cooldown started')), 'the mention starts a cooldown');
 
-    // The mention cooldown delays the opportunity but does not discard it: keeping
-    // the deadline instead of resetting it means the reply lands on the first poll
-    // after the cooldown ends.
+    // The mention cooldown delays the opportunity but does not discard it: a
+    // genuinely new incoming message keeps the overdue opportunity available,
+    // so the reply lands on the first poll after the cooldown ends.
     await pollsTo(13_500);
     assert.equal(generations.length, 1, 'the cooldown still blocks the opportunity');
+    inject([{ messageId: 'chat-2', sender: 'Blair', message: 'moving on to a new topic' }]);
     await pollsTo(1_500);
     assert.equal(generations.length, 2, 'the opportunity is taken once the mention cooldown ends');
     assert.ok(logs.some(line => line.includes('Cooldown ended')));

@@ -181,6 +181,18 @@ function createMentionMatcher(aliases: readonly string[]): (message: string) => 
   return message => matcher.test(message);
 }
 
+function identityNameVariants(value: string): string[] {
+  const base = value.trim().replace(/^@+/u, '').replace(/\s+/gu, ' ');
+  if (!base) {
+    return [];
+  }
+  const collapsed = base.replace(/[_-]+/gu, ' ').replace(/\s+/gu, ' ');
+  const compact = collapsed.replace(/\s+/gu, '');
+  return [...new Set([base, collapsed, compact])]
+    .map(variant => variant.toLocaleLowerCase())
+    .filter(Boolean);
+}
+
 function formatPacketMessages(messages: PacketBuilderMessage[]): string {
   if (messages.length === 0) {
     return `  ${styled('(none)', 'dim')}`;
@@ -495,6 +507,46 @@ export async function startCombustion({
   let listenerAttached = false;
   const messageIdentity = createMessageIdentityTracker();
   const mentionsConfiguredAlias = createMentionMatcher(aliases);
+  const botIdentityNames = new Set(
+    [configuration.puppetName ?? '', ...aliases].flatMap(identityNameVariants),
+  );
+  const answeredIncomingMessageIds = new Set<string>();
+  const isBotAuthoredMessage = (message: {
+    sender?: unknown;
+    direction?: unknown;
+    [key: string]: unknown;
+  }): boolean => {
+    if (message.direction === 'OUTGOING') {
+      return true;
+    }
+    if (typeof message.sender !== 'string') {
+      return false;
+    }
+    return identityNameVariants(message.sender).some(variant =>
+      variant === 'you' || botIdentityNames.has(variant)
+    );
+  };
+  const isUsableIncomingMessage = (message: ContextMessage): boolean =>
+    message.direction === 'INCOMING' &&
+    !isBotAuthoredMessage(message) &&
+    message.message.trim().length > 0;
+  const rememberAnsweredIncomingMessages = (packet: ScheduledPacket): void => {
+    for (const message of [
+      ...(packet.contextMessages ?? []),
+      ...(packet.newMessages ?? []),
+    ]) {
+      if (message.direction === 'INCOMING' && message.messageId) {
+        answeredIncomingMessageIds.add(message.messageId);
+      }
+    }
+    while (answeredIncomingMessageIds.size > MESSAGE_HISTORY_LIMIT) {
+      const oldestMessageId = answeredIncomingMessageIds.values().next().value;
+      if (oldestMessageId === undefined) {
+        break;
+      }
+      answeredIncomingMessageIds.delete(oldestMessageId);
+    }
+  };
   const detectedAtByMessageId = new Map<string, number>();
   const observedTextByMessageId = new Map<string, string>();
   const packetTimings = new WeakMap<object, PacketTiming>();
@@ -1090,6 +1142,7 @@ export async function startCombustion({
     packetBuilderState = createPacketBuilderState();
     packetBuilderState.nextPacketNumber = nextPacketNumber;
     contextStore.clear();
+    answeredIncomingMessageIds.clear();
     seenMessageIds = new Set(baseline.map(message => message.messageId).filter(Boolean));
     appendContextMessages(contextStore, baseline, packetScheduler, packetBuilderState);
     packetBuilderState = buildPacketTurn({
@@ -1346,6 +1399,10 @@ export async function startCombustion({
         console.log(formatPacketTiming(packet, timing, performance.now()));
         activePacketTiming = undefined;
         activePacketContext = null;
+        if (succeeded && !stopRequested &&
+            packetEpochs.get(packet) === destinationEpoch) {
+          rememberAnsweredIncomingMessages(packet);
+        }
         if (succeeded && !isRngPacket && !stopRequested) {
           startRngCooldown('reply sent');
         }
@@ -1413,11 +1470,19 @@ export async function startCombustion({
         `${styled('Evaluating cycle', 'dim')} (due ${formatElapsed(overdueMs)} ago)`,
       ));
       const latestMessage = contextStore.getRecent(1)[0];
-      if (latestMessage?.direction === 'OUTGOING') {
+      if (latestMessage && !isUsableIncomingMessage(latestMessage)) {
         console.log(formatSubsystemStatus(
           'rng',
           `${styled('Skipping dice roll:', 'yellow')} ` +
-          'latest Context Store message is OUTGOING.',
+          'latest Context Store message is not an eligible incoming message.',
+        ));
+        return;
+      }
+      if (latestMessage && answeredIncomingMessageIds.has(latestMessage.messageId)) {
+        console.log(formatSubsystemStatus(
+          'rng',
+          `${styled('Skipping dice roll:', 'yellow')} ` +
+          'latest incoming message was already answered.',
         ));
         return;
       }
@@ -1444,14 +1509,34 @@ export async function startCombustion({
           'rng',
           `Context snapshot: ${styled(String(recentMessages.length), 'bold')} messages`,
         ));
-        const hasUsableIncomingMessage = recentMessages.some(message =>
-          message.direction === 'INCOMING' && message.message.trim().length > 0
-        );
-        if (!hasUsableIncomingMessage) {
+        const latestIncomingMessage = [...recentMessages]
+          .reverse()
+          .find(isUsableIncomingMessage);
+        if (!latestIncomingMessage) {
           rngOperationActive = false;
           console.log(formatSubsystemStatus(
             'rng',
             `${styled('Skipped:', 'yellow')} no usable incoming Messenger message`,
+          ));
+          console.log(formatSubsystemStatus('rng', 'No cooldown; normal polling resumes'));
+          return;
+        }
+        if (recentMessages.at(-1)?.messageId !== latestIncomingMessage.messageId) {
+          rngOperationActive = false;
+          console.log(formatSubsystemStatus(
+            'rng',
+            `${styled('Skipped:', 'yellow')} ` +
+            'the newest stored message is not an incoming message from another participant',
+          ));
+          console.log(formatSubsystemStatus('rng', 'No cooldown; normal polling resumes'));
+          return;
+        }
+        if (answeredIncomingMessageIds.has(latestIncomingMessage.messageId)) {
+          rngOperationActive = false;
+          console.log(formatSubsystemStatus(
+            'rng',
+            `${styled('Skipped:', 'yellow')} ` +
+            'the newest incoming message was already answered',
           ));
           console.log(formatSubsystemStatus('rng', 'No cooldown; normal polling resumes'));
           return;
