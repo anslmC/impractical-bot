@@ -137,6 +137,11 @@ class StartupPage {
   loginIndicatorReads = 0;
   loginIndicatorError: Error | undefined;
   navigationCount = 0;
+  navigationError: Error | undefined;
+  destinationAfterNavigation: string | undefined;
+  beforeNavigation: (() => void) | undefined;
+  closeAfterNavigation = false;
+  closed = false;
   pinVisible = false;
   notificationVisible = false;
   pinRejected = false;
@@ -158,7 +163,7 @@ class StartupPage {
     });
   }
 
-  isClosed(): boolean { return false; }
+  isClosed(): boolean { return this.closed; }
   url(): string { return this.currentUrl; }
 
   async waitForLoadState(): Promise<void> {
@@ -190,20 +195,27 @@ class StartupPage {
 
   async goto(url: string): Promise<void> {
     this.gotoUrls.push(url);
+    this.beforeNavigation?.();
+    if (this.navigationError) {
+      throw this.navigationError;
+    }
     if (url === baseConfiguration.startupUrl) {
       this.currentUrl = url;
       return;
     }
     const alreadyAtDestination = this.currentUrl === url;
+    const currentConversation = new URL(this.currentUrl).pathname
+      .match(/^\/messages\/t\/(\d+)(?:\/|$)/)?.[1];
     assert.equal(
-      this.loginDetected || alreadyAtDestination,
+      this.loginDetected || alreadyAtDestination || currentConversation !== undefined,
       true,
-      'destination navigation must follow login detection unless already at the destination',
+      'destination navigation must follow login detection unless already in Messenger',
     );
     this.navigationCount += 1;
-    this.currentUrl = this.scenario === 'wrong-conversation'
-      ? 'https://www.facebook.com/messages/t/999999999'
-      : url;
+    this.currentUrl = this.destinationAfterNavigation ??
+      (this.scenario === 'wrong-conversation'
+        ? 'https://www.facebook.com/messages/t/999999999'
+        : url);
     this.events.push('navigated');
     this.notificationVisible = this.scenario === 'notification-and-skip-pin' ||
       this.scenario === 'notification-dismiss-failure';
@@ -211,12 +223,18 @@ class StartupPage {
     if (this.scenario !== 'no-pin') {
       this.pinVisible = true;
     }
+    if (this.closeAfterNavigation) {
+      this.closed = true;
+    }
   }
 
   async waitForFunction(
     _callback: (expectedId: string) => boolean,
     expectedId: string,
   ): Promise<void> {
+    if (this.closed) {
+      throw new Error('Target page, context or browser has been closed');
+    }
     const currentId = new URL(this.currentUrl).pathname.match(/^\/messages\/t\/(\d+)(?:\/|$)/)?.[1];
     if (currentId !== expectedId) {
       throw new Error('wrong conversation');
@@ -529,25 +547,36 @@ test('startup skips feed login indicators when already at the configured convers
   assert.deepEqual(page.loginTimeouts, []);
 });
 
-test('startup still requires login detection on another conversation or checkpoint redirect', async () => {
-  const pageUrls = [
-    'https://www.facebook.com/messages/t/999999999',
-    'https://www.facebook.com/checkpoint/',
-  ];
+test('startup navigates directly from a different Messenger conversation without waiting for feed login indicators', async () => {
+  const page = new StartupPage('no-pin');
+  page.currentUrl = 'https://www.facebook.com/messages/t/999999999';
+  page.loginIndicatorsAvailable = false;
+  page.composerReady = true;
 
-  for (const pageUrl of pageUrls) {
-    const page = new StartupPage('no-pin');
-    page.currentUrl = pageUrl;
-    page.loginIndicatorsAvailable = false;
+  await prepareConfiguredBrowser(browserForStartupPage(page), baseConfiguration, {
+    loginTimeoutMs: 10,
+    readinessTimeoutMs: 1_000,
+  });
 
-    await assert.rejects(
-      prepareConfiguredBrowser(browserForStartupPage(page), baseConfiguration, {
-        loginTimeoutMs: 10,
-      }),
-      /Login detection timed out before all three visible Facebook indicators appeared/,
-    );
-    assert.deepEqual(page.gotoUrls, []);
-  }
+  assert.equal(page.loginDetected, false);
+  assert.equal(page.loginIndicatorReads, 0);
+  assert.equal(page.navigationCount, 1);
+  assert.deepEqual(page.gotoUrls, [baseConfiguration.messageDestination]);
+  assert.equal(page.currentUrl, baseConfiguration.messageDestination);
+});
+
+test('startup still requires login detection on a checkpoint redirect', async () => {
+  const page = new StartupPage('no-pin');
+  page.currentUrl = 'https://www.facebook.com/checkpoint/';
+  page.loginIndicatorsAvailable = false;
+
+  await assert.rejects(
+    prepareConfiguredBrowser(browserForStartupPage(page), baseConfiguration, {
+      loginTimeoutMs: 10,
+    }),
+    /Login detection timed out before all three visible Facebook indicators appeared/,
+  );
+  assert.deepEqual(page.gotoUrls, []);
 });
 
 test('startup keeps waiting for manual login before navigating', async () => {
@@ -565,22 +594,18 @@ test('startup keeps waiting for manual login before navigating', async () => {
   assert.equal(page.loginDetected, true);
 });
 
-test('startup times out when multiple Facebook tabs have no sufficient login evidence', async () => {
-  const messengerPage = new StartupPage('no-pin');
-  messengerPage.currentUrl = 'https://www.facebook.com/messages/t/999999999';
-  messengerPage.loginIndicatorsAvailable = false;
-  const feedPage = new StartupPage('no-pin');
-  feedPage.loginIndicatorsAvailable = false;
+test('startup times out when a Facebook tab has no sufficient login evidence', async () => {
+  const page = new StartupPage('no-pin');
+  page.loginIndicatorsAvailable = false;
 
   await assert.rejects(
-    prepareConfiguredBrowser(browserForStartupPage([messengerPage, feedPage]), baseConfiguration, {
+    prepareConfiguredBrowser(browserForStartupPage(page), baseConfiguration, {
       loginTimeoutMs: 10,
     }),
     /Login detection timed out before all three visible Facebook indicators appeared/,
   );
 
-  assert.equal(messengerPage.navigationCount, 0);
-  assert.equal(feedPage.navigationCount, 0);
+  assert.equal(page.navigationCount, 0);
 });
 
 test('startup reports login indicator page errors instead of relabeling them as timeouts', async () => {
@@ -754,6 +779,159 @@ test('startup does not report readiness for the wrong conversation or a missing 
   );
 });
 
+test('startup rejects a destination that falls back to the Messenger inbox', async () => {
+  const page = new StartupPage('no-pin');
+  page.currentUrl = 'https://www.facebook.com/messages/t/999999999';
+  page.destinationAfterNavigation = 'https://www.facebook.com/messages/t/';
+
+  await assert.rejects(
+    prepareConfiguredBrowser(browserForStartupPage(page), {
+      ...baseConfiguration,
+      skipPinRestoration: true,
+      pin: null,
+    }, { readinessTimeoutMs: 1_000 }),
+    /general inbox instead of opening conversation 1618007223454558/,
+  );
+
+  assert.equal(page.navigationCount, 1);
+  assert.equal(page.events.includes('conversation-verified'), false);
+});
+
+test('startup reports a navigation failure from a different conversation without retrying', async () => {
+  const page = new StartupPage('no-pin');
+  page.currentUrl = 'https://www.facebook.com/messages/t/999999999';
+  page.navigationError = new Error('navigation failed');
+
+  await assert.rejects(
+    prepareConfiguredBrowser(browserForStartupPage(page), {
+      ...baseConfiguration,
+      skipPinRestoration: true,
+      pin: null,
+    }, { readinessTimeoutMs: 1_000 }),
+    /Unable to navigate to the configured Messenger destination .*navigation failed/,
+  );
+
+  assert.equal(page.navigationCount, 0);
+  assert.deepEqual(page.gotoUrls, [baseConfiguration.messageDestination]);
+});
+
+test('startup reports a navigation timeout from a different conversation', async () => {
+  const page = new StartupPage('no-pin');
+  page.currentUrl = 'https://www.facebook.com/messages/t/999999999';
+  page.navigationError = Object.assign(new Error('Timeout 1ms exceeded.'), {
+    name: 'TimeoutError',
+  });
+
+  await assert.rejects(
+    prepareConfiguredBrowser(browserForStartupPage(page), {
+      ...baseConfiguration,
+      skipPinRestoration: true,
+      pin: null,
+    }, { navigationTimeoutMs: 10 }),
+    /navigation timed out/,
+  );
+
+  assert.deepEqual(page.gotoUrls, [baseConfiguration.messageDestination]);
+});
+
+test('startup reports a closed conversation tab during navigation verification', async () => {
+  const page = new StartupPage('no-pin');
+  page.currentUrl = 'https://www.facebook.com/messages/t/999999999';
+  page.composerReady = true;
+  page.closeAfterNavigation = true;
+
+  await assert.rejects(
+    prepareConfiguredBrowser(browserForStartupPage(page), {
+      ...baseConfiguration,
+      skipPinRestoration: true,
+      pin: null,
+    }, { readinessTimeoutMs: 1_000 }),
+    /conversation tab closed/,
+  );
+
+  assert.equal(page.navigationCount, 1);
+});
+
+test('startup rejects navigation that opens the wrong conversation', async () => {
+  const page = new StartupPage('no-pin');
+  page.currentUrl = 'https://www.facebook.com/messages/t/999999999';
+  page.destinationAfterNavigation = 'https://www.facebook.com/messages/t/888888888';
+  page.composerReady = true;
+
+  await assert.rejects(
+    prepareConfiguredBrowser(browserForStartupPage(page), {
+      ...baseConfiguration,
+      skipPinRestoration: true,
+      pin: null,
+    }, { readinessTimeoutMs: 1_000 }),
+    /did not settle on conversation/,
+  );
+
+  assert.equal(page.navigationCount, 1);
+});
+
+test('startup rejects a destination whose composer never becomes ready', async () => {
+  const page = new StartupPage('no-composer');
+  page.currentUrl = 'https://www.facebook.com/messages/t/999999999';
+
+  await assert.rejects(
+    prepareConfiguredBrowser(browserForStartupPage(page), {
+      ...baseConfiguration,
+      skipPinRestoration: true,
+      pin: null,
+    }, { readinessTimeoutMs: 1_000 }),
+    /composer/,
+  );
+
+  assert.equal(page.navigationCount, 1);
+  assert.equal(page.currentUrl, baseConfiguration.messageDestination);
+});
+
+test('startup cancellation before navigation leaves the conversation unchanged', async () => {
+  const page = new StartupPage('no-pin');
+  page.currentUrl = 'https://www.facebook.com/messages/t/999999999';
+  const controller = new AbortController();
+  controller.abort();
+
+  await assert.rejects(
+    prepareConfiguredBrowser(browserForStartupPage(page), {
+      ...baseConfiguration,
+      skipPinRestoration: true,
+      pin: null,
+    }, {
+      readinessTimeoutMs: 1_000,
+      signal: controller.signal,
+    }),
+    /navigation was cancelled/,
+  );
+
+  assert.deepEqual(page.gotoUrls, []);
+  assert.equal(page.currentUrl, 'https://www.facebook.com/messages/t/999999999');
+});
+
+test('startup cancellation during navigation stops before verification', async () => {
+  const page = new StartupPage('no-pin');
+  page.currentUrl = 'https://www.facebook.com/messages/t/999999999';
+  page.composerReady = true;
+  const controller = new AbortController();
+  page.beforeNavigation = () => controller.abort();
+
+  await assert.rejects(
+    prepareConfiguredBrowser(browserForStartupPage(page), {
+      ...baseConfiguration,
+      skipPinRestoration: true,
+      pin: null,
+    }, {
+      readinessTimeoutMs: 1_000,
+      signal: controller.signal,
+    }),
+    /navigation was cancelled/,
+  );
+
+  assert.deepEqual(page.gotoUrls, [baseConfiguration.messageDestination]);
+  assert.equal(page.events.includes('conversation-verified'), false);
+});
+
 test('launches configured browser, connects to its configured port, then disconnects Playwright only', async t => {
   const port = await getAvailablePort();
   const config = { ...baseConfiguration, cdpPort: port };
@@ -834,6 +1012,48 @@ test('navigates an engine page to a verified Messenger conversation', async () =
   assert.ok(page.events.includes('load-state-checked'));
   assert.ok(page.events.includes('conversation-verified'));
   assert.ok(page.events.includes('composer-readiness-checked'));
+});
+
+test('conversation navigation rejects the Messenger inbox fallback without waiting for readiness', async () => {
+  const destination = 'https://www.facebook.com/messages/t/987654321';
+  const page = new StartupPage('no-pin');
+  page.loginDetected = true;
+  page.destinationAfterNavigation = 'https://www.facebook.com/messages/t';
+
+  await assert.rejects(
+    navigatePageToMessengerDestination(
+      page as unknown as Page,
+      baseConfiguration,
+      destination,
+    ),
+    /general inbox instead of opening conversation 987654321/,
+  );
+
+  assert.deepEqual(page.gotoUrls, [destination]);
+  assert.equal(page.events.includes('conversation-verified'), false);
+});
+
+test('conversation navigation rejects a client-side inbox fallback reported by readiness polling', async () => {
+  const destination = 'https://www.facebook.com/messages/t/987654321';
+  const page = new StartupPage('no-pin');
+  page.loginDetected = true;
+  Object.assign(page, {
+    waitForFunction: async () => ({
+      jsonValue: async () => 'inbox',
+    }),
+  });
+
+  await assert.rejects(
+    navigatePageToMessengerDestination(
+      page as unknown as Page,
+      baseConfiguration,
+      destination,
+    ),
+    /general inbox instead of opening conversation 987654321/,
+  );
+
+  assert.deepEqual(page.gotoUrls, [destination]);
+  assert.equal(page.events.includes('conversation-verified'), false);
 });
 
 test('conversation navigation skips redundant navigation and rejects unverifiable destinations', async () => {

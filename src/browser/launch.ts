@@ -39,6 +39,7 @@ export interface BrowserLaunchOptions {
   loginTimeoutMs?: number;
   pinPromptTimeoutMs?: number;
   readinessTimeoutMs?: number;
+  signal?: AbortSignal;
   fileSystem?: BrowserLaunchFileSystem;
   spawnProcess?: (
     executablePath: string,
@@ -87,7 +88,7 @@ export interface BrowserLaunchSession {
   browserVersion: string;
   disconnected: Promise<void>;
   reusedExistingBrowser?: boolean;
-  prepare(): Promise<Page>;
+  prepare(options?: { signal?: AbortSignal }): Promise<Page>;
   isWindowMinimized?(page: Page): Promise<boolean | undefined>;
   disconnect(): Promise<void>;
 }
@@ -539,34 +540,60 @@ async function dismissNotificationDialog(page: Page): Promise<void> {
   console.log(startupStatus('Challenge 0: notification dialog dismissed.', 'green'));
 }
 
-async function waitForConfiguredConversation(
-  page: Page,
-  expectedConversationId: string,
-  timeoutMs: number,
-): Promise<void> {
-  try {
-    await page.waitForFunction(
-      expectedId => new URL(window.location.href).pathname
-        .match(/^\/messages\/t\/(\d+)(?:\/|$)/)?.[1] === expectedId,
-      expectedConversationId,
-      { timeout: timeoutMs },
-    );
-  } catch {
-    throw new Error(`The page did not settle on conversation ${expectedConversationId}.`);
+function isAuthenticationRedirect(url: URL): boolean {
+  return /^\/(?:login(?:\.php)?|checkpoint)(?:\/|$)/.test(url.pathname);
+}
+
+function isMessengerPage(url: URL): boolean {
+  return isFacebookUrl(url) && /^\/messages(?:\/|$)/.test(url.pathname);
+}
+
+function isMessengerInbox(url: URL): boolean {
+  return isFacebookUrl(url) && /^\/messages(?:\/t)?\/?$/.test(url.pathname);
+}
+
+function destinationUrlFailure(url: URL, expectedConversationId: string): string | undefined {
+  if (isAuthenticationRedirect(url)) {
+    return 'The destination navigation was redirected to Facebook authentication.';
+  }
+  if (isMessengerInbox(url)) {
+    return `Messenger returned to the general inbox instead of opening conversation ${expectedConversationId}.`;
+  }
+  return undefined;
+}
+
+function assertNavigationNotAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw new Error('Conversation navigation was cancelled before the destination was verified.');
   }
 }
 
-export interface ConversationNavigationOptions {
-  navigationTimeoutMs?: number;
-  readinessTimeoutMs?: number;
+function describeNavigationFailure(error: unknown, destinationUrl: URL): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  const timedOut = error instanceof Error &&
+    (error.name === 'TimeoutError' || /timeout/i.test(message));
+  const disconnected =
+    /target (?:page|closed)|browser.*(?:closed|disconnected)|page.*closed/i.test(message);
+  const detail = timedOut
+    ? 'navigation timed out'
+    : disconnected
+      ? 'the browser disconnected or the conversation tab closed'
+      : message;
+  return new Error(
+    `Unable to navigate to the configured Messenger destination ${destinationUrl.href}: ${detail}.`,
+    { cause: error },
+  );
 }
 
-export async function navigatePageToMessengerDestination(
-  page: Page,
+interface MessengerDestination {
+  destinationUrl: URL;
+  expectedConversationId: string;
+}
+
+function resolveMessengerDestination(
   configuration: Configuration,
   destination: string,
-  options: ConversationNavigationOptions = {},
-): Promise<void> {
+): MessengerDestination {
   const validatedConfiguration = validateConfiguration({
     ...configuration,
     messageDestination: destination,
@@ -579,12 +606,99 @@ export async function navigatePageToMessengerDestination(
   if (!expectedConversationId) {
     throw new Error('Message destination must identify a Messenger conversation.');
   }
+  return { destinationUrl, expectedConversationId };
+}
 
+function currentConversationId(page: Page): string | null {
+  try {
+    const currentUrl = new URL(page.url());
+    return isFacebookUrl(currentUrl) ? conversationId(currentUrl) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function waitForConfiguredConversation(
+  page: Page,
+  expectedConversationId: string,
+  timeoutMs: number,
+): Promise<void> {
+  let state: string | undefined;
+  try {
+    const handle = await page.waitForFunction(
+      expectedId => {
+        const path = new URL(window.location.href).pathname;
+        if (path.match(/^\/messages\/t\/(\d+)(?:\/|$)/)?.[1] === expectedId) {
+          return 'verified';
+        }
+        if (/^\/(?:login(?:\.php)?|checkpoint)(?:\/|$)/.test(path)) {
+          return 'authentication';
+        }
+        if (/^\/messages(?:\/t)?\/?$/.test(path)) {
+          return 'inbox';
+        }
+        return false;
+      },
+      expectedConversationId,
+      { timeout: timeoutMs },
+    );
+    if (handle && typeof handle.jsonValue === 'function') {
+      const value = await handle.jsonValue();
+      state = typeof value === 'string' ? value : undefined;
+    }
+  } catch (error) {
+    if (page.isClosed()) {
+      throw new Error('The conversation tab closed before the destination could be verified.', {
+        cause: error,
+      });
+    }
+    let failure: string | undefined;
+    try {
+      failure = destinationUrlFailure(new URL(page.url()), expectedConversationId);
+    } catch {
+    }
+    if (failure) {
+      throw new Error(failure, { cause: error });
+    }
+    throw new Error(`The page did not settle on conversation ${expectedConversationId}.`, {
+      cause: error,
+    });
+  }
+
+  if (state === 'authentication') {
+    throw new Error('The destination navigation was redirected to Facebook authentication.');
+  }
+  if (state === 'inbox') {
+    throw new Error(
+      `Messenger returned to the general inbox instead of opening conversation ${expectedConversationId}.`,
+    );
+  }
+}
+
+export interface ConversationNavigationOptions {
+  navigationTimeoutMs?: number;
+  readinessTimeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+interface MessengerNavigationOptions extends ConversationNavigationOptions {
+  verifyComposer?: boolean;
+  waitForNetworkIdle?: boolean;
+}
+
+async function navigateAndVerifyMessengerDestination(
+  page: Page,
+  destination: MessengerDestination,
+  options: MessengerNavigationOptions = {},
+): Promise<void> {
+  const { destinationUrl, expectedConversationId } = destination;
   const navigationTimeoutMs = options.navigationTimeoutMs ?? 30_000;
   const readinessTimeoutMs = options.readinessTimeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS;
   if (navigationTimeoutMs <= 0 || readinessTimeoutMs <= 0) {
     throw new Error('Conversation navigation and readiness timeouts must be positive.');
   }
+
+  assertNavigationNotAborted(options.signal);
 
   let alreadyAtDestination = false;
   try {
@@ -595,30 +709,67 @@ export async function navigatePageToMessengerDestination(
     alreadyAtDestination = false;
   }
   if (!alreadyAtDestination) {
-    await page.goto(destinationUrl.href, {
-      waitUntil: 'domcontentloaded',
-      timeout: navigationTimeoutMs,
-    });
+    try {
+      await page.goto(destinationUrl.href, {
+        waitUntil: 'domcontentloaded',
+        timeout: navigationTimeoutMs,
+      });
+    } catch (error) {
+      throw describeNavigationFailure(error, destinationUrl);
+    }
   }
 
+  assertNavigationNotAborted(options.signal);
+
+  let navigatedUrl: URL | undefined;
   try {
-    await page.waitForLoadState('networkidle', { timeout: 5_000 });
+    navigatedUrl = new URL(page.url());
   } catch {
+  }
+  const immediateFailure = navigatedUrl
+    ? destinationUrlFailure(navigatedUrl, expectedConversationId)
+    : undefined;
+  if (immediateFailure) {
+    throw new Error(immediateFailure);
+  }
+
+  if (options.waitForNetworkIdle !== false) {
+    try {
+      await page.waitForLoadState('networkidle', { timeout: 5_000 });
+    } catch {
+    }
+  }
+
+  assertNavigationNotAborted(options.signal);
+
+  let landedUrl: URL | undefined;
+  try {
+    landedUrl = new URL(page.url());
+  } catch {
+  }
+  const landedFailure = landedUrl
+    ? destinationUrlFailure(landedUrl, expectedConversationId)
+    : undefined;
+  if (landedFailure) {
+    throw new Error(landedFailure);
   }
 
   await waitForConfiguredConversation(page, expectedConversationId, readinessTimeoutMs);
+  assertNavigationNotAborted(options.signal);
   if (page.isClosed()) {
     throw new Error('The conversation tab closed before the destination could be verified.');
   }
 
-  const composers = page.locator('[role="textbox"][contenteditable="true"]:visible');
-  try {
-    await composers.first().waitFor({ state: 'visible', timeout: readinessTimeoutMs });
-  } catch {
-    throw new Error('A visible conversation composer did not become available.');
-  }
-  if (await composers.count() === 0 || !await composers.first().isEnabled()) {
-    throw new Error('The conversation composer is not ready.');
+  if (options.verifyComposer !== false) {
+    const composers = page.locator('[role="textbox"][contenteditable="true"]:visible');
+    try {
+      await composers.first().waitFor({ state: 'visible', timeout: readinessTimeoutMs });
+    } catch {
+      throw new Error('A visible conversation composer did not become available.');
+    }
+    if (await composers.count() === 0 || !await composers.first().isEnabled()) {
+      throw new Error('The conversation composer is not ready.');
+    }
   }
 
   let resultingUrl: URL;
@@ -635,6 +786,16 @@ export async function navigatePageToMessengerDestination(
   }
 }
 
+export async function navigatePageToMessengerDestination(
+  page: Page,
+  configuration: Configuration,
+  destination: string,
+  options: ConversationNavigationOptions = {},
+): Promise<void> {
+  const target = resolveMessengerDestination(configuration, destination);
+  await navigateAndVerifyMessengerDestination(page, target, options);
+}
+
 export async function prepareConfiguredBrowser(
   browser: Browser,
   configuration: Configuration,
@@ -647,14 +808,11 @@ export async function prepareConfiguredBrowser(
   if (!browser.isConnected()) {
     throw new Error('The configured browser disconnected before startup preparation.');
   }
-  const destinationUrl = new URL(validatedConfiguration.messageDestination);
-  if (!isFacebookUrl(destinationUrl)) {
-    throw new Error('Message destination must be on Facebook.');
-  }
-  const expectedConversationId = conversationId(destinationUrl);
-  if (!expectedConversationId) {
-    throw new Error('Message destination must identify a Messenger conversation.');
-  }
+  const destination = resolveMessengerDestination(
+    validatedConfiguration,
+    validatedConfiguration.messageDestination,
+  );
+  const { destinationUrl, expectedConversationId } = destination;
 
   let facebookPages = getFacebookPages(browser);
   if (facebookPages.length === 0) {
@@ -684,25 +842,35 @@ export async function prepareConfiguredBrowser(
   const page = selectFacebookPage(facebookPages, destinationUrl);
   console.log(formatTerminalMilestone('CONVERSATION', 'Verifying configured conversation.'));
   const currentPageUrl = new URL(page.url());
+  const currentId = currentConversationId(page);
   const alreadyAtConfiguredConversation = isFacebookUrl(currentPageUrl) &&
     currentPageUrl.origin === destinationUrl.origin &&
-    conversationId(currentPageUrl) === expectedConversationId;
+    currentId === expectedConversationId;
   logStartupDiagnostic(`alreadyAtConfiguredConversation=${alreadyAtConfiguredConversation}`);
   if (!alreadyAtConfiguredConversation) {
-    await waitForSuccessLogin(facebookPages, options.loginTimeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS);
+    if (!isMessengerPage(currentPageUrl)) {
+      await waitForSuccessLogin(facebookPages, options.loginTimeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS);
+    } else {
+      logStartupDiagnostic(
+        `destination mismatch: conversation ${currentId ?? 'none'} -> ${expectedConversationId}`,
+      );
+    }
     logStartupDiagnostic(`navigating to ${destinationUrl.href}`);
-    await page.goto(destinationUrl.href, {
-      waitUntil: 'domcontentloaded',
-      timeout: options.navigationTimeoutMs ?? 30_000,
+    await navigateAndVerifyMessengerDestination(page, destination, {
+      navigationTimeoutMs: options.navigationTimeoutMs,
+      readinessTimeoutMs: options.readinessTimeoutMs,
+      signal: options.signal,
+      verifyComposer: false,
+      waitForNetworkIdle: false,
     });
   } else {
     logStartupDiagnostic('skipping conversation navigation');
+    await waitForConfiguredConversation(
+      page,
+      expectedConversationId,
+      options.readinessTimeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS,
+    );
   }
-  await waitForConfiguredConversation(
-    page,
-    expectedConversationId,
-    options.readinessTimeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS,
-  );
   console.log(startupStatus(
     `Configured conversation ${expectedConversationId} verified after navigation.`,
     'green',
@@ -1095,11 +1263,14 @@ async function createBrowserLaunchSession(
       browserVersion,
       disconnected,
       reusedExistingBrowser,
-      prepare() {
+      prepare(prepareOptions) {
         if (!browser.isConnected()) {
           return Promise.reject(new Error('The configured browser disconnected before startup preparation.'));
         }
-        return prepareConfiguredBrowser(browser, configuration, options);
+        return prepareConfiguredBrowser(browser, configuration, {
+          ...options,
+          ...prepareOptions,
+        });
       },
       async isWindowMinimized(page: Page) {
         const cdpSession = await page.context().newCDPSession(page);

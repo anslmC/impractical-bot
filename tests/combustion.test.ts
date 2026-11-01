@@ -376,13 +376,218 @@ test('Combustion rejects an invalid destination, restores navigation, and keeps 
     });
     assert.equal(result.status, 'rejected');
     if (result.status === 'rejected') {
-      assert.match(result.reason, /not a valid or accessible group conversation/);
+      assert.equal(result.resumed, true);
+      assert.match(result.reason, /could not be opened or verified/);
       assert.match(result.reason, /destination could not be verified/);
     }
     assert.equal(persisted, false);
     assert.equal(configuration.messageDestination, originalDestination);
     assert.deepEqual(navigation, [destination, originalDestination]);
     assert.deepEqual(contextStore.getState().messageIds, ['historical-1']);
+  } finally {
+    await controller.stop();
+    context.mock.timers.reset();
+  }
+});
+
+test('Combustion stays paused when rollback to the previous destination fails', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const mockPage = createMockPage({ messageCount: 2 });
+  const contextStore = createContextStore();
+  contextStore.add([{ messageId: 'old-conversation', message: 'stale context' }]);
+  const originalDestination = configuration.messageDestination!;
+  const destination = 'https://www.facebook.com/messages/t/987654321';
+  const navigation: string[] = [];
+  let persisted = false;
+  const controller = await startCombustion({
+    page: mockPage.page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+    navigateDestination: async selectedDestination => {
+      navigation.push(selectedDestination);
+      if (selectedDestination === destination) {
+        throw new Error('requested destination failed');
+      }
+      if (selectedDestination === originalDestination) {
+        throw new Error('previous destination failed');
+      }
+    },
+  });
+
+  try {
+    const result = await controller.changeDestination(destination, {
+      resume: true,
+      persist: () => {
+        persisted = true;
+      },
+    });
+    assert.deepEqual(result, {
+      status: 'failed',
+      resumed: false,
+      reason:
+        'The requested destination could not be opened or verified. requested destination failed ' +
+        'The previous destination could not be restored, so the engine remains paused. ' +
+        'Rollback failure: previous destination failed',
+    });
+    assert.equal(persisted, false);
+    assert.equal(configuration.messageDestination, originalDestination);
+    assert.deepEqual(navigation, [destination, originalDestination]);
+    assert.deepEqual(
+      contextStore.getState().messageIds,
+      ['old-conversation', 'historical-1', 'baseline-1'],
+    );
+    await assert.rejects(
+      controller.resume(),
+      /cannot resume until a verified destination is restored/,
+    );
+  } finally {
+    await controller.stop();
+    context.mock.timers.reset();
+  }
+});
+
+test('Combustion rolls back when destination configuration persistence fails', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const mockPage = createMockPage({ messageCount: 2 });
+  const contextStore = createContextStore();
+  contextStore.add([{ messageId: 'old-conversation', message: 'stale context' }]);
+  const originalDestination = configuration.messageDestination!;
+  const destination = 'https://www.facebook.com/messages/t/987654321';
+  const navigation: string[] = [];
+  const persisted: string[] = [];
+  const controller = await startCombustion({
+    page: mockPage.page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+    navigateDestination: async selectedDestination => {
+      navigation.push(selectedDestination);
+    },
+  });
+
+  try {
+    const result = await controller.changeDestination(destination, {
+      resume: true,
+      persist: selectedDestination => {
+        persisted.push(selectedDestination);
+        throw new Error('configuration write failed');
+      },
+    });
+    assert.deepEqual(result, {
+      status: 'failed',
+      resumed: true,
+      reason:
+        'The requested destination was opened but its configuration could not be initialized. ' +
+        'configuration write failed',
+    });
+    assert.deepEqual(persisted, [destination]);
+    assert.equal(configuration.messageDestination, originalDestination);
+    assert.deepEqual(navigation, [destination, originalDestination]);
+    assert.deepEqual(
+      contextStore.getState().messageIds,
+      ['old-conversation', 'historical-1', 'baseline-1'],
+    );
+  } finally {
+    await controller.stop();
+    context.mock.timers.reset();
+  }
+});
+
+test('Combustion rolls back when destination conversation state reset fails', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const mockPage = createMockPage({ messageCount: 2 });
+  const contextStore = createContextStore();
+  contextStore.add([{ messageId: 'old-conversation', message: 'stale context' }]);
+  const originalDestination = configuration.messageDestination!;
+  const destination = 'https://www.facebook.com/messages/t/987654321';
+  const navigation: string[] = [];
+  let persisted = false;
+  const controller = await startCombustion({
+    page: mockPage.page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+    navigateDestination: async selectedDestination => {
+      navigation.push(selectedDestination);
+    },
+  });
+  const originalClear = contextStore.clear.bind(contextStore);
+  let clearCalls = 0;
+  contextStore.clear = () => {
+    clearCalls += 1;
+    if (clearCalls === 1) {
+      throw new Error('state reset failed');
+    }
+    originalClear();
+  };
+
+  try {
+    const result = await controller.changeDestination(destination, {
+      resume: true,
+      persist: () => {
+        persisted = true;
+      },
+    });
+    assert.deepEqual(result, {
+      status: 'failed',
+      resumed: true,
+      reason:
+        'The requested destination was opened but its conversation state could not be initialized. ' +
+        'state reset failed',
+    });
+    assert.equal(persisted, false);
+    assert.equal(configuration.messageDestination, originalDestination);
+    assert.deepEqual(navigation, [destination, originalDestination]);
+    assert.deepEqual(
+      contextStore.getState().messageIds,
+      ['old-conversation', 'historical-1', 'baseline-1'],
+    );
+  } finally {
+    contextStore.clear = originalClear;
+    await controller.stop();
+    context.mock.timers.reset();
+  }
+});
+
+test('Combustion leaves a previously paused engine paused after a rejected destination change', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const mockPage = createMockPage({ messageCount: 2 });
+  const originalDestination = configuration.messageDestination!;
+  const destination = 'https://www.facebook.com/messages/t/987654321';
+  const navigation: string[] = [];
+  const controller = await startCombustion({
+    page: mockPage.page,
+    contextStore: createContextStore(),
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+    navigateDestination: async selectedDestination => {
+      navigation.push(selectedDestination);
+      if (selectedDestination === destination) {
+        throw new Error('destination could not be verified');
+      }
+    },
+  });
+
+  try {
+    await controller.pause();
+    const result = await controller.changeDestination(destination, { resume: false });
+    assert.deepEqual(result, {
+      status: 'rejected',
+      resumed: false,
+      reason: 'The requested destination could not be opened or verified. destination could not be verified',
+    });
+    assert.equal(configuration.messageDestination, originalDestination);
+    assert.deepEqual(navigation, [destination, originalDestination]);
+    await controller.resume();
   } finally {
     await controller.stop();
     context.mock.timers.reset();
@@ -3573,7 +3778,7 @@ test('roster context reaches generation and refreshes after a destination change
   }
 });
 
-test('a failed roster refresh replaces stale roster context with unavailable', async context => {
+test('a failed roster refresh rolls back to the previous destination and roster', async context => {
   context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
   const originalRandom = Math.random;
   Math.random = () => 0.99;
@@ -3588,6 +3793,7 @@ test('a failed roster refresh replaces stale roster context with unavailable', a
   };
   const generatedRosters: Array<GroupRoster | undefined> = [];
   const systemInstructions: string[] = [];
+  const navigation: string[] = [];
   const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
   const originalCompose = composerModule.composeMessengerReply;
   (nvidiaModule as unknown as {
@@ -3610,27 +3816,41 @@ test('a failed roster refresh replaces stale roster context with unavailable', a
     apiKey: 'offline-test-key',
     debugMode: true,
     roster: initialRoster,
-    extractGroupRoster: async () => {
-      throw new Error('member panel unavailable');
+    extractGroupRoster: async () => ({
+      status: 'unavailable',
+      members: [],
+      puppet: null,
+      duplicateFirstNames: [],
+      reason: 'member panel unavailable',
+    }),
+    navigateDestination: async destination => {
+      navigation.push(destination);
     },
-    navigateDestination: async () => undefined,
   });
 
   try {
+    const destination = 'https://www.facebook.com/messages/t/987654321';
     const change = await controller.changeDestination(
-      'https://www.facebook.com/messages/t/987654321',
+      destination,
       { resume: true, persist: async () => undefined },
     );
-    assert.deepEqual(change, { status: 'changed', resumed: true });
+    assert.deepEqual(change, {
+      status: 'failed',
+      resumed: true,
+      reason:
+        'The requested destination was opened but its conversation state could not be initialized. ' +
+        'member panel unavailable',
+    });
+    assert.deepEqual(navigation, [destination, configuration.messageDestination]);
 
     inject([{ messageId: 'roster-failed-1', sender: 'Blair', message: '@Bot hello' }]);
     for (let poll = 0; poll < 3; poll += 1) {
       context.mock.timers.tick(3_000);
       await flushEngine();
     }
-    assert.equal(generatedRosters.at(-1)?.status, 'unavailable');
-    assert.deepEqual(generatedRosters.at(-1)?.members, []);
-    assert.equal(systemInstructions.at(-1)?.includes('Alex'), false);
+    assert.deepEqual(generatedRosters.at(-1), initialRoster);
+    assert.match(systemInstructions.at(-1) ?? '', /Alex/u);
+    assert.equal(systemInstructions.at(-1)?.includes('UNAVAILABLE'), false);
   } finally {
     await controller.stop();
     Math.random = originalRandom;
@@ -3641,5 +3861,43 @@ test('a failed roster refresh replaces stale roster context with unavailable', a
     (composerModule as unknown as {
       composeMessengerReply: typeof composerModule.composeMessengerReply;
     }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('a thrown roster refresh rolls back to the previous destination', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const navigation: string[] = [];
+  const controller = await startCombustion({
+    page: createMockPage({ messageCount: 2 }).page,
+    contextStore: createContextStore(),
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+    extractGroupRoster: async () => {
+      throw new Error('member panel unavailable');
+    },
+    navigateDestination: async destination => {
+      navigation.push(destination);
+    },
+  });
+
+  try {
+    const destination = 'https://www.facebook.com/messages/t/987654321';
+    const change = await controller.changeDestination(
+      destination,
+      { resume: true, persist: async () => undefined },
+    );
+    assert.deepEqual(change, {
+      status: 'failed',
+      resumed: true,
+      reason:
+        'The requested destination was opened but its conversation state could not be initialized. ' +
+        'member panel unavailable',
+    });
+    assert.deepEqual(navigation, [destination, configuration.messageDestination]);
+  } finally {
+    await controller.stop();
+    context.mock.timers.reset();
   }
 });

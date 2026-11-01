@@ -465,10 +465,24 @@ export async function startDashboard(
           };
         }
         if (result.status === 'rejected') {
-          return { ok: false, message: `Destination change rejected: ${result.reason}` };
+          return {
+            ok: false,
+            message:
+              `Destination change rejected: ${result.reason} ` +
+              (result.resumed
+                ? 'The engine resumed at the previous destination.'
+                : 'The engine remains paused.'),
+          };
         }
         if (result.status === 'failed') {
-          return { ok: false, message: `Destination change failed: ${result.reason}` };
+          return {
+            ok: false,
+            message:
+              `Destination change failed: ${result.reason} ` +
+              (result.resumed
+                ? 'The engine resumed at the previous destination.'
+                : 'The engine remains paused.'),
+          };
         }
         return { ok: false, message: 'No impractical-bot engine is running.' };
       },

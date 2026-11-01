@@ -2368,7 +2368,7 @@ test('changemsgUrl rejection preserves a running engine destination and requires
     async () => destination,
   );
   assert.equal(change.exitCode, 1);
-  assert.match(change.errors[0], /not a valid or accessible group conversation/);
+  assert.match(change.errors[0], /could not be verified/);
   assert.match(change.output[0], /remains paused/);
   const savedAfterRejection = loadConfiguration(configurationFilePath);
   assert.equal(savedAfterRejection.status, 'valid');

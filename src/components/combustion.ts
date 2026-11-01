@@ -6,7 +6,6 @@ import {
 } from '../ai/nvidia.js';
 import { navigatePageToMessengerDestination } from '../browser/launch.js';
 import {
-  createUnavailableGroupRoster,
   extractGroupRoster,
   formatGroupRosterOutcome,
   sanitizeGroupRoster,
@@ -152,12 +151,23 @@ export interface CombustionOptions {
 
 export type DestinationChangeResult =
   | { status: 'changed'; resumed: boolean }
-  | { status: 'rejected'; reason: string }
-  | { status: 'failed'; reason: string };
+  | { status: 'rejected'; reason: string; resumed?: boolean }
+  | { status: 'failed'; reason: string; resumed?: boolean };
 
 export interface DestinationChangeOptions {
   resume: boolean;
   persist?: (destination: string) => void | Promise<void>;
+}
+
+interface ConversationRuntimeSnapshot {
+  destination?: string;
+  roster?: GroupRoster;
+  contextMessages: ContextMessage[];
+  seenMessageIds: string[];
+  answeredIncomingMessageIds: string[];
+  detectedAtByMessageId: Array<[string, number]>;
+  observedTextByMessageId: Array<[string, string]>;
+  packetBuilderState?: PacketBuilderState;
 }
 
 export interface CombustionController {
@@ -501,6 +511,7 @@ export async function startCombustion({
   let loadListenerAttached = false;
   let destinationChangeInProgress = false;
   let pendingDestination: string | null = null;
+  let destinationSafe = true;
   let destinationEpoch = 0;
   const packetEpochs = new WeakMap<object, number>();
   let mode: 'polling' | 'idle' = 'polling';
@@ -830,6 +841,9 @@ export async function startCombustion({
   const resumeEngine = async (): Promise<void> => {
     if (stopRequested || !pauseGate.isPaused()) {
       return;
+    }
+    if (!destinationSafe) {
+      throw new Error('The engine cannot resume until a verified destination is restored.');
     }
     pauseGate.resume();
     if (mode === 'idle') {
@@ -1252,38 +1266,106 @@ export async function startCombustion({
     rngCooldownTimer = undefined;
   };
 
-  const returnToPreviousDestination = async (
-    previousDestination: string | undefined,
-  ): Promise<void> => {
+  const captureConversationSnapshot = (): ConversationRuntimeSnapshot => ({
+    destination: configuration.messageDestination,
+    roster: groupRoster,
+    contextMessages: contextStore.getRecent(contextStore.getState().maxMessages),
+    seenMessageIds: seenMessageIds.values(),
+    answeredIncomingMessageIds: [...answeredIncomingMessageIds],
+    detectedAtByMessageId: [...detectedAtByMessageId.entries()],
+    observedTextByMessageId: [...observedTextByMessageId.entries()],
+    packetBuilderState: packetBuilderState ? structuredClone(packetBuilderState) : undefined,
+  });
+
+  const restoreConversationSnapshot = (snapshot: ConversationRuntimeSnapshot): void => {
+    groupRoster = snapshot.roster;
+    recomposeSystemInstruction();
+    contextStore.clear();
+    if (snapshot.contextMessages.length > 0) {
+      contextStore.add(snapshot.contextMessages);
+    }
+    seenMessageIds.clear();
+    for (const messageId of snapshot.seenMessageIds) {
+      seenMessageIds.add(messageId);
+    }
+    answeredIncomingMessageIds.clear();
+    for (const messageId of snapshot.answeredIncomingMessageIds) {
+      answeredIncomingMessageIds.add(messageId);
+    }
+    detectedAtByMessageId.clear();
+    for (const [messageId, detectedAt] of snapshot.detectedAtByMessageId) {
+      detectedAtByMessageId.set(messageId, detectedAt);
+    }
+    observedTextByMessageId.clear();
+    for (const [messageId, text] of snapshot.observedTextByMessageId) {
+      observedTextByMessageId.set(messageId, text);
+    }
+    packetBuilderState = snapshot.packetBuilderState
+      ? structuredClone(snapshot.packetBuilderState)
+      : createPacketBuilderState();
+    messageIdentity.clear();
+    packetScheduler?.discardPending();
+    rngOperationActive = false;
+    rngPacketInFlightId = null;
+    rngPacketEpoch = null;
+    lastRngSkipReason = null;
+    rngCooldownActive = false;
+    clearTimeout(rngCooldownTimer);
+    rngCooldownTimer = undefined;
+  };
+
+  const restorePreviousDestination = async (
+    snapshot: ConversationRuntimeSnapshot,
+  ): Promise<string | undefined> => {
+    const previousDestination = snapshot.destination;
     if (!previousDestination) {
-      return;
+      destinationSafe = false;
+      return 'No previous destination was available for rollback.';
     }
     try {
       await navigateToDestination(previousDestination);
-      if (!stopRequested) {
-        observerAttached = false;
-        await attachWakerObserver();
+      if (stopRequested) {
+        throw new Error('The engine stopped during rollback navigation.');
       }
+      observerAttached = false;
+      await attachWakerObserver();
+      restoreConversationSnapshot(snapshot);
+      configuration.messageDestination = previousDestination;
+      destinationSafe = true;
       console.log('[engine] Returned to the previous message destination.');
+      return undefined;
     } catch (error) {
+      try {
+        restoreConversationSnapshot(snapshot);
+        configuration.messageDestination = previousDestination;
+      } catch {
+      }
+      destinationSafe = false;
+      const reason = describeError(error);
       console.error(
         '[engine] Could not return to the previous message destination: ' +
-        `${describeError(error)}`,
+        `${reason}`,
       );
+      return reason;
     }
   };
 
-  const refreshGroupRoster = async (): Promise<void> => {
+  const extractRefreshedGroupRoster = async (): Promise<GroupRoster | undefined> => {
     if (!shouldRefreshRoster) {
-      return;
+      return undefined;
     }
-    let refreshedRoster: GroupRoster;
-    try {
-      refreshedRoster = sanitizeGroupRoster(
-        await rosterExtractor(page, configuration.puppetName ?? ''),
-      );
-    } catch {
-      refreshedRoster = createUnavailableGroupRoster('group roster extraction failed');
+    const roster = sanitizeGroupRoster(
+      await rosterExtractor(page, configuration.puppetName ?? ''),
+    );
+    if (roster.status === 'unavailable') {
+      throw new Error(roster.reason ?? 'group roster extraction failed');
+    }
+    return roster;
+  };
+
+  const commitGroupRoster = (refreshedRoster: GroupRoster | undefined): void => {
+    if (refreshedRoster === undefined) {
+      return;
     }
     groupRoster = refreshedRoster;
     console.log(formatGroupRosterOutcome(refreshedRoster));
@@ -1295,74 +1377,138 @@ export async function startCombustion({
     { resume, persist }: DestinationChangeOptions,
   ): Promise<DestinationChangeResult> => {
     if (destinationChangeInProgress || pendingDestination !== null) {
-      return { status: 'rejected', reason: 'A destination change is already in progress.' };
+      return { status: 'rejected', resumed: false, reason: 'A destination change is already in progress.' };
     }
     if (stopRequested) {
-      return { status: 'failed', reason: 'The engine is stopping.' };
+      return { status: 'failed', resumed: false, reason: 'The engine is stopping.' };
     }
 
-    const previousDestination = configuration.messageDestination;
+    const snapshot = captureConversationSnapshot();
     destinationChangeInProgress = true;
     pendingDestination = destination;
     try {
       await pauseEngine();
       if (stopRequested) {
-        return { status: 'failed', reason: 'The engine stopped during the destination change.' };
+        return {
+          status: 'failed',
+          resumed: false,
+          reason: 'The engine stopped during the destination change.',
+        };
       }
 
-      let baseline: MessageDetails[];
+      destinationEpoch += 1;
+      packetScheduler?.discardPending();
+
       try {
         await navigateToDestination(destination);
+      } catch (error) {
+        const reason = describeError(error);
+        console.error(`[engine] Destination change rejected: ${reason}`);
         if (stopRequested) {
           return {
             status: 'failed',
-            reason: 'The engine stopped during destination navigation.',
+            resumed: false,
+            reason: `The engine stopped while opening the requested destination. ${reason}`,
           };
         }
+        const rollbackFailure = await restorePreviousDestination(snapshot);
+        if (rollbackFailure) {
+          return {
+            status: 'failed',
+            resumed: false,
+            reason:
+              `The requested destination could not be opened or verified. ${reason} ` +
+              `The previous destination could not be restored, so the engine remains paused. ` +
+              `Rollback failure: ${rollbackFailure}`,
+          };
+        }
+        if (resume) {
+          await resumeEngine();
+        }
+        return {
+          status: 'rejected',
+          resumed: resume,
+          reason: `The requested destination could not be opened or verified. ${reason}`,
+        };
+      }
+
+      if (stopRequested) {
+        return {
+          status: 'failed',
+          resumed: false,
+          reason: 'The engine stopped during the destination change.',
+        };
+      }
+
+      let baseline: MessageDetails[];
+      let refreshedRoster: GroupRoster | undefined;
+      try {
         observerAttached = false;
         await attachWakerObserver();
         messageIdentity.clear();
         detectedAtByMessageId.clear();
         observedTextByMessageId.clear();
         baseline = (await readLatestMessages()).messages;
+        refreshedRoster = await extractRefreshedGroupRoster();
       } catch (error) {
         const reason = describeError(error);
-        console.error(`[engine] Destination change rejected: ${reason}`);
-        await returnToPreviousDestination(previousDestination);
-        return {
-          status: 'rejected',
-          reason: `The proposed destination is not a valid or accessible group conversation. ${reason}`,
-        };
-      }
-
-      try {
-        await persist?.(destination);
-        configuration.messageDestination = destination;
-      } catch (error) {
-        const reason = describeError(error);
-        await returnToPreviousDestination(previousDestination);
+        const rollbackFailure = await restorePreviousDestination(snapshot);
+        if (rollbackFailure) {
+          return {
+            status: 'failed',
+            resumed: false,
+            reason:
+              `The requested destination was opened but its conversation state could not be initialized. ${reason} ` +
+              `The previous destination could not be restored, so the engine remains paused. ` +
+              `Rollback failure: ${rollbackFailure}`,
+          };
+        }
+        if (resume) {
+          await resumeEngine();
+        }
         return {
           status: 'failed',
-          reason: `The destination was validated but the configuration could not be saved. ${reason}`,
+          resumed: resume,
+          reason:
+            'The requested destination was opened but its conversation state could not be initialized. ' +
+            reason,
         };
       }
 
-      pendingDestination = null;
-      await refreshGroupRoster();
+      let initializationStage: 'conversation state' | 'configuration' = 'conversation state';
       try {
         await resetConversationState(baseline);
+        initializationStage = 'configuration';
+        await persist?.(destination);
       } catch (error) {
+        const reason = describeError(error);
+        const rollbackFailure = await restorePreviousDestination(snapshot);
+        if (rollbackFailure) {
+          return {
+            status: 'failed',
+            resumed: false,
+            reason:
+              `The requested destination was opened but its ${initializationStage} could not be initialized. ${reason} ` +
+              `The previous destination could not be restored, so the engine remains paused. ` +
+              `Rollback failure: ${rollbackFailure}`,
+          };
+        }
+        if (resume) {
+          await resumeEngine();
+        }
         return {
           status: 'failed',
+          resumed: resume,
           reason:
-            'The destination was saved but the engine session could not be reset. ' +
-            `${describeError(error)}`,
+            `The requested destination was opened but its ${initializationStage} could not be initialized. ` +
+            reason,
         };
       }
 
-      if (stopRequested) {
-        return { status: 'failed', reason: 'The engine stopped during the destination change.' };
-      }
+      commitGroupRoster(refreshedRoster);
+      configuration.messageDestination = destination;
+      destinationSafe = true;
+      pendingDestination = null;
       if (resume) {
         await resumeEngine();
       }

@@ -791,21 +791,22 @@ async function handleChangeMsgUrl(
   }
 
   if (result.status === 'rejected') {
-    writeError(
-      `The proposed message destination is not a valid or accessible group conversation. ` +
-      result.reason,
-    );
+    writeError(`Message destination change rejected: ${result.reason}`);
     writeOutput(
-      'The message destination was not changed. The engine remains paused; ' +
-      'run `impbot resume` to resume normal operation.',
+      result.resumed
+        ? 'The message destination was not changed. The engine resumed at the previous destination.'
+        : 'The message destination was not changed. The engine remains paused; ' +
+          'run `impbot resume` to resume normal operation.',
     );
     return 1;
   }
 
   writeError(`Message destination change failed: ${result.reason}`);
   writeOutput(
-    'The engine remains paused. Run `impbot resume` after resolving the failure, ' +
-    'or `impbot stop` to shut down.',
+    result.resumed
+      ? 'The message destination was not changed. The engine resumed at the previous destination.'
+      : 'The engine remains paused. Run `impbot resume` after resolving the failure, ' +
+        'or `impbot stop` to shut down.',
   );
   return 1;
 }
@@ -1313,6 +1314,8 @@ async function handleStart(
         }),
       ])
     : shutdownRequest;
+  const startupAbort = new AbortController();
+  void shutdownPromise.then(() => startupAbort.abort());
   let session: BrowserLaunchSession | undefined;
   let aliasData: ReturnType<typeof generateAliases> | undefined;
   let exitCode = 0;
@@ -1344,7 +1347,9 @@ async function handleStart(
         `(${session.browserVersion}).`,
       ));
       const preparationResult = await Promise.race([
-        session.prepare().then(page => ({ type: 'ready' as const, page })),
+        session.prepare({ signal: startupAbort.signal }).then(
+          page => ({ type: 'ready' as const, page }),
+        ),
         shutdownPromise.then(source => ({ type: 'shutdown' as const, source })),
         session.disconnected.then(() => ({ type: 'disconnected' as const })),
       ]);

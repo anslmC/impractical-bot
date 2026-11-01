@@ -312,12 +312,50 @@ test('runtime control keeps a rejected destination change paused and reports the
   assert.equal(result.status, 'rejected');
   if (result.status === 'rejected') {
     assert.equal(result.reason, 'The destination conversation could not be verified.');
+    assert.equal(result.resumed, false);
   }
 
   assert.match(await sendRuntimeCommand(configurationPath, 'PAUSE'), /^PAUSED /);
   assert.equal(pauseRequests, 0);
   assert.match(await sendRuntimeCommand(configurationPath, 'RESUME'), /^RESUMED /);
   assert.equal(resumeRequests, 1);
+});
+
+test('runtime control reports a resumed engine after a rolled-back destination failure', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  let pauseRequests = 0;
+  const control = await createRuntimeControl(configurationPath, {
+    requestShutdown: () => undefined,
+    requestPause: () => {
+      pauseRequests += 1;
+    },
+    requestChangeDestination: () => ({
+      status: 'failed',
+      reason: 'The requested destination was opened but its configuration could not be initialized.',
+      resumed: true,
+    }),
+  });
+  context.after(async () => {
+    control.complete(1);
+    await control.close();
+  });
+  control.setState('running');
+
+  const result = await requestRuntimeChangeDestination(
+    configurationPath,
+    'https://www.facebook.com/messages/t/987654321',
+  );
+  assert.equal(result.status, 'failed');
+  if (result.status === 'failed') {
+    assert.equal(
+      result.reason,
+      'The requested destination was opened but its configuration could not be initialized.',
+    );
+    assert.equal(result.resumed, true);
+  }
+
+  assert.match(await sendRuntimeCommand(configurationPath, 'PAUSE'), /^PAUSED /);
+  assert.equal(pauseRequests, 1);
 });
 
 test('runtime control rejects overlapping destination, pause, and resume changes', async context => {

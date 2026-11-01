@@ -45,13 +45,13 @@ export type RuntimeResumeResult =
 
 export type RuntimeDestinationChangeResult =
   | { status: 'changed'; resumed: boolean }
-  | { status: 'rejected'; reason: string }
-  | { status: 'failed'; reason: string };
+  | { status: 'rejected'; reason: string; resumed?: boolean }
+  | { status: 'failed'; reason: string; resumed?: boolean };
 
 export type RuntimeChangeDestinationResult =
   | { status: 'changed'; instanceId: string; resumed: boolean }
-  | { status: 'rejected'; instanceId: string; reason: string }
-  | { status: 'failed'; instanceId: string; reason: string }
+  | { status: 'rejected'; instanceId: string; reason: string; resumed?: boolean }
+  | { status: 'failed'; instanceId: string; reason: string; resumed?: boolean }
   | { status: 'not-running' };
 
 export type RuntimeTemperamentChangeResult =
@@ -122,6 +122,20 @@ function decodeProtocolText(value: string): string {
   } catch {
     return '';
   }
+}
+
+function parseDestinationFailureResponse(value: string): {
+  resumed: boolean;
+  reason: string;
+} {
+  const stateMatch = value.match(/^(RUNNING|PAUSED) (.*)$/s);
+  if (!stateMatch) {
+    return { resumed: false, reason: decodeProtocolText(value) };
+  }
+  return {
+    resumed: stateMatch[1] === 'RUNNING',
+    reason: decodeProtocolText(stateMatch[2]),
+  };
 }
 
 export interface RuntimeControl {
@@ -290,14 +304,14 @@ export async function createRuntimeControl(
           state = result.resumed ? 'running' : 'paused';
           return `CHANGED ${instanceId} ${result.resumed ? 'RUNNING' : 'PAUSED'}\n`;
         }
-        state = 'paused';
+        state = result.resumed ? 'running' : 'paused';
         return `${result.status === 'rejected' ? 'REJECTED' : 'FAILED'} ${instanceId} ` +
-          `${encodeProtocolText(result.reason)}\n`;
+          `${result.resumed ? 'RUNNING' : 'PAUSED'} ${encodeProtocolText(result.reason)}\n`;
       } catch (error) {
         if (!isStopping()) {
           state = 'paused';
         }
-        return `FAILED ${instanceId} ${encodeProtocolText(
+        return `FAILED ${instanceId} PAUSED ${encodeProtocolText(
           error instanceof Error ? error.message : String(error),
         )}\n`;
       }
@@ -643,19 +657,19 @@ export async function requestRuntimeChangeDestination(
     if (response === `CHANGED ${instanceId} PAUSED`) {
       return { status: 'changed', instanceId, resumed: false };
     }
-    if (response.startsWith(`REJECTED ${instanceId} `)) {
-      return {
-        status: 'rejected',
-        instanceId,
-        reason: decodeProtocolText(response.slice(`REJECTED ${instanceId} `.length)),
-      };
+    const rejectedPrefix = `REJECTED ${instanceId} `;
+    if (response.startsWith(rejectedPrefix)) {
+      const { resumed, reason } = parseDestinationFailureResponse(
+        response.slice(rejectedPrefix.length),
+      );
+      return { status: 'rejected', instanceId, reason, resumed };
     }
-    if (response.startsWith(`FAILED ${instanceId} `)) {
-      return {
-        status: 'failed',
-        instanceId,
-        reason: decodeProtocolText(response.slice(`FAILED ${instanceId} `.length)),
-      };
+    const failedPrefix = `FAILED ${instanceId} `;
+    if (response.startsWith(failedPrefix)) {
+      const { resumed, reason } = parseDestinationFailureResponse(
+        response.slice(failedPrefix.length),
+      );
+      return { status: 'failed', instanceId, reason, resumed };
     }
     if (response.startsWith(`ERROR ${instanceId} `)) {
       const reason = response.slice(`ERROR ${instanceId} `.length);
