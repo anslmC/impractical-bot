@@ -99,9 +99,35 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
     }));
   };
 
+  const messageIdentity = createMessageIdentityTracker();
+  const duplicateDiagnostics: string[] = [];
+  const canonicalizeRenderedMessages = (messages: RenderedMessage[]): RenderedMessage[] => {
+    const identifiedMessages = messages.filter(
+      (message): message is RenderedMessage & { messageId: string } => message.messageId !== null,
+    );
+    const reconciled = messageIdentity.reconcile(identifiedMessages.map(message => {
+      const classification = classifyMessageLabel(message.ariaLabel);
+      return {
+        ...message,
+        sender: classification.sender,
+        direction: classification.direction,
+      };
+    }));
+    for (const duplicate of reconciled.duplicates) {
+      duplicateDiagnostics.push(
+        `Merged duplicate rendered record: observed ${duplicate.observedMessageId}, ` +
+        `canonical ${duplicate.canonicalMessageId}, ${duplicate.direction}, ` +
+        `sender ${JSON.stringify(duplicate.sender)}, ` +
+        `fingerprint ${fingerprintMessageText(duplicate.message)}.`,
+      );
+    }
+    return reconciled.messages;
+  };
+
   const seenMessageIds = new Set<string>();
   let collectedMessages: RenderedMessage[] = [];
-  const initialMessages = await collectRenderedMessages();
+  const initialRenderedMessages = await collectRenderedMessages();
+  const initialMessages = canonicalizeRenderedMessages(initialRenderedMessages);
 
   for (const message of initialMessages) {
     if (message.messageId && !seenMessageIds.has(message.messageId)) {
@@ -111,7 +137,7 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
   }
   collectedMessages = collectedMessages.slice(-TARGET_MESSAGE_COUNT);
 
-  if (initialMessages.length === 0) {
+  if (initialRenderedMessages.length === 0) {
     diagnostics.push('No rendered messages matched the requested message selector.');
   }
 
@@ -151,7 +177,7 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
       { timeout: 1_500, polling: 100 },
     ).catch(() => undefined);
     await progressHandle?.dispose();
-    const renderedMessages = await collectRenderedMessages();
+    const renderedMessages = canonicalizeRenderedMessages(await collectRenderedMessages());
     const newlyFoundMessages: RenderedMessage[] = [];
 
     for (const message of renderedMessages) {
@@ -276,7 +302,8 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
     diagnostics.push('No messages with usable data-message-id values were collected.');
   }
 
-  const collectedBackreadMessages = collectedMessages.map(message => {
+  diagnostics.push(...duplicateDiagnostics);
+  const messages = collectedMessages.map(message => {
     const classification = classifyMessageLabel(message.ariaLabel);
     return {
       id: message.messageId!,
@@ -287,23 +314,6 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
       ariaLabel: message.ariaLabel,
     };
   });
-  const identity = createMessageIdentityTracker();
-  const reconciled = identity.reconcile(collectedBackreadMessages.map(message => ({
-    ...message,
-    messageId: message.id,
-  })));
-  for (const duplicate of reconciled.duplicates) {
-    diagnostics.push(
-      `Merged duplicate rendered record: observed ${duplicate.observedMessageId}, ` +
-      `canonical ${duplicate.canonicalMessageId}, ${duplicate.direction}, ` +
-      `sender ${JSON.stringify(duplicate.sender)}, ` +
-      `fingerprint ${fingerprintMessageText(duplicate.message)}.`,
-    );
-  }
-  const messages = reconciled.messages.map(({ messageId, ...message }) => ({
-    ...message,
-    id: messageId,
-  }));
 
   const aggregateMessages = messages.flatMap(message => {
     const lines: string[] = [];

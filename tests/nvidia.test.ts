@@ -24,6 +24,10 @@ import {
   isEchoReply,
 } from '../src/components/anti-echo.js';
 import {
+  CONVERSATIONAL_INITIATIVE_INSTRUCTION_MARKER,
+  MEMORY_HONESTY_INSTRUCTION_MARKER,
+} from '../src/components/personality.js';
+import {
   createUnavailableGroupRoster,
   type GroupRoster,
 } from '../src/browser/group-roster.js';
@@ -242,6 +246,33 @@ test('reply generation uses a supplied system instruction before conversation me
   assert.deepEqual(body.messages.slice(1), [
     { role: 'user', content: '[from Alex] Hello.' },
   ]);
+});
+
+test('supplied system instructions receive memory and initiative guardrails once', async () => {
+  let requestedOptions: RequestInit | undefined;
+
+  await generateTestReply('nvapi-test-key', [{
+    id: 'incoming-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Alex',
+    direction: 'INCOMING',
+    message: 'Hello.',
+    ariaLabel: null,
+  }], {
+    systemInstruction: 'Supplied instruction.',
+    fetch: async (_input, init) => {
+      requestedOptions = init;
+      return successfulCompletion('Hi.');
+    },
+  });
+
+  const body = JSON.parse(String(requestedOptions?.body));
+  const systemInstruction = String(body.messages[0].content);
+  assert.match(systemInstruction, new RegExp(MEMORY_HONESTY_INSTRUCTION_MARKER));
+  assert.match(systemInstruction, new RegExp(CONVERSATIONAL_INITIATIVE_INSTRUCTION_MARKER));
+  assert.equal(systemInstruction.match(/Memory and conversational history:/gu)?.length, 1);
+  assert.equal(systemInstruction.match(/Conversational initiative:/gu)?.length, 1);
+  assert.ok(systemInstruction.startsWith('Supplied instruction.'));
 });
 
 test('a non-English reply is retried without dropping multilingual context', async () => {

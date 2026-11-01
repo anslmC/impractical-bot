@@ -345,6 +345,49 @@ test('backread returns one logical message when a reply has two rendered ids', a
   assert.match(result.diagnostics.join('\n'), /Merged duplicate rendered record/);
 });
 
+test('backread merges alternate ids observed in different scroll batches', async () => {
+  const reply = 'I literally just said it. Like, one message ago.';
+  const numericId = '7521591905785117407';
+  const midId = 'mid.$gAAW_kanMS16nuYVAE2hiD_y5xnrf';
+  const { page } = createPage([
+    [
+      {
+        messageId: numericId,
+        ariaLabel: `At October 18, 2026, 1:15 PM, You: ${reply}`,
+        message: reply,
+      },
+      {
+        messageId: 'message-9',
+        ariaLabel: 'At October 18, 2026, 1:16 PM, Alex: newer message',
+        message: 'newer message',
+      },
+    ],
+    [
+      {
+        messageId: midId,
+        ariaLabel: `At October 18, 2026, 1:15 PM, You: ${reply}`,
+        message: reply,
+      },
+      {
+        messageId: 'message-1',
+        ariaLabel: 'At October 18, 2026, 1:14 PM, Alex: older message',
+        message: 'older message',
+      },
+    ],
+  ]);
+
+  const result = await readMessengerMessages(page);
+
+  assert.equal(
+    result.messages.filter(message => message.message === reply).length,
+    1,
+    'the reply observed under another id in a later batch is not seeded twice',
+  );
+  assert.ok(result.messages.some(message => message.id === numericId));
+  assert.equal(result.messages.some(message => message.id === midId), false);
+  assert.match(result.diagnostics.join('\n'), /Merged duplicate rendered record/);
+});
+
 test('backread keeps legitimate repeated messages that share one id namespace', async () => {
   const renderedMessages: TestMessage[] = [
     {

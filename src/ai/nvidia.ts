@@ -25,7 +25,9 @@ import {
   type IdentityViolationReason,
 } from '../components/identity-policy.js';
 import {
+  appendConversationalInitiativeInstruction,
   appendGroupRosterInstruction,
+  appendMemoryHonestyInstruction,
   appendRetryInstruction,
   type BotIdentity,
 } from '../components/personality.js';
@@ -623,16 +625,20 @@ export async function generateNvidiaReply(
       emptyMessage: 'NVIDIA returned an empty reply.',
     });
 
-  const systemInstruction = appendIdentityAwarenessInstruction(
-    appendGroupRosterInstruction(options.systemInstruction.trim(), roster),
-    {
-      identity: options.identity,
-      participantNames: combineParticipantNames(
-        options.identity,
-        participantNames,
-        collectRosterParticipantNames(roster),
+  const systemInstruction = appendConversationalInitiativeInstruction(
+    appendMemoryHonestyInstruction(
+      appendIdentityAwarenessInstruction(
+        appendGroupRosterInstruction(options.systemInstruction.trim(), roster),
+        {
+          identity: options.identity,
+          participantNames: combineParticipantNames(
+            options.identity,
+            participantNames,
+            collectRosterParticipantNames(roster),
+          ),
+        },
       ),
-    },
+    ),
   );
   const firstReply = await requestCompletion(systemInstruction);
   const firstLanguageValid = isEnglishOnlyReply(firstReply);

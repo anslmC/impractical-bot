@@ -87,15 +87,24 @@ export interface MessageIdentityTracker {
 }
 
 const DEFAULT_MAX_TRACKED_ALIASES = 256;
+const DEFAULT_MAX_RECENT_MESSAGES = 128;
 
 export function createMessageIdentityTracker({
   maxAliases = DEFAULT_MAX_TRACKED_ALIASES,
-}: { maxAliases?: number } = {}): MessageIdentityTracker {
+  maxRecentMessages = DEFAULT_MAX_RECENT_MESSAGES,
+}: {
+  maxAliases?: number;
+  maxRecentMessages?: number;
+} = {}): MessageIdentityTracker {
   if (!Number.isInteger(maxAliases) || maxAliases < 1) {
     throw new TypeError('maxAliases must be a positive integer.');
   }
+  if (!Number.isInteger(maxRecentMessages) || maxRecentMessages < 1) {
+    throw new TypeError('maxRecentMessages must be a positive integer.');
+  }
 
   const aliases = new Map<string, string>();
+  const recentCanonical: IdentifiableMessage[] = [];
 
   const resolve = (messageId: string): string => {
     let current = messageId;
@@ -121,6 +130,35 @@ export function createMessageIdentityTracker({
     }
   };
 
+  const rememberRecent = (message: IdentifiableMessage): void => {
+    const existingIndex = recentCanonical.findIndex(
+      candidate => candidate.messageId === message.messageId,
+    );
+    if (existingIndex !== -1) {
+      recentCanonical.splice(existingIndex, 1);
+    }
+    recentCanonical.push({ ...message });
+    while (recentCanonical.length > maxRecentMessages) {
+      recentCanonical.shift();
+    }
+  };
+
+  const findPreviouslyObservedCopy = (
+    message: IdentifiableMessage,
+    renderedCanonicalIds: ReadonlySet<string>,
+  ): IdentifiableMessage | null => {
+    for (let index = recentCanonical.length - 1; index >= 0; index -= 1) {
+      const candidate = recentCanonical[index];
+      if (renderedCanonicalIds.has(candidate.messageId)) {
+        continue;
+      }
+      if (isSameLogicalMessage(candidate, message)) {
+        return candidate;
+      }
+    }
+    return null;
+  };
+
   return {
     reconcile<T extends IdentifiableMessage>(messages: readonly T[]): ReconciledMessages<T> {
       if (!Array.isArray(messages)) {
@@ -130,6 +168,14 @@ export function createMessageIdentityTracker({
       const reconciled: T[] = [];
       const duplicates: DuplicateMessageRecord[] = [];
       const emittedMessageIds = new Set<string>();
+      const renderedCanonicalIds = new Set(
+        messages
+          .filter(message =>
+            message && typeof message === 'object' &&
+            typeof message.messageId === 'string' && message.messageId,
+          )
+          .map(message => resolve(message.messageId)),
+      );
       let previous: IdentifiableMessage | null = null;
 
       for (const message of messages) {
@@ -146,6 +192,13 @@ export function createMessageIdentityTracker({
             previous !== null &&
             isSameLogicalMessage(previous, message)) {
           canonicalMessageId = previous.messageId;
+        }
+
+        if (canonicalMessageId === observedMessageId) {
+          const previouslyObserved = findPreviouslyObservedCopy(message, renderedCanonicalIds);
+          if (previouslyObserved) {
+            canonicalMessageId = previouslyObserved.messageId;
+          }
         }
 
         const newlyLearned = canonicalMessageId !== observedMessageId &&
@@ -174,6 +227,7 @@ export function createMessageIdentityTracker({
           ? { ...message }
           : { ...message, messageId: canonicalMessageId };
         reconciled.push(trackedMessage);
+        rememberRecent(trackedMessage);
         previous = trackedMessage;
       }
 
@@ -181,6 +235,7 @@ export function createMessageIdentityTracker({
     },
     clear() {
       aliases.clear();
+      recentCanonical.length = 0;
     },
   };
 }

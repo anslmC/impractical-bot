@@ -16,14 +16,20 @@ import { createPacketScheduler } from '../src/components/packet-scheduler.js';
 import { createPauseGate } from '../src/components/pause-gate.js';
 import { ENGLISH_ONLY_INSTRUCTION } from '../src/components/english-only.js';
 import {
+  CONVERSATIONAL_INITIATIVE_INSTRUCTION_MARKER,
+  MEMORY_HONESTY_INSTRUCTION_MARKER,
+  appendConversationalInitiativeInstruction,
   appendGroupRosterInstruction,
+  appendMemoryHonestyInstruction,
   composeProductionSystemInstruction,
   composeSystemInstruction,
   getBotIdentityInstruction,
+  getConversationalInitiativeInstruction,
   getGroupRosterInstruction,
   getConversationPolicyInstruction,
   getDefaultBehavioralInstruction,
   getDefaultPersonalityInstruction,
+  getMemoryHonestyInstruction,
   getOutputGuidanceInstruction,
   getPersonalityInstruction,
 } from '../src/components/personality.js';
@@ -1509,6 +1515,49 @@ test('composeProductionSystemInstruction orders identity, language, policy, voic
   assert.ok(composed.indexOf('You are Ada') < composed.indexOf(ENGLISH_ONLY_INSTRUCTION));
   assert.ok(composed.indexOf(ENGLISH_ONLY_INSTRUCTION) < composed.indexOf('Deadpan.'));
   assert.ok(composed.indexOf('Deadpan.') < composed.indexOf('roughly 3–12 words'));
+});
+
+test('production prompt requires honest handling of memory and supplied history', () => {
+  const composed = composeTestPrompt();
+
+  assert.ok(composed.includes(getMemoryHonestyInstruction()));
+  assert.match(composed, new RegExp(MEMORY_HONESTY_INSTRUCTION_MARKER));
+  assert.match(composed, /Distinguish the current conversation from any explicitly supplied historical context/u);
+  assert.match(composed, /only text present in the supplied transcript as known conversation history/u);
+  assert.match(composed, /Do not claim to remember a previous conversation/u);
+  assert.match(composed, /Recognizing a participant.*not the same as remembering their personal history/u);
+  assert.match(composed, /Never turn a plausible inference into a claimed memory/u);
+  assert.match(composed, /say naturally that you cannot see it or do not remember it/u);
+});
+
+test('production prompt defaults to ending a complete turn without a follow-up question', () => {
+  const composed = composeTestPrompt('custom', 'Deadpan.');
+  const initiative = getConversationalInitiativeInstruction();
+
+  assert.ok(composed.includes(initiative));
+  assert.match(composed, new RegExp(CONVERSATIONAL_INITIATIVE_INSTRUCTION_MARKER));
+  assert.match(composed, /Default to ending your reply when the thought is complete/u);
+  assert.match(composed, /Do not ask a question just to keep the conversation going/u);
+  assert.match(composed, /Never add a generic engagement question/u);
+  assert.match(composed, /Ask only when you genuinely need information, clarification, or a decision/u);
+  assert.ok(composed.indexOf('Deadpan.') < composed.indexOf(initiative));
+  assert.ok(composed.indexOf('roughly 3–12 words') < composed.indexOf(initiative));
+});
+
+test('memory and initiative instructions are appended once and stay idempotent', () => {
+  const initial = appendConversationalInitiativeInstruction(
+    appendMemoryHonestyInstruction('Base instruction.'),
+  );
+  const repeated = appendConversationalInitiativeInstruction(
+    appendMemoryHonestyInstruction(initial),
+  );
+
+  assert.equal(repeated, initial);
+  assert.equal(initial.match(/Memory and conversational history:/gu)?.length, 1);
+  assert.equal(initial.match(/Conversational initiative:/gu)?.length, 1);
+  assert.ok(initial.startsWith('Base instruction.'));
+  assert.ok(initial.indexOf(MEMORY_HONESTY_INSTRUCTION_MARKER) <
+    initial.indexOf(CONVERSATIONAL_INITIATIVE_INSTRUCTION_MARKER));
 });
 
 test('composeProductionSystemInstruction places roster context after identity and before language', () => {

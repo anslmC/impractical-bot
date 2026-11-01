@@ -30,6 +30,30 @@ const OUTPUT_GUIDANCE_INSTRUCTION =
   'Avoid unsolicited email copy, calls to action, headings, labels, and unrelated prefixes such as "Verse 3.1". ' +
   'Write only your message text. Return only the reply text, and never reproduce the transcript format in your own line. This reply is a proposal until the application sends it.';
 
+export const MEMORY_HONESTY_INSTRUCTION_MARKER = 'Memory and conversational history:';
+
+const MEMORY_HONESTY_INSTRUCTION =
+  `${MEMORY_HONESTY_INSTRUCTION_MARKER} Distinguish the current conversation from any explicitly supplied historical context. ` +
+  'Treat only text present in the supplied transcript as known conversation history. ' +
+  'You may use details that are explicitly present in that transcript, but attribute them to what was said in the conversation or supplied history instead of presenting them as your own recollection. ' +
+  'Do not claim to remember a previous conversation, a past meeting, or anything you did together unless that event is explicitly present in the supplied transcript. ' +
+  'Do not invent names, relationships, promises, preferences, purchases, plans, shared experiences, or personal details. ' +
+  'Recognizing a participant from their sender label or identity context is not the same as remembering their personal history. ' +
+  'When the transcript does not support a detail, say naturally that you cannot see it or do not remember it instead of guessing. ' +
+  'Never turn a plausible inference into a claimed memory; if you are inferring, phrase it as an inference or ask. ' +
+  'Never deny or contradict details that are explicitly present in the supplied transcript.';
+
+export const CONVERSATIONAL_INITIATIVE_INSTRUCTION_MARKER = 'Conversational initiative:';
+
+const CONVERSATIONAL_INITIATIVE_INSTRUCTION =
+  `${CONVERSATIONAL_INITIATIVE_INSTRUCTION_MARKER} Treat a complete answer, reaction, joke, tease, or observation as a finished turn. ` +
+  'Default to ending your reply when the thought is complete instead of appending a question. ' +
+  'Do not ask a question just to keep the conversation going, to hand the turn back, or because a reply feels like it should include one. ' +
+  'Never add a generic engagement question after a greeting, answer, or short statement. ' +
+  'Ask only when you genuinely need information, clarification, or a decision from the other participant, or when a specific question is the natural next beat of the current topic. ' +
+  'If you are unsure whether a question is needed, make a statement or stop. ' +
+  'This shapes initiative only; it does not flatten or replace your configured personality.';
+
 const CUSTOM_PERSONALITY_LEAD_IN =
   'The configured personality below is your primary voice. Embody its attitude, word choice, humor, and reactions in every reply, including ordinary or brief ones, without naming or describing it.';
 
@@ -47,6 +71,14 @@ export function getConversationPolicyInstruction(): string {
 
 export function getOutputGuidanceInstruction(): string {
   return OUTPUT_GUIDANCE_INSTRUCTION;
+}
+
+export function getMemoryHonestyInstruction(): string {
+  return MEMORY_HONESTY_INSTRUCTION;
+}
+
+export function getConversationalInitiativeInstruction(): string {
+  return CONVERSATIONAL_INITIATIVE_INSTRUCTION;
 }
 
 export type BotPersonalityMode = 'default' | 'custom';
@@ -185,6 +217,38 @@ export function appendGroupRosterInstruction(
   return [systemInstruction.trim(), instruction].filter(Boolean).join('\n\n');
 }
 
+function appendMarkedInstruction(
+  systemInstruction: string,
+  marker: string,
+  instruction: string,
+): string {
+  const sections = systemInstruction.split(/\n{2,}/u);
+  const sectionIndex = sections.findIndex(section =>
+    section.trimStart().startsWith(marker)
+  );
+  if (sectionIndex >= 0) {
+    sections[sectionIndex] = instruction;
+    return sections.join('\n\n');
+  }
+  return [systemInstruction.trim(), instruction].filter(Boolean).join('\n\n');
+}
+
+export function appendMemoryHonestyInstruction(systemInstruction: string): string {
+  return appendMarkedInstruction(
+    systemInstruction,
+    MEMORY_HONESTY_INSTRUCTION_MARKER,
+    MEMORY_HONESTY_INSTRUCTION,
+  );
+}
+
+export function appendConversationalInitiativeInstruction(systemInstruction: string): string {
+  return appendMarkedInstruction(
+    systemInstruction,
+    CONVERSATIONAL_INITIATIVE_INSTRUCTION_MARKER,
+    CONVERSATIONAL_INITIATIVE_INSTRUCTION,
+  );
+}
+
 export interface SystemInstructionLayers {
   identityInstruction: string;
   languageInstruction: string;
@@ -193,6 +257,8 @@ export interface SystemInstructionLayers {
   outputGuidanceInstruction: string;
   groupRosterInstruction?: string;
   identityAwarenessInstruction?: string;
+  memoryHonestyInstruction?: string;
+  conversationalInitiativeInstruction?: string;
 }
 
 export function composeSystemInstruction(layers: SystemInstructionLayers): string;
@@ -215,8 +281,10 @@ export function composeSystemInstruction(
       layersOrIdentity.identityAwarenessInstruction ?? '',
       layersOrIdentity.languageInstruction,
       layersOrIdentity.conversationPolicyInstruction,
+      layersOrIdentity.memoryHonestyInstruction ?? '',
       layersOrIdentity.personalityInstruction,
       layersOrIdentity.outputGuidanceInstruction,
+      layersOrIdentity.conversationalInitiativeInstruction ?? '',
     ];
   return layers
     .map(layer => layer.trim())
@@ -253,7 +321,9 @@ export function composeProductionSystemInstruction({
     identityAwarenessInstruction: buildIdentityAwarenessInstruction({ identity }),
     languageInstruction: ENGLISH_ONLY_INSTRUCTION,
     conversationPolicyInstruction: getConversationPolicyInstruction(),
+    memoryHonestyInstruction: getMemoryHonestyInstruction(),
     personalityInstruction: getPersonalityInstruction(personalityMode, customPersonalityInstruction),
     outputGuidanceInstruction: getOutputGuidanceInstruction(),
+    conversationalInitiativeInstruction: getConversationalInitiativeInstruction(),
   });
 }

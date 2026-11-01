@@ -1832,6 +1832,106 @@ test('one reply rendered under two ids becomes one Context Store message and one
   }
 });
 
+test('an alternate reply id observed on a later poll does not create duplicate work', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+
+  const generatedRequests: Array<readonly {
+    messageId: string;
+    message: string;
+    sender: string;
+    direction: string;
+  }[]> = [];
+  const composedReplies: string[] = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    generatedRequests.push(messages as typeof generatedRequests[number]);
+    return 'mocked reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async (_page, reply) => {
+    composedReplies.push(reply);
+    return { status: 'sent' };
+  };
+
+  const flush = async (): Promise<void> => {
+    for (let turn = 0; turn < 8; turn += 1) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+  };
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3000);
+    await flush();
+  };
+
+  const reply = 'I literally just said it. Like, one message ago.';
+  const numericId = '7521591905785117407';
+  const midId = 'mid.$gAAW_kanMS16nuYVAE2hiD_y5xnrf';
+  const { page, inject, replace } = createInjectedMessengerPage();
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([
+      { messageId: numericId, sender: 'You', message: reply },
+      { messageId: 'mid.$mention-1', sender: 'Alex', message: '@Bot what now?' },
+    ]);
+    await advancePoll();
+    await advancePoll();
+
+    replace([
+      { messageId: midId, sender: 'You', message: reply },
+      { messageId: 'mid.$mention-1', sender: 'Alex', message: '@Bot what now?' },
+    ]);
+    await advancePoll();
+    await advancePoll();
+
+    assert.equal(generatedRequests.length, 1, 'the alternate id is not new work');
+    assert.equal(composedReplies.length, 1, 'the reply is sent only once');
+    assert.deepEqual(
+      contextStore.getState().messageIds,
+      [numericId, 'mid.$mention-1'],
+      'the reply is stored once under its first observed id',
+    );
+    assert.equal(
+      generatedRequests[0].filter(message => message.message === reply).length,
+      1,
+      'the alternate id does not add a second assistant turn',
+    );
+
+    inject([{ messageId: 'mid.$mention-2', sender: 'Alex', message: '@Bot what now?' }]);
+    await advancePoll();
+    await advancePoll();
+    assert.equal(generatedRequests.length, 2, 'a genuinely new mention still works');
+    assert.equal(composedReplies.length, 2);
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
 test('a duplicated incoming mention opens one packet and sends once', async context => {
   context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
   const originalRandom = Math.random;

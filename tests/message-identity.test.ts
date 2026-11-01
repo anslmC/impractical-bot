@@ -60,6 +60,54 @@ test('a merged id stays canonical when only the other copy is rendered later', (
   assert.deepEqual(laterPoll.duplicates, [], 'the merge is reported once, not on every poll');
 });
 
+test('an alternate id observed on a later poll merges into the earlier copy', () => {
+  const tracker = createMessageIdentityTracker();
+  tracker.reconcile([
+    { messageId: NUMERIC_ID, message: REPLY, sender: 'You', direction: 'OUTGOING' },
+  ]);
+
+  const laterPoll = tracker.reconcile([
+    { messageId: MID_ID, message: REPLY, sender: 'You', direction: 'OUTGOING' },
+  ]);
+
+  assert.deepEqual(
+    laterPoll.messages.map(message => message.messageId),
+    [NUMERIC_ID],
+    'the server id resolves back to the copy that was already observed',
+  );
+  assert.deepEqual(laterPoll.duplicates, [{
+    observedMessageId: MID_ID,
+    canonicalMessageId: NUMERIC_ID,
+    direction: 'OUTGOING',
+    sender: 'You',
+    message: REPLY,
+  }]);
+});
+
+test('an earlier server id stays canonical when the numeric id appears on a later poll', () => {
+  const tracker = createMessageIdentityTracker();
+  tracker.reconcile([
+    { messageId: MID_ID, message: REPLY, sender: 'You', direction: 'OUTGOING' },
+  ]);
+
+  const laterPoll = tracker.reconcile([
+    { messageId: NUMERIC_ID, message: REPLY, sender: 'You', direction: 'OUTGOING' },
+  ]);
+
+  assert.deepEqual(
+    laterPoll.messages.map(message => message.messageId),
+    [MID_ID],
+    'the first observed copy remains the stable identity for the reply',
+  );
+  assert.deepEqual(laterPoll.duplicates, [{
+    observedMessageId: NUMERIC_ID,
+    canonicalMessageId: MID_ID,
+    direction: 'OUTGOING',
+    sender: 'You',
+    message: REPLY,
+  }]);
+});
+
 test('legitimate consecutive messages with identical text stay distinct', () => {
   const tracker = createMessageIdentityTracker();
   const { messages, duplicates } = tracker.reconcile([
@@ -80,6 +128,24 @@ test('legitimate consecutive messages with identical text stay distinct', () => 
     ),
     false,
   );
+});
+
+test('legitimate repeated text in one namespace stays distinct across polls', () => {
+  const tracker = createMessageIdentityTracker();
+  tracker.reconcile([
+    { messageId: 'mid.$a', message: 'say it again', sender: 'Alex', direction: 'INCOMING' },
+  ]);
+
+  const laterPoll = tracker.reconcile([
+    { messageId: 'mid.$b', message: 'say it again', sender: 'Alex', direction: 'INCOMING' },
+  ]);
+
+  assert.deepEqual(
+    laterPoll.messages.map(message => message.messageId),
+    ['mid.$b'],
+    'a same-namespace repeat is not an alternate representation of the earlier message',
+  );
+  assert.deepEqual(laterPoll.duplicates, []);
 });
 
 test('identical text across a sender or direction change is never merged', () => {
