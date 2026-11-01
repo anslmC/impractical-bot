@@ -37,6 +37,13 @@ import {
   type BrowserDiscoveryOptions,
 } from './browser/discovery.js';
 import {
+  createUnavailableGroupRoster,
+  extractGroupRoster,
+  formatGroupRosterOutcome,
+  sanitizeGroupRoster,
+  type GroupRoster,
+} from './browser/group-roster.js';
+import {
   loadConfiguration,
   resolveBotTemperament,
   resolveBotPersonalityMode,
@@ -99,6 +106,7 @@ export interface CliRuntimeOptions {
   promptSecret?: TerminalPrompt;
   validateNvidiaApiKey?: (apiKey: string) => Promise<void>;
   readMessengerMessages?: typeof readMessengerMessages;
+  extractGroupRoster?: typeof extractGroupRoster;
   createContextStore?: typeof createContextStore;
   startCombustion?: typeof startCombustion;
   generateNvidiaReply?: typeof generateNvidiaReply;
@@ -131,7 +139,8 @@ ${commandReference}
 
 Options:
   -h, --help     Show this help
-  -v, --version  Show the version`;
+  -v, --version  Show the version
+  --debug        Start without the interactive dashboard`;
 
 function promptTerminal(question: string): Promise<string | null> {
   const terminal = createInterface({ input: stdin, output: stdout });
@@ -413,7 +422,10 @@ async function updatePuppetName(
       configurationFilePath,
     );
     configuration.puppetName = savedConfiguration.puppetName;
-    writeOutput(`Puppet account name updated: ${JSON.stringify(puppetName)}.`);
+    writeOutput(
+      `${formatTerminalText('Puppet account name updated:', 'cyan')} ` +
+      `${formatTerminalText(JSON.stringify(puppetName), 'bold')}.`,
+    );
   } catch (error) {
     writeOutput(
       `Puppet account name retrieved as ${JSON.stringify(puppetName)}, but saving failed; ` +
@@ -987,9 +999,12 @@ async function handleStart(
   writeError: Output,
   configurationFilePath: string | undefined,
   runtime: CliRuntimeOptions,
+  debug = false,
 ): Promise<number> {
-  const dashboardTerminal = (runtime.checkDashboardTerminal ?? checkDashboardTerminal)();
-  const useDashboard = dashboardTerminal.ok;
+  const dashboardTerminal = debug === false
+    ? (runtime.checkDashboardTerminal ?? checkDashboardTerminal)()
+    : undefined;
+  const useDashboard = dashboardTerminal?.ok === true;
 
   let configurationResult;
   try {
@@ -1350,6 +1365,18 @@ async function handleStart(
         if (!puppetName) {
           throw new Error('A configured puppet name is required to initialize the alias engine.');
         }
+        let groupRoster: GroupRoster;
+        try {
+          groupRoster = sanitizeGroupRoster(
+            await (runtime.extractGroupRoster ?? extractGroupRoster)(
+              preparationResult.page,
+              puppetName,
+            ),
+          );
+        } catch {
+          groupRoster = createUnavailableGroupRoster('group roster extraction failed');
+        }
+        console.log(formatGroupRosterOutcome(groupRoster));
         aliasData = generateAliases(puppetName);
         writeOutput(formatTerminalMilestone(
           'ALIASES',
@@ -1403,6 +1430,7 @@ async function handleStart(
             personalityMode: resolveBotPersonalityMode(configurationResult.configuration),
             customPersonalityInstruction:
               configurationResult.configuration.customPersonalityInstruction,
+            roster: groupRoster,
           });
           try {
             reply = await (runtime.generateNvidiaReply ?? generateNvidiaReply)(
@@ -1411,6 +1439,7 @@ async function handleStart(
               {
                 systemInstruction: debugSystemInstruction,
                 identity: debugIdentity,
+                roster: groupRoster,
               },
             );
           } catch (error) {
@@ -1449,6 +1478,7 @@ async function handleStart(
           aliases: aliasData.valids,
           apiKey,
           debugMode: DEBUG_MODE,
+          roster: groupRoster,
         });
         runtimeControl.setState('running');
         writeOutput(formatTerminalMilestone(
@@ -1734,8 +1764,10 @@ export async function runCli(
     return 0;
   }
 
-  if (remainingArgs.length > 0) {
-    writeError(`Error: unexpected argument '${remainingArgs[0]}'.\n\n${usage}`);
+  const debug = command === 'start' && remainingArgs[0] === '--debug';
+  const unexpectedArgs = debug ? remainingArgs.slice(1) : remainingArgs;
+  if (unexpectedArgs.length > 0) {
+    writeError(`Error: unexpected argument '${unexpectedArgs[0]}'.\n\n${usage}`);
     return 1;
   }
 
@@ -1771,7 +1803,7 @@ export async function runCli(
       runtime,
     ),
     updatekey: () => handleUpdateKey(writeOutput, writeError, configurationFilePath, runtime),
-    start: () => handleStart(writeOutput, writeError, configurationFilePath, runtime),
+    start: () => handleStart(writeOutput, writeError, configurationFilePath, runtime, debug),
     pause: () => handlePause(writeOutput, writeError, configurationFilePath, runtime),
     resume: () => handleResume(writeOutput, writeError, configurationFilePath, runtime),
     stop: () => handleStop(writeOutput, writeError, configurationFilePath, runtime),

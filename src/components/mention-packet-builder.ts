@@ -1,4 +1,4 @@
-import type { ReplyDecision } from './reply-adjudication.js';
+const OBSERVED_MESSAGE_LIMIT = 200;
 
 export interface PacketBuilderMessage {
   messageId: string;
@@ -13,7 +13,6 @@ export interface PacketBuilderPacket {
   newMessages: PacketBuilderMessage[];
   mentionMessages: PacketBuilderMessage[];
   contextMessages: PacketBuilderMessage[];
-  reply: ReplyDecision;
 }
 
 export interface PacketBuilderState {
@@ -53,9 +52,20 @@ function isMentionTrigger(message: PacketBuilderMessage): boolean {
   return message.direction === 'INCOMING' && message.mention === true;
 }
 
-function assertMatchingContent(existing: PacketBuilderMessage, incoming: PacketBuilderMessage): void {
-  if (existing.message !== incoming.message) {
-    throw new Error(`Message ID ${incoming.messageId} was observed with different content.`);
+function syncObservedMessage(
+  target: PacketBuilderMessage,
+  incoming: PacketBuilderMessage,
+): void {
+  target.message = incoming.message;
+  if (incoming.sender === undefined) {
+    delete target.sender;
+  } else {
+    target.sender = incoming.sender;
+  }
+  if (incoming.direction === undefined) {
+    delete target.direction;
+  } else {
+    target.direction = incoming.direction;
   }
 }
 
@@ -64,11 +74,13 @@ export function buildPacketTurn({
   recentContext = [],
   state = createPacketBuilderState(),
   contextLimit,
+  observedLimit = OBSERVED_MESSAGE_LIMIT,
 }: {
   newMessages: PacketBuilderMessage[];
   recentContext?: PacketBuilderMessage[];
   state?: PacketBuilderState;
   contextLimit?: number;
+  observedLimit?: number;
 }): {
   packet: PacketBuilderPacket | null;
   pendingPacket: PacketBuilderPacket | null;
@@ -84,6 +96,9 @@ export function buildPacketTurn({
   if (contextLimit !== undefined && (!Number.isInteger(contextLimit) || contextLimit < 1)) {
     throw new TypeError('contextLimit must be a positive integer when provided.');
   }
+  if (!Number.isInteger(observedLimit) || observedLimit < 1) {
+    throw new TypeError('observedLimit must be a positive integer.');
+  }
 
   const observedById = new Map(
     state.observedMessages.map(message => [message.messageId, { ...message }]),
@@ -95,14 +110,14 @@ export function buildPacketTurn({
     const message = normalizeMessage(rawMessage);
     const inBatch = messagesById.get(message.messageId);
     if (inBatch) {
-      assertMatchingContent(inBatch, message);
+      syncObservedMessage(inBatch, message);
       inBatch.mention ||= message.mention;
       continue;
     }
 
     const previouslyObserved = observedById.get(message.messageId);
     if (previouslyObserved) {
-      assertMatchingContent(previouslyObserved, message);
+      syncObservedMessage(previouslyObserved, message);
       continue;
     }
 
@@ -116,7 +131,6 @@ export function buildPacketTurn({
     const message = normalizeMessage(rawMessage);
     const inContext = contextById.get(message.messageId);
     if (inContext) {
-      assertMatchingContent(inContext, message);
       contextById.delete(message.messageId);
       contextById.set(message.messageId, message);
       continue;
@@ -124,14 +138,14 @@ export function buildPacketTurn({
 
     const inBatch = messagesById.get(message.messageId);
     if (inBatch) {
-      assertMatchingContent(inBatch, message);
+      syncObservedMessage(inBatch, message);
       continue;
     }
 
     contextById.set(message.messageId, message);
     const previouslyObserved = observedById.get(message.messageId);
     if (previouslyObserved) {
-      assertMatchingContent(previouslyObserved, message);
+      syncObservedMessage(previouslyObserved, message);
     } else {
       observedById.set(message.messageId, { ...message });
     }
@@ -168,13 +182,17 @@ export function buildPacketTurn({
       contextMessages: [...contextById.values()]
         .slice(contextLimit === undefined ? 0 : -contextLimit)
         .map(message => ({ ...message })),
-      reply: 'pending',
     };
     nextPacketNumber += 1;
   }
 
+  const observedMessages = [...observedById.values()].map(message => ({ ...message }));
+  while (observedMessages.length > observedLimit) {
+    observedMessages.shift();
+  }
+
   const nextState = {
-    observedMessages: [...observedById.values()].map(message => ({ ...message })),
+    observedMessages,
     nextPacketNumber,
     pendingPacket,
   };

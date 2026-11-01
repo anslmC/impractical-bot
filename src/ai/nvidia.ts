@@ -25,21 +25,18 @@ import {
   type IdentityViolationReason,
 } from '../components/identity-policy.js';
 import {
+  appendGroupRosterInstruction,
   appendRetryInstruction,
   type BotIdentity,
 } from '../components/personality.js';
-import {
-  buildReplyAdjudicationInstruction,
-  parseReplyAdjudicationContent,
-  type ReplyAdjudicationResult,
-} from '../components/reply-adjudication.js';
+import { sanitizeGroupRoster, type GroupRoster } from '../browser/group-roster.js';
+import { appendIdentityAwarenessInstruction } from '../components/identity-awareness.js';
 import { stripParticipantSpeakerLabel } from '../components/reply-normalization.js';
 
 const NVIDIA_CHAT_COMPLETIONS_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
 const NVIDIA_CHAT_COMPLETIONS_MODEL = 'nvidia/nemotron-3.5-lightning-30b-a3b';
 const DEFAULT_REQUEST_TIMEOUT_MS = 50_000;
 const REPLY_MAX_TOKENS = 256;
-const ADJUDICATION_MAX_TOKENS = 128;
 const MAX_ASSISTANT_HISTORY_TURNS = 3;
 const VALIDATION_MAX_TOKENS = 4096;
 
@@ -72,6 +69,13 @@ export class NvidiaIdentityError extends Error {
   }
 }
 
+export interface ConversationDiagnostic {
+  messageId: string | null;
+  reason: IdentityViolationReason;
+}
+
+export type ConversationDiagnosticHandler = (diagnostic: ConversationDiagnostic) => void;
+
 export interface NvidiaRequestOptions {
   fetch?: typeof fetch;
   timeoutMs?: number;
@@ -80,11 +84,8 @@ export interface NvidiaRequestOptions {
 export interface NvidiaReplyRequestOptions extends NvidiaRequestOptions {
   systemInstruction: string;
   identity: BotIdentity;
-}
-
-export interface NvidiaAdjudicationOptions extends NvidiaRequestOptions {
-  identity: BotIdentity;
-  participantNames?: readonly string[];
+  roster?: GroupRoster;
+  onDiagnostic?: ConversationDiagnosticHandler;
 }
 
 export type NvidiaValidationOptions = NvidiaRequestOptions;
@@ -333,6 +334,9 @@ function collectParticipantNames(
   const participantNames: string[] = [];
   const seen = new Set<string>();
   for (const message of messages) {
+    if (message.direction === 'OUTGOING') {
+      continue;
+    }
     const senderName = typeof message.sender === 'string' ? message.sender.trim() : '';
     const comparable = normalizeIdentityValue(senderName);
     if (!senderName || comparable === 'unknown' || comparable === 'you' ||
@@ -343,6 +347,35 @@ function collectParticipantNames(
     participantNames.push(senderName);
   }
   return participantNames;
+}
+
+function combineParticipantNames(
+  identity: BotIdentity,
+  ...nameLists: readonly (readonly string[])[]
+): string[] {
+  const ownNames = identityComparableNames(identity);
+  const seen = new Set<string>();
+  const participantNames: string[] = [];
+  for (const name of nameLists.flat()) {
+    const normalized = name.trim();
+    const comparable = normalizeIdentityValue(normalized);
+    if (!normalized || comparable === 'unknown' || comparable === 'you' ||
+        ownNames.has(comparable) || seen.has(comparable)) {
+      continue;
+    }
+    seen.add(comparable);
+    participantNames.push(normalized);
+  }
+  return participantNames;
+}
+
+function collectRosterParticipantNames(roster?: GroupRoster): string[] {
+  if (!roster || roster.status === 'unavailable' || roster.status === 'not-group') {
+    return [];
+  }
+  return roster.members
+    .filter(member => !member.isPuppet)
+    .map(member => member.firstName);
 }
 
 function createIdentityContext(
@@ -358,9 +391,11 @@ function createIdentityContext(
 
 function buildConversationTurns(
   messages: readonly BackreadMessage[],
-  participantNames: readonly string[],
   identityContext: IdentityValidationContext,
+  participantNames: readonly string[],
+  onDiagnostic?: ConversationDiagnosticHandler,
 ): ConversationTurn[] {
+  const ownNames = identityComparableNames(identityContext);
   const conversationMessages: ConversationTurn[] = [];
   for (const message of messages) {
     if (message.direction !== 'INCOMING' && message.direction !== 'OUTGOING') {
@@ -370,23 +405,44 @@ function buildConversationTurns(
     if (!content) {
       continue;
     }
-    const isIncoming = message.direction === 'INCOMING';
     const senderName = typeof message.sender === 'string' ? message.sender.trim() : '';
-    const sender = isIncoming && senderName && senderName !== 'UNKNOWN'
-      ? `[from ${senderName}] `
-      : '';
-    const turnContent = isIncoming
-      ? content
-      : stripParticipantSpeakerLabel(content, participantNames);
-    if (!isIncoming && !validateReplyIdentity(turnContent, identityContext).valid) {
-      continue;
+    const senderIsBot = senderName !== '' &&
+      senderName.toUpperCase() !== 'UNKNOWN' &&
+      ownNames.has(normalizeIdentityValue(senderName));
+    const isAssistantTurn = message.direction === 'OUTGOING' ||
+      (message.direction === 'INCOMING' && senderIsBot);
+    const turnContent = isAssistantTurn
+      ? stripParticipantSpeakerLabel(content, participantNames)
+      : content;
+    if (isAssistantTurn) {
+      const identityResult = validateReplyIdentity(turnContent, identityContext);
+      if (!identityResult.valid) {
+        onDiagnostic?.({
+          messageId: message.id || null,
+          reason: identityResult.reason,
+        });
+        continue;
+      }
     }
     conversationMessages.push({
-      role: isIncoming ? 'user' : 'assistant',
-      content: `${sender}${turnContent}`,
+      role: isAssistantTurn ? 'assistant' : 'user',
+      content: isAssistantTurn || !senderName || senderName === 'UNKNOWN'
+        ? turnContent
+        : `[from ${senderName}] ${turnContent}`,
     });
   }
   return conversationMessages;
+}
+
+function buildRequestTranscript(
+  messages: readonly BackreadMessage[],
+  identityContext: IdentityValidationContext,
+  participantNames: readonly string[],
+  onDiagnostic?: ConversationDiagnosticHandler,
+): ConversationTurn[] | null {
+  return selectRequestTurns(
+    buildConversationTurns(messages, identityContext, participantNames, onDiagnostic),
+  );
 }
 
 function selectRequestTurns(
@@ -531,10 +587,21 @@ export async function generateNvidiaReply(
     throw new Error('A configured bot identity is required to generate a reply.');
   }
 
+  const roster = options.roster ? sanitizeGroupRoster(options.roster) : undefined;
   const participantNames = collectParticipantNames(messages, options.identity);
-  const identityContext = createIdentityContext(options.identity, participantNames);
-  const requestMessages = selectRequestTurns(
-    buildConversationTurns(messages, participantNames, identityContext),
+  const identityContext = createIdentityContext(
+    options.identity,
+    combineParticipantNames(
+      options.identity,
+      participantNames,
+      collectRosterParticipantNames(roster),
+    ),
+  );
+  const requestMessages = buildRequestTranscript(
+    messages,
+    identityContext,
+    participantNames,
+    options.onDiagnostic,
   );
   if (!requestMessages) {
     throw new Error('No usable Messenger messages are available to generate a reply.');
@@ -556,7 +623,17 @@ export async function generateNvidiaReply(
       emptyMessage: 'NVIDIA returned an empty reply.',
     });
 
-  const systemInstruction = options.systemInstruction.trim();
+  const systemInstruction = appendIdentityAwarenessInstruction(
+    appendGroupRosterInstruction(options.systemInstruction.trim(), roster),
+    {
+      identity: options.identity,
+      participantNames: combineParticipantNames(
+        options.identity,
+        participantNames,
+        collectRosterParticipantNames(roster),
+      ),
+    },
+  );
   const firstReply = await requestCompletion(systemInstruction);
   const firstLanguageValid = isEnglishOnlyReply(firstReply);
   const firstIdentityResult = validateReplyIdentity(firstReply, identityContext);
@@ -588,74 +665,4 @@ export async function generateNvidiaReply(
     );
   }
   return retryReply;
-}
-
-export async function adjudicateNvidiaReply(
-  apiKey: string,
-  messages: readonly BackreadMessage[],
-  options: NvidiaAdjudicationOptions,
-): Promise<ReplyAdjudicationResult> {
-  if (!apiKey.trim() || /[\r\n]/.test(apiKey)) {
-    throw new NvidiaApiKeyError('authentication', 'The NVIDIA API key is empty or malformed.');
-  }
-  if (!options.identity.name.trim()) {
-    throw new Error('A configured bot identity is required to adjudicate a reply.');
-  }
-
-  const ownNames = identityComparableNames(options.identity);
-  const seen = new Set<string>();
-  const participantNames: string[] = [];
-  for (const name of [
-    ...(options.participantNames ?? []),
-    ...collectParticipantNames(messages, options.identity),
-  ]) {
-    const normalized = name.trim();
-    const comparable = normalizeIdentityValue(normalized);
-    if (!normalized || comparable === 'unknown' || comparable === 'you' ||
-        ownNames.has(comparable) || seen.has(comparable)) {
-      continue;
-    }
-    seen.add(comparable);
-    participantNames.push(normalized);
-  }
-
-  const identityContext = createIdentityContext(options.identity, participantNames);
-  const requestMessages = selectRequestTurns(
-    buildConversationTurns(messages, participantNames, identityContext),
-  );
-  if (!requestMessages) {
-    return {
-      decision: 'reject',
-      reason: 'no incoming messages are available for adjudication',
-    };
-  }
-
-  try {
-    const content = await requestNvidiaCompletion({
-      apiKey,
-      systemInstruction: buildReplyAdjudicationInstruction({
-        identity: options.identity,
-        participantNames,
-      }),
-      messages: requestMessages,
-      fetch: options.fetch,
-      timeoutMs: options.timeoutMs,
-      maxTokens: ADJUDICATION_MAX_TOKENS,
-      responseFormat: { type: 'json_object' },
-      networkMessage:
-        'Unable to reach NVIDIA to adjudicate the reply. The packet was rejected.',
-      pendingMessage: 'NVIDIA accepted the adjudication request but left it pending.',
-      failureMessage: 'NVIDIA could not adjudicate the reply.',
-      malformedMessage: 'NVIDIA returned an unexpected adjudication response.',
-      emptyMessage: 'NVIDIA returned an empty adjudication.',
-    });
-    return parseReplyAdjudicationContent(content);
-  } catch (error) {
-    return {
-      decision: 'reject',
-      reason: error instanceof Error
-        ? `adjudication failed: ${error.message}`
-        : 'adjudication failed',
-    };
-  }
 }

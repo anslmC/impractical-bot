@@ -549,10 +549,9 @@ test('delivery status and accessibility-label changes do not stop Combustion', a
     );
     await advance();
 
-    assert.match(
-      String((stoppedError as Error | undefined)?.message),
-      /Message ID baseline-1 was observed with different content\./,
-    );
+    assert.equal(stoppedError, undefined);
+    assert.deepEqual(contextStore.getState().messageIds, ['baseline-1']);
+    assert.equal(contextStore.getRecent(1)[0].message, 'genuinely different');
   } finally {
     await controller.stop();
     Math.random = originalRandom;
@@ -603,7 +602,7 @@ test('A seeded context message outside the baseline is not treated as new', asyn
   }
 });
 
-test('A genuine same-ID content conflict still stops Combustion', async context => {
+test('an edited message updates in place and Combustion keeps polling', async context => {
   context.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
   const originalRandom = Math.random;
   Math.random = () => 0.99;
@@ -627,9 +626,18 @@ test('A genuine same-ID content conflict still stops Combustion', async context 
     context.mock.timers.tick(3_000);
     await flush();
 
-    assert.match(
-      String((stoppedError as Error | undefined)?.message),
-      /Message ID baseline-1 was observed with different content\./,
+    assert.equal(stoppedError, undefined);
+    assert.deepEqual(contextStore.getState().messageIds, ['baseline-1']);
+    assert.equal(contextStore.getRecent(1)[0].message, 'genuinely different');
+
+    wakerPage.appendMessage('after-edit-1', 'still listening');
+    context.mock.timers.tick(3_000);
+    await flush();
+
+    assert.equal(stoppedError, undefined);
+    assert.deepEqual(
+      contextStore.getState().messageIds,
+      ['baseline-1', 'after-edit-1'],
     );
   } finally {
     await controller.stop();

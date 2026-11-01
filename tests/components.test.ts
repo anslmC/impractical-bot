@@ -1,17 +1,26 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createContextStore } from '../src/components/context-store.js';
-import { buildPacketTurn } from '../src/components/mention-packet-builder.js';
+import {
+  buildPacketTurn,
+  createPacketBuilderState,
+} from '../src/components/mention-packet-builder.js';
 import { extractMessageDetails } from '../src/components/message-extraction.js';
-import { createPacketProcessor } from '../src/components/packet-processor.js';
-import { ReplyRejectedError } from '../src/components/reply-adjudication.js';
+import {
+  PacketStaleError,
+  createPacketProcessor,
+} from '../src/components/packet-processor.js';
+import { createBoundedIdSet } from '../src/components/bounded-id-set.js';
+import { createMentionMatcher } from '../src/components/mention-matcher.js';
 import { createPacketScheduler } from '../src/components/packet-scheduler.js';
 import { createPauseGate } from '../src/components/pause-gate.js';
 import { ENGLISH_ONLY_INSTRUCTION } from '../src/components/english-only.js';
 import {
+  appendGroupRosterInstruction,
   composeProductionSystemInstruction,
   composeSystemInstruction,
   getBotIdentityInstruction,
+  getGroupRosterInstruction,
   getConversationPolicyInstruction,
   getDefaultBehavioralInstruction,
   getDefaultPersonalityInstruction,
@@ -19,6 +28,7 @@ import {
   getPersonalityInstruction,
 } from '../src/components/personality.js';
 import { buildRngPacket } from '../src/components/rng-packet-builder.js';
+import type { GroupRoster } from '../src/browser/group-roster.js';
 import { formatPollSummary, formatTerminalText } from '../src/components/terminal-formatting.js';
 import { generateNvidiaReply } from '../src/ai/nvidia.js';
 
@@ -490,35 +500,77 @@ test('packet builder accepts a delivery-status-only difference once normalized',
   );
 });
 
-test('packet builder still rejects a genuine same-ID content change', () => {
+test('packet builder updates an edited message in place without new work', () => {
   const firstPoll = buildPacketTurn({
-    newMessages: [{ messageId: 'genuine-change', message: 'first content' }],
+    newMessages: [{ messageId: 'edited-change', message: 'first content', direction: 'INCOMING' }],
+  });
+  const editedPoll = buildPacketTurn({
+    newMessages: [],
+    recentContext: [{ messageId: 'edited-change', message: 'second content', direction: 'INCOMING' }],
+    state: firstPoll.state,
   });
 
-  assert.throws(
-    () => buildPacketTurn({
-      newMessages: [{ messageId: 'genuine-change', message: 'second content' }],
-      state: firstPoll.state,
-    }),
-    /Message ID genuine-change was observed with different content\./,
+  assert.equal(editedPoll.packet, null);
+  assert.equal(editedPoll.state.observedMessages.length, 1);
+  assert.equal(editedPoll.state.observedMessages[0].message, 'second content');
+
+  const nextPoll = buildPacketTurn({
+    newMessages: [{
+      messageId: 'edited-change-trigger',
+      message: '@Bot hello',
+      mention: true,
+      direction: 'INCOMING',
+    }],
+    recentContext: [{ messageId: 'edited-change', message: 'second content', direction: 'INCOMING' }],
+    state: editedPoll.state,
+  });
+
+  assert.deepEqual(
+    nextPoll.pendingPacket?.newMessages.map(message => message.messageId),
+    ['edited-change-trigger'],
+  );
+  assert.equal(
+    nextPoll.pendingPacket?.contextMessages
+      .find(message => message.messageId === 'edited-change')?.message,
+    'second content',
+    'later packets use the edited text',
   );
 });
 
-test('context store keeps distinct IDs with identical text and rejects genuine conflicts', () => {
+test('context store keeps distinct IDs with identical text and updates an edit in place', () => {
   const store = createContextStore();
   store.add([
-    { messageId: '7521145770279674844', message: 'same visible text' },
-    { messageId: 'mid.$gAAW_kanMS16nsy41p2hgejq1c6Pc', message: 'same visible text' },
+    { messageId: '7521145770279674844', message: 'same visible text', sender: 'Alex' },
+    { messageId: 'mid.$gAAW_kanMS16nsy41p2hgejq1c6Pc', message: 'same visible text', sender: 'Alex' },
   ]);
 
   assert.deepEqual(store.getState().messageIds, [
     '7521145770279674844',
     'mid.$gAAW_kanMS16nsy41p2hgejq1c6Pc',
   ]);
+
+  store.add([{ messageId: '7521145770279674844', message: 'genuinely different', sender: 'Alex' }]);
+
+  assert.deepEqual(store.getState().messageIds, [
+    '7521145770279674844',
+    'mid.$gAAW_kanMS16nsy41p2hgejq1c6Pc',
+  ]);
+  assert.equal(store.getState().size, 2, 'an edit does not create a second entry');
+  assert.equal(store.getRecent(2)[0].message, 'genuinely different');
+});
+
+test('a context store batch with an invalid message leaves stored state unchanged', () => {
+  const store = createContextStore();
+  store.add([{ messageId: 'kept-1', message: 'first' }]);
+
   assert.throws(
-    () => store.add([{ messageId: '7521145770279674844', message: 'genuinely different' }]),
-    /Message ID 7521145770279674844 was observed with different content\./,
+    () => store.add([
+      { messageId: 'kept-2', message: 'second' },
+      { messageId: 'broken-1', message: 'invalid mention', mention: 'yes' as unknown as boolean },
+    ]),
+    /optional mention property must be a boolean/,
   );
+  assert.deepEqual(store.getState().messageIds, ['kept-1']);
 });
 
 test('packet builder does not reprocess repeated messages and still accepts the next message', () => {
@@ -1304,7 +1356,9 @@ test('reply generation sends the production identity rule with the incoming text
   });
 
   assert.equal(body?.messages[0].role, 'system');
-  assert.equal(body?.messages[0].content, systemInstruction);
+  assert.ok(body?.messages[0].content?.startsWith(systemInstruction));
+  assert.match(body?.messages[0].content ?? '', /Identity and recipient awareness:/);
+  assert.match(body?.messages[0].content ?? '', /Other identified participants in this conversation: Alex, Blair\./);
   assert.match(body?.messages[0].content ?? '', /Do not begin an ordinary reply with your own name or alias/);
   assert.match(body?.messages[0].content ?? '', /This includes reproducing your own name or alias/);
   assert.deepEqual(body?.messages.slice(1), [
@@ -1371,7 +1425,11 @@ test('the English-only rule survives multilingual incoming and historical messag
   });
 
   assert.equal(reply, 'I am doing well.');
-  assert.equal(body?.messages[0].content, systemInstruction);
+  assert.match(body?.messages[0].content ?? '', /You are Ada/);
+  assert.match(
+    body?.messages[0].content ?? '',
+    /Other identified participants in this conversation: Alex, Blair, Casey, Dana\./,
+  );
   assert.equal(
     body?.messages[0].content?.split(ENGLISH_ONLY_INSTRUCTION).length,
     2,
@@ -1451,6 +1509,76 @@ test('composeProductionSystemInstruction orders identity, language, policy, voic
   assert.ok(composed.indexOf('You are Ada') < composed.indexOf(ENGLISH_ONLY_INSTRUCTION));
   assert.ok(composed.indexOf(ENGLISH_ONLY_INSTRUCTION) < composed.indexOf('Deadpan.'));
   assert.ok(composed.indexOf('Deadpan.') < composed.indexOf('roughly 3–12 words'));
+});
+
+test('composeProductionSystemInstruction places roster context after identity and before language', () => {
+  const roster: GroupRoster = {
+    status: 'partial',
+    members: [
+      { firstName: 'Ada', isPuppet: true },
+      { firstName: 'Alex', isPuppet: false },
+    ],
+    puppet: { firstName: 'Ada', isPuppet: true },
+    duplicateFirstNames: [],
+  };
+  const composed = composeProductionSystemInstruction({
+    identity: testIdentity,
+    personalityMode: 'default',
+    roster,
+  });
+
+  assert.match(composed, /Group membership context: partial\./u);
+  assert.match(composed, /Observed first names: Ada \(you\), Alex\./u);
+  assert.ok(composed.indexOf('You are Ada') < composed.indexOf('Group membership context:'));
+  assert.ok(composed.indexOf('Group membership context:') < composed.indexOf(ENGLISH_ONLY_INSTRUCTION));
+});
+
+test('appendGroupRosterInstruction replaces existing roster context instead of duplicating it', () => {
+  const initial: GroupRoster = {
+    status: 'partial',
+    members: [{ firstName: 'Ada', isPuppet: true }],
+    puppet: { firstName: 'Ada', isPuppet: true },
+    duplicateFirstNames: [],
+  };
+  const refreshed: GroupRoster = {
+    status: 'unavailable',
+    members: [],
+    puppet: null,
+    duplicateFirstNames: [],
+    reason: 'panel unavailable',
+  };
+  const composed = composeProductionSystemInstruction({
+    identity: testIdentity,
+    personalityMode: 'default',
+    roster: initial,
+  });
+  const appended = appendGroupRosterInstruction(composed, refreshed);
+
+  assert.equal(appended.match(/Group membership context:/gu)?.length, 1);
+  assert.match(appended, /Group membership context: unavailable\./u);
+  assert.match(appended, /Do not assume the conversation has no other participants/u);
+  assert.equal(appended.includes('Observed first names: Ada'), false);
+});
+
+test('getGroupRosterInstruction omits roster context when no roster is supplied', () => {
+  assert.equal(getGroupRosterInstruction(), '');
+});
+
+test('getGroupRosterInstruction keeps only first names from runtime roster input', () => {
+  const instruction = getGroupRosterInstruction({
+    status: 'partial',
+    members: [
+      { firstName: 'Anselmo Calderon', isPuppet: true },
+      { firstName: 'Geoff Markus Del Rio', isPuppet: false },
+    ],
+    puppet: { firstName: 'Anselmo Calderon', isPuppet: true },
+    duplicateFirstNames: [],
+  });
+
+  assert.match(instruction, /Observed first names: Anselmo \(you\), Geoff\./u);
+  for (const surname of ['Calderon', 'Markus', 'Del Rio']) {
+    assert.equal(instruction.includes(surname), false);
+  }
 });
 
 test('the behavioral layer requires literal requests to be answered plainly', () => {
@@ -1650,15 +1778,11 @@ test('a mention arriving while a packet is in flight becomes a queued second pac
   assert.deepEqual(scheduler.getState().completedPacketIds, ['packet-001', 'packet-002']);
 });
 
-test('packet processor adjudicates a pending packet once before generation and composition', async () => {
+test('packet processor generates and composes without an adjudication step', async () => {
   const calls: string[] = [];
   const processPacket = createPacketProcessor({
     page: 'mock-page',
     apiKey: 'mock-key',
-    adjudicateReply: async () => {
-      calls.push('adjudicate');
-      return 'approve' as const;
-    },
     generateReply: async () => {
       calls.push('generate');
       return 'reply';
@@ -1669,133 +1793,16 @@ test('packet processor adjudicates a pending packet once before generation and c
     },
   });
   const packet = {
-    packetId: 'packet-approved',
-    newMessages: [{ messageId: 'in-1', message: 'hello' }],
-    reply: 'pending' as const,
+    packetId: 'packet-direct',
+    newMessages: [{ messageId: 'in-1', message: 'hey Alex' }],
   };
 
   assert.deepEqual(await processPacket(packet), { status: 'sent' });
-  assert.deepEqual(calls, ['adjudicate', 'generate', 'compose']);
-  assert.equal(packet.reply, 'approve');
+  assert.deepEqual(calls, ['generate', 'compose']);
+  assert.equal('reply' in packet, false);
 });
 
-test('packet processor does not generate or compose a rejected pending packet', async () => {
-  const calls: string[] = [];
-  const processPacket = createPacketProcessor({
-    page: 'mock-page',
-    apiKey: 'mock-key',
-    adjudicateReply: async () => {
-      calls.push('adjudicate');
-      return 'reject' as const;
-    },
-    generateReply: async () => {
-      calls.push('generate');
-      return 'reply';
-    },
-    composeReply: async () => {
-      calls.push('compose');
-      return { status: 'sent' };
-    },
-    logError: () => undefined,
-  });
-  const packet = {
-    packetId: 'packet-rejected',
-    newMessages: [{ messageId: 'in-1', message: 'hey Alex' }],
-    reply: 'pending' as const,
-  };
-
-  await assert.rejects(processPacket(packet), ReplyRejectedError);
-  assert.deepEqual(calls, ['adjudicate']);
-  assert.equal(packet.reply, 'reject');
-});
-
-test('packet processor fails closed when a pending packet has no adjudicator', async () => {
-  const calls: string[] = [];
-  const processPacket = createPacketProcessor({
-    page: 'mock-page',
-    apiKey: 'mock-key',
-    generateReply: async () => {
-      calls.push('generate');
-      return 'reply';
-    },
-    composeReply: async () => {
-      calls.push('compose');
-      return { status: 'sent' };
-    },
-    logError: () => undefined,
-  });
-
-  await assert.rejects(
-    processPacket({
-      packetId: 'packet-no-adjudicator',
-      newMessages: [{ messageId: 'in-1', message: 'hello' }],
-      reply: 'pending',
-    }),
-    ReplyRejectedError,
-  );
-  assert.deepEqual(calls, []);
-});
-
-test('packet processor fails closed when the adjudicator throws', async () => {
-  const calls: string[] = [];
-  const processPacket = createPacketProcessor({
-    page: 'mock-page',
-    apiKey: 'mock-key',
-    adjudicateReply: async () => {
-      throw new Error('adjudication timeout');
-    },
-    generateReply: async () => {
-      calls.push('generate');
-      return 'reply';
-    },
-    composeReply: async () => {
-      calls.push('compose');
-      return { status: 'sent' };
-    },
-    logError: () => undefined,
-  });
-
-  await assert.rejects(
-    processPacket({
-      packetId: 'packet-adjudication-error',
-      newMessages: [{ messageId: 'in-1', message: 'hello' }],
-      reply: 'pending',
-    }),
-    ReplyRejectedError,
-  );
-  assert.deepEqual(calls, []);
-});
-
-test('packet processor rechecks approval before composition', async () => {
-  const calls: string[] = [];
-  const processPacket = createPacketProcessor({
-    page: 'mock-page',
-    apiKey: 'mock-key',
-    adjudicateReply: async () => 'approve' as const,
-    generateReply: async (_apiKey, _messages, packet) => {
-      calls.push('generate');
-      packet.reply = 'reject';
-      return 'reply';
-    },
-    composeReply: async () => {
-      calls.push('compose');
-      return { status: 'sent' };
-    },
-    logError: () => undefined,
-  });
-
-  await assert.rejects(
-    processPacket({
-      packetId: 'packet-tampered',
-      newMessages: [{ messageId: 'in-1', message: 'hello' }],
-      reply: 'pending',
-    }),
-    ReplyRejectedError,
-  );
-  assert.deepEqual(calls, ['generate']);
-});
-
-test('RNG packets start pending until adjudication', () => {
+test('RNG packets do not carry an adjudication decision', () => {
   const rngPacket = buildRngPacket([{
     messageId: 'in-1',
     sender: 'Alex',
@@ -1804,5 +1811,186 @@ test('RNG packets start pending until adjudication', () => {
     timestamp: null,
   }]);
 
-  assert.equal(rngPacket.reply, 'pending');
+  assert.equal('reply' in rngPacket, false);
+});
+
+test('mention packets do not carry an adjudication decision', () => {
+  const result = buildPacketTurn({
+    newMessages: [{
+      messageId: 'in-1', message: '@Bot help', mention: true, direction: 'INCOMING',
+    }],
+  });
+
+  assert.ok(result.pendingPacket);
+  assert.equal('reply' in result.pendingPacket, false);
+});
+
+test('mention matcher accepts bare, prefixed, and mixed-case identity forms', () => {
+  const matcher = createMentionMatcher({ name: 'Yukinon', aliases: ['@Yukinon', 'Yuki'] });
+
+  assert.equal(matcher('Yukinon are you good?'), true);
+  assert.equal(matcher('yukinon'), true);
+  assert.equal(matcher('YUKINON, you there?'), true);
+  assert.equal(matcher('@Yukinon hi'), true);
+  assert.equal(matcher('hey yuki, what now'), true);
+  assert.equal(matcher('good morning'), false);
+  assert.equal(matcher('Katsuyo can you hear me?'), false);
+});
+
+test('mention matcher rejects substring and word-boundary false positives', () => {
+  const matcher = createMentionMatcher({ name: 'Bot', aliases: ['@Bot'] });
+
+  assert.equal(matcher('@Bot, still there?'), true);
+  assert.equal(matcher('Bot?'), true);
+  assert.equal(matcher('@Botany is a plant'), false);
+  assert.equal(matcher('the robotics club meets today'), false);
+  assert.equal(matcher('bottle of water'), false);
+});
+
+test('mention matcher honours multiword configured identities and existing aliases', () => {
+  const aliases = ['@PleaseGetout Daily', '@PleaseGetoutDaily', '@PleaseGetout_Daily'];
+  const matcher = createMentionMatcher({ name: 'PleaseGetout Daily', aliases });
+
+  assert.equal(matcher('@PleaseGetout Daily can you check this?'), true);
+  assert.equal(matcher('PleaseGetout Daily can you check this?'), true);
+  assert.equal(matcher('pleasegetoutdaily are you there'), true);
+  assert.equal(matcher('@PleaseGetout_Daily explain'), true);
+  assert.equal(matcher('@PleaseGetoutDailyX explain'), false);
+  assert.equal(matcher('PleaseGetout Dailybreak is not the name'), false);
+});
+
+test('mention matcher follows the configured identity and never matches without one', () => {
+  const matcher = createMentionMatcher({ name: 'Anselmo', aliases: ['@Anselmo'] });
+  assert.equal(matcher('anselmo hello'), true);
+  assert.equal(matcher('@Anselmo hello'), true);
+  assert.equal(matcher('yukinon hello'), false);
+
+  assert.equal(createMentionMatcher({ name: '', aliases: [] })('anything at all'), false);
+});
+
+test('bounded id tracking enforces its limit, evicts oldest first, and keeps retained duplicates', () => {
+  const ids = createBoundedIdSet(3);
+  ids.add('one');
+  ids.add('two');
+  ids.add('three');
+  ids.add('two');
+  assert.deepEqual(ids.values(), ['one', 'two', 'three'], 're-adding a known id does not reorder');
+
+  ids.add('four');
+  assert.deepEqual(ids.values(), ['two', 'three', 'four']);
+  assert.equal(ids.has('one'), false);
+  assert.equal(ids.has('three'), true);
+  assert.equal(ids.size, 3);
+
+  ids.clear();
+  assert.equal(ids.size, 0);
+});
+
+test('packet builder bounds observed message retention and evicts oldest first', () => {
+  let state = createPacketBuilderState();
+  for (let index = 1; index <= 5; index += 1) {
+    state = buildPacketTurn({
+      newMessages: [{ messageId: `bounded-${index}`, message: `message ${index}` }],
+      state,
+      observedLimit: 3,
+    }).state;
+  }
+
+  assert.deepEqual(
+    state.observedMessages.map(message => message.messageId),
+    ['bounded-3', 'bounded-4', 'bounded-5'],
+  );
+
+  const repeated = buildPacketTurn({
+    newMessages: [{ messageId: 'bounded-4', message: 'message 4' }],
+    state,
+    observedLimit: 3,
+  });
+  assert.equal(repeated.packet, null, 'a retained id is not reprocessed');
+  assert.equal(repeated.state.observedMessages.length, 3);
+});
+
+test('packet processor discards a stale packet before generation', async () => {
+  const calls: string[] = [];
+  const processPacket = createPacketProcessor({
+    page: 'mock-page',
+    apiKey: 'mock-key',
+    generateReply: async () => {
+      calls.push('generate');
+      return 'reply';
+    },
+    composeReply: async () => {
+      calls.push('compose');
+      return { status: 'sent' };
+    },
+    isStale: () => true,
+    logError: () => undefined,
+  });
+
+  await assert.rejects(
+    processPacket({
+      packetId: 'packet-stale-before-generation',
+      newMessages: [{ messageId: 'in-1', message: 'hello' }],
+    }),
+    PacketStaleError,
+  );
+  assert.deepEqual(calls, []);
+});
+
+test('packet processor rechecks freshness immediately before sending', async () => {
+  const calls: string[] = [];
+  let stale = false;
+  const processPacket = createPacketProcessor({
+    page: 'mock-page',
+    apiKey: 'mock-key',
+    generateReply: async () => {
+      calls.push('generate');
+      return 'reply';
+    },
+    composeReply: async (_page, _reply, options) => {
+      calls.push('compose');
+      stale = true;
+      await options?.beforeSend?.();
+      return { status: 'sent' };
+    },
+    isStale: () => stale,
+    logError: () => undefined,
+  });
+
+  await assert.rejects(
+    processPacket({
+      packetId: 'packet-stale-before-send',
+      newMessages: [{ messageId: 'in-1', message: 'hello' }],
+    }),
+    PacketStaleError,
+  );
+  assert.deepEqual(calls, ['generate', 'compose']);
+});
+
+test('packet processor delivers a packet that stays fresh', async () => {
+  const calls: string[] = [];
+  const processPacket = createPacketProcessor({
+    page: 'mock-page',
+    apiKey: 'mock-key',
+    generateReply: async () => {
+      calls.push('generate');
+      return 'reply';
+    },
+    composeReply: async (_page, _reply, options) => {
+      calls.push('compose');
+      await options?.beforeSend?.();
+      return { status: 'sent' };
+    },
+    isStale: () => false,
+    logError: () => undefined,
+  });
+
+  assert.deepEqual(
+    await processPacket({
+      packetId: 'packet-fresh',
+      newMessages: [{ messageId: 'in-1', message: 'hello' }],
+    }),
+    { status: 'sent' },
+  );
+  assert.deepEqual(calls, ['generate', 'compose']);
 });

@@ -1,10 +1,17 @@
 import type { ConsoleMessage, Page } from 'playwright';
 import {
   NvidiaIdentityError,
-  adjudicateNvidiaReply,
   generateNvidiaReply,
+  type ConversationDiagnostic,
 } from '../ai/nvidia.js';
 import { navigatePageToMessengerDestination } from '../browser/launch.js';
+import {
+  createUnavailableGroupRoster,
+  extractGroupRoster,
+  formatGroupRosterOutcome,
+  sanitizeGroupRoster,
+  type GroupRoster,
+} from '../browser/group-roster.js';
 import {
   ANTI_ECHO_RETRY_INSTRUCTION,
   AntiEchoSuppressedError,
@@ -43,9 +50,10 @@ import {
   fingerprintMessageText,
   type DuplicateMessageRecord,
 } from './message-identity.js';
-import { createPacketProcessor } from './packet-processor.js';
+import { PacketStaleError, createPacketProcessor } from './packet-processor.js';
+import { createMentionMatcher } from './mention-matcher.js';
+import { createBoundedIdSet } from './bounded-id-set.js';
 import { validateReplyIdentity } from './identity-policy.js';
-import { assertReplyApproved } from './reply-adjudication.js';
 import {
   stripLeadingParticipantMentions,
   stripParticipantSpeakerLabel,
@@ -137,6 +145,8 @@ export interface CombustionOptions {
   aliases: readonly string[];
   apiKey: string;
   debugMode?: boolean;
+  roster?: GroupRoster;
+  extractGroupRoster?: typeof extractGroupRoster;
   navigateDestination?: (destination: string) => Promise<void>;
 }
 
@@ -173,20 +183,6 @@ function createWakeSignal(): { promise: Promise<void>; resolve: () => void } {
     resolve = resolvePromise;
   });
   return { promise, resolve };
-}
-
-function createMentionMatcher(aliases: readonly string[]): (message: string) => boolean {
-  const patterns = aliases
-    .map(alias => alias.trim())
-    .filter(Boolean)
-    .map(alias => alias.split(/\s+/)
-      .map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-      .join('\\s+') + '(?![\\p{L}\\p{N}_])');
-  if (patterns.length === 0) {
-    return () => false;
-  }
-  const matcher = new RegExp(patterns.join('|'), 'iu');
-  return message => matcher.test(message);
 }
 
 function identityNameVariants(value: string): string[] {
@@ -489,11 +485,17 @@ export async function startCombustion({
   aliases,
   apiKey,
   debugMode = false,
+  roster,
+  extractGroupRoster: extractRoster,
   navigateDestination,
 }: CombustionOptions): Promise<CombustionController> {
   const pauseGate = createPauseGate();
   const navigateToDestination = navigateDestination ?? ((destination: string) =>
     navigatePageToMessengerDestination(page, configuration, destination));
+  const rosterExtractor = extractRoster ?? extractGroupRoster;
+  const shouldRefreshRoster = roster !== undefined || extractRoster !== undefined;
+  let groupRoster = roster ? sanitizeGroupRoster(roster) : undefined;
+  let recomposeSystemInstruction = (): void => {};
   let observerAttached = false;
   let stopRequested = false;
   let loadListenerAttached = false;
@@ -523,12 +525,11 @@ export async function startCombustion({
   let pollRng: (() => void) | undefined;
   let listenerAttached = false;
   const messageIdentity = createMessageIdentityTracker();
-  const mentionsConfiguredAlias = createMentionMatcher(aliases);
+  const mentionsConfiguredAlias = createMentionMatcher({ name: configuration.puppetName ?? '', aliases });
   const botIdentityNames = new Set(
     [configuration.puppetName ?? '', ...aliases].flatMap(identityNameVariants),
   );
   const answeredIncomingMessageIds = new Set<string>();
-  const declinedIncomingMessageIds = new Set<string>();
   const isBotAuthoredMessage = (message: {
     sender?: unknown;
     direction?: unknown;
@@ -544,10 +545,53 @@ export async function startCombustion({
       variant === 'you' || botIdentityNames.has(variant)
     );
   };
-  const isUsableIncomingMessage = (message: ContextMessage): boolean =>
+  const isConfiguredMention = (message: {
+    message: string;
+    sender?: unknown;
+    direction?: unknown;
+  }): boolean =>
+    !isBotAuthoredMessage(message) && mentionsConfiguredAlias(message.message);
+
+  const isUsableIncomingMessage = (message: {
+    messageId?: string;
+    message?: string;
+    sender?: unknown;
+    direction?: unknown;
+  }): boolean =>
     message.direction === 'INCOMING' &&
     !isBotAuthoredMessage(message) &&
+    typeof message.message === 'string' &&
     message.message.trim().length > 0;
+
+  const newestParticipantMessageId = (): string | null => {
+    const recentMessages = contextStore.getRecent(CONTEXT_STORE_CAPACITY);
+    for (let index = recentMessages.length - 1; index >= 0; index -= 1) {
+      const message = recentMessages[index];
+      if (isUsableIncomingMessage(message) && message.messageId) {
+        return message.messageId;
+      }
+    }
+    return null;
+  };
+
+  const packetConversationWatermark = (packet: ScheduledPacket): string | null => {
+    const messages = [
+      ...(packet.contextMessages ?? []),
+      ...(packet.newMessages ?? []),
+    ];
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (isUsableIncomingMessage(message) && message.messageId) {
+        return message.messageId;
+      }
+    }
+    return null;
+  };
+
+  const isPacketStale = (packet: ScheduledPacket): boolean => {
+    const watermark = packetConversationWatermark(packet);
+    return watermark !== null && newestParticipantMessageId() !== watermark;
+  };
   const rememberAnsweredIncomingMessages = (packet: ScheduledPacket): void => {
     for (const message of [
       ...(packet.contextMessages ?? []),
@@ -563,22 +607,6 @@ export async function startCombustion({
         break;
       }
       answeredIncomingMessageIds.delete(oldestMessageId);
-    }
-  };
-  const rememberDeclinedIncomingMessage = (
-    messages: readonly { messageId?: string; message: string; direction?: unknown }[],
-  ): void => {
-    const latestIncoming = findLatestIncomingMessage(messages);
-    if (!latestIncoming?.messageId) {
-      return;
-    }
-    declinedIncomingMessageIds.add(latestIncoming.messageId);
-    while (declinedIncomingMessageIds.size > MESSAGE_HISTORY_LIMIT) {
-      const oldestMessageId = declinedIncomingMessageIds.values().next().value;
-      if (oldestMessageId === undefined) {
-        break;
-      }
-      declinedIncomingMessageIds.delete(oldestMessageId);
     }
   };
   const detectedAtByMessageId = new Map<string, number>();
@@ -982,11 +1010,25 @@ export async function startCombustion({
       let mentionPacketSubmittedThisPoll = false;
       try {
         const pollStartedAt = performance.now();
-        const messages = await readLatestMessages();
+        const readResult = await readLatestMessages();
+        const messages = readResult.messages;
         if (stopRequested) {
           break;
         }
         const observedAt = performance.now();
+        if (readResult.editedMessages.length > 0) {
+          console.log(
+            `  ${styled('[edit]', 'cyan')} detected ` +
+            `${readResult.editedMessages.length} edited message(s): ` +
+            `${readResult.editedMessages.map(message => message.messageId).join(', ')}`,
+          );
+          appendContextMessages(
+            contextStore,
+            readResult.editedMessages,
+            packetScheduler,
+            packetBuilderState,
+          );
+        }
         const newMessages: MessageDetails[] = [];
         for (const message of messages) {
           if (message.messageId && !seenMessageIds.has(message.messageId)) {
@@ -1004,7 +1046,7 @@ export async function startCombustion({
 
         const newMessagesWithMentions = newMessages.map(message => ({
           ...message,
-          mention: mentionsConfiguredAlias(message.message),
+          mention: isConfiguredMention(message),
         }));
         const mentionCount = newMessagesWithMentions.filter(message => message.mention).length;
         console.log(formatPollSummary(newMessages.length, mentionCount));
@@ -1039,7 +1081,7 @@ export async function startCombustion({
                 .filter(message => message.messageId && !newMessageIds.has(message.messageId))
                 .map(message => ({
                   ...message,
-                  mention: mentionsConfiguredAlias(message.message),
+                  mention: isConfiguredMention(message),
                 }))
             : [];
           const hadPendingPacket = packetBuilderState!.pendingPacket !== null;
@@ -1133,7 +1175,10 @@ export async function startCombustion({
       );
     }
   };
-  const readLatestMessages = async (): Promise<MessageDetails[]> => {
+  const readLatestMessages = async (): Promise<{
+    messages: MessageDetails[];
+    editedMessages: MessageDetails[];
+  }> => {
     const elements = await messageLocator.evaluateAll((items, limit) =>
       items.slice(-limit).map(element => {
         const message = element as HTMLElement;
@@ -1149,7 +1194,11 @@ export async function startCombustion({
     );
     const reconciled = messageIdentity.reconcile(elements.map(extractMessageDetails));
     reportMergedDuplicates(reconciled.duplicates);
+    const editedMessages: MessageDetails[] = [];
     for (const message of reconciled.messages) {
+      if (!message.messageId) {
+        continue;
+      }
       const previousText = observedTextByMessageId.get(message.messageId);
       if (previousText === undefined) {
         observedTextByMessageId.set(message.messageId, message.message);
@@ -1160,14 +1209,13 @@ export async function startCombustion({
           }
         }
       } else if (previousText !== message.message) {
-        throw new Error(
-          `Message ID ${message.messageId} was observed with different content.`,
-        );
+        observedTextByMessageId.set(message.messageId, message.message);
+        editedMessages.push(message);
       }
     }
-    return reconciled.messages;
+    return { messages: reconciled.messages, editedMessages };
   };
-  let seenMessageIds = new Set<string>();
+  const seenMessageIds = createBoundedIdSet(MESSAGE_HISTORY_LIMIT);
 
   const resetConversationState = async (baseline: MessageDetails[]): Promise<void> => {
     destinationEpoch += 1;
@@ -1177,8 +1225,12 @@ export async function startCombustion({
     packetBuilderState.nextPacketNumber = nextPacketNumber;
     contextStore.clear();
     answeredIncomingMessageIds.clear();
-    declinedIncomingMessageIds.clear();
-    seenMessageIds = new Set(baseline.map(message => message.messageId).filter(Boolean));
+    seenMessageIds.clear();
+    for (const message of baseline) {
+      if (message.messageId) {
+        seenMessageIds.add(message.messageId);
+      }
+    }
     appendContextMessages(contextStore, baseline, packetScheduler, packetBuilderState);
     packetBuilderState = buildPacketTurn({
       newMessages: [],
@@ -1186,7 +1238,7 @@ export async function startCombustion({
         .filter(message => message.messageId)
         .map(message => ({
           ...message,
-          mention: mentionsConfiguredAlias(message.message),
+          mention: isConfiguredMention(message),
         })),
       state: packetBuilderState,
     }).state;
@@ -1219,6 +1271,23 @@ export async function startCombustion({
         `${describeError(error)}`,
       );
     }
+  };
+
+  const refreshGroupRoster = async (): Promise<void> => {
+    if (!shouldRefreshRoster) {
+      return;
+    }
+    let refreshedRoster: GroupRoster;
+    try {
+      refreshedRoster = sanitizeGroupRoster(
+        await rosterExtractor(page, configuration.puppetName ?? ''),
+      );
+    } catch {
+      refreshedRoster = createUnavailableGroupRoster('group roster extraction failed');
+    }
+    groupRoster = refreshedRoster;
+    console.log(formatGroupRosterOutcome(refreshedRoster));
+    recomposeSystemInstruction();
   };
 
   const changeDestination = async (
@@ -1255,7 +1324,7 @@ export async function startCombustion({
         messageIdentity.clear();
         detectedAtByMessageId.clear();
         observedTextByMessageId.clear();
-        baseline = await readLatestMessages();
+        baseline = (await readLatestMessages()).messages;
       } catch (error) {
         const reason = describeError(error);
         console.error(`[engine] Destination change rejected: ${reason}`);
@@ -1279,6 +1348,7 @@ export async function startCombustion({
       }
 
       pendingDestination = null;
+      await refreshGroupRoster();
       try {
         await resetConversationState(baseline);
       } catch (error) {
@@ -1318,7 +1388,22 @@ export async function startCombustion({
       identity,
       personalityMode,
       customPersonalityInstruction,
+      roster: groupRoster,
     });
+    recomposeSystemInstruction = (): void => {
+      systemInstruction = composeProductionSystemInstruction({
+        identity,
+        personalityMode,
+        customPersonalityInstruction,
+        roster: groupRoster,
+      });
+    };
+    const reportTranscriptDiagnostic = (diagnostic: ConversationDiagnostic): void => {
+      console.log(
+        `${styled('[transcript]', 'yellow')} withheld assistant turn ` +
+        `id=${diagnostic.messageId ?? 'unknown'} reason=${diagnostic.reason}`,
+      );
+    };
     const processPacket = createPacketProcessor<
       PacketBuilderMessage,
       string,
@@ -1328,31 +1413,7 @@ export async function startCombustion({
     >({
       page,
       apiKey,
-      adjudicateReply: async (requestApiKey, packet, messages) => {
-        try {
-          const result = await adjudicateNvidiaReply(
-            requestApiKey,
-            messages as unknown as readonly BackreadMessage[],
-            { identity },
-          );
-          if (result.decision === 'approve') {
-            return 'approve';
-          }
-          console.log(
-            `${styled('[adjudication]', 'yellow')} ${packet.packetId ?? 'unknown'} ` +
-            `rejected: ${result.reason}`,
-          );
-        } catch (error) {
-          console.log(
-            `${styled('[adjudication]', 'yellow')} ${packet.packetId ?? 'unknown'} ` +
-            `failed closed: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-        rememberDeclinedIncomingMessage(messages);
-        return 'reject';
-      },
-      generateReply: async (requestApiKey, messages, packet) => {
-        assertReplyApproved(packet, 'combustion-reply-generation');
+      generateReply: async (requestApiKey, messages) => {
         const startedAt = performance.now();
         const latestIncoming = findLatestIncomingMessage(messages);
         const participantNames = collectParticipantNames({
@@ -1368,6 +1429,8 @@ export async function startCombustion({
                 ? appendRetryInstruction(systemInstruction, ANTI_ECHO_RETRY_INSTRUCTION)
                 : systemInstruction,
               identity,
+              roster: groupRoster,
+              onDiagnostic: reportTranscriptDiagnostic,
             },
           );
           const normalizedReply = stripLeadingParticipantMentions(
@@ -1448,6 +1511,7 @@ export async function startCombustion({
       },
       pauseGate,
       isCurrent: packet => packetEpochs.get(packet) === destinationEpoch,
+      isStale: packet => isPacketStale(packet as ScheduledPacket),
       debugMode,
     });
     packetScheduler = createPacketScheduler<ScheduledPacket>(async packet => {
@@ -1474,6 +1538,13 @@ export async function startCombustion({
         return result;
       } catch (error) {
         processingError = error;
+        if (error instanceof PacketStaleError) {
+          console.log(formatSubsystemStatus(
+            'packet',
+            `${styled(packet.packetId, 'bold')} discarded; newer incoming ` +
+            'messages superseded its context.',
+          ));
+        }
         throw error;
       } finally {
         completeRngPacket(packet.packetId, succeeded, processingError);
@@ -1496,11 +1567,17 @@ export async function startCombustion({
     loadListenerAttached = true;
     await attachWakerObserver();
 
-    const baseline = await readLatestMessages();
-    seenMessageIds = new Set([
-      ...contextStore.getState().messageIds,
-      ...baseline.map(message => message.messageId).filter(Boolean),
-    ]);
+    const baselineRead = await readLatestMessages();
+    const baseline = baselineRead.messages;
+    seenMessageIds.clear();
+    for (const messageId of contextStore.getState().messageIds) {
+      seenMessageIds.add(messageId);
+    }
+    for (const message of baseline) {
+      if (message.messageId) {
+        seenMessageIds.add(message.messageId);
+      }
+    }
     console.log(
       `${styled('Baseline recorded:', 'cyan')} ` +
       `${styled(String(seenMessageIds.size), 'bold')} unique message IDs.`,
@@ -1513,7 +1590,7 @@ export async function startCombustion({
         .filter(message => message.messageId)
         .map(message => ({
           ...message,
-          mention: mentionsConfiguredAlias(message.message),
+          mention: isConfiguredMention(message),
         })),
       state: packetBuilderState,
     }).state;
@@ -1559,13 +1636,11 @@ export async function startCombustion({
         ));
         return;
       }
-      if (latestMessage &&
-          (answeredIncomingMessageIds.has(latestMessage.messageId) ||
-           declinedIncomingMessageIds.has(latestMessage.messageId))) {
+      if (latestMessage && answeredIncomingMessageIds.has(latestMessage.messageId)) {
         console.log(formatSubsystemStatus(
           'rng',
           `${styled('Skipping dice roll:', 'yellow')} ` +
-          'latest incoming message was already answered or declined.',
+          'latest incoming message was already answered.',
         ));
         return;
       }
@@ -1614,13 +1689,12 @@ export async function startCombustion({
           console.log(formatSubsystemStatus('rng', 'No cooldown; normal polling resumes'));
           return;
         }
-        if (answeredIncomingMessageIds.has(latestIncomingMessage.messageId) ||
-            declinedIncomingMessageIds.has(latestIncomingMessage.messageId)) {
+        if (answeredIncomingMessageIds.has(latestIncomingMessage.messageId)) {
           rngOperationActive = false;
           console.log(formatSubsystemStatus(
             'rng',
             `${styled('Skipped:', 'yellow')} ` +
-            'the newest incoming message was already answered or declined',
+            'the newest incoming message was already answered',
           ));
           console.log(formatSubsystemStatus('rng', 'No cooldown; normal polling resumes'));
           return;
@@ -1699,11 +1773,7 @@ export async function startCombustion({
       setPersonality(nextMode, nextCustomInstruction) {
         personalityMode = nextMode;
         customPersonalityInstruction = nextCustomInstruction;
-        systemInstruction = composeProductionSystemInstruction({
-          identity,
-          personalityMode,
-          customPersonalityInstruction,
-        });
+        recomposeSystemInstruction();
       },
       changeDestination,
       async stop() {

@@ -34,7 +34,7 @@ export function createContextStore({ maxMessages = 60 }: { maxMessages?: number 
   }
 
   const messages: ContextMessage[] = [];
-  const messagesById = new Map();
+  const messagesById = new Map<string, ContextMessage>();
 
   return {
     add(incomingMessages) {
@@ -42,12 +42,21 @@ export function createContextStore({ maxMessages = 60 }: { maxMessages?: number 
         throw new TypeError('messages must be an array.');
       }
 
-      for (const message of incomingMessages) {
+      const validatedMessages = incomingMessages.map(message => {
         validateMessage(message);
+        return message;
+      });
+
+      for (const message of validatedMessages) {
         const existing = messagesById.get(message.messageId);
         if (existing) {
           if (existing.message !== message.message) {
-            throw new Error(`Message ID ${message.messageId} was observed with different content.`);
+            const updatedMessage = cloneMessage(message);
+            const existingIndex = messages.indexOf(existing);
+            if (existingIndex !== -1) {
+              messages[existingIndex] = updatedMessage;
+            }
+            messagesById.set(updatedMessage.messageId, updatedMessage);
           }
           continue;
         }

@@ -8,7 +8,6 @@ import {
   NvidiaApiKeyError,
   NvidiaIdentityError,
   NvidiaRequestError,
-  adjudicateNvidiaReply,
   generateNvidiaReply,
   resolveNvidiaEnvironmentPath,
   saveNvidiaApiKey,
@@ -19,10 +18,15 @@ import {
   ENGLISH_ONLY_RETRY_INSTRUCTION,
 } from '../src/components/english-only.js';
 import { IDENTITY_RETRY_INSTRUCTION } from '../src/components/identity-policy.js';
+import { IDENTITY_AWARENESS_INSTRUCTION_MARKER } from '../src/components/identity-awareness.js';
 import {
   generateReplyWithAntiEchoGuard,
   isEchoReply,
 } from '../src/components/anti-echo.js';
+import {
+  createUnavailableGroupRoster,
+  type GroupRoster,
+} from '../src/browser/group-roster.js';
 
 function createEnvironmentPath(context: TestContext): string {
   const directory = mkdtempSync(join(tmpdir(), 'impractical-bot-nvidia-'));
@@ -191,21 +195,22 @@ test('reply generation sends known-direction messages in order and extracts trim
     'Content-Type': 'application/json',
   });
   const body = JSON.parse(String(requestedOptions?.body));
-  assert.deepEqual(body, {
-    model: 'nvidia/nemotron-3.5-lightning-30b-a3b',
-    messages: [
-      {
-        role: 'system',
-        content: 'Test system instruction.',
-      },
-      { role: 'user', content: '[from Alex] Are you free tomorrow?' },
-      { role: 'assistant', content: 'I think so.' },
-      { role: 'user', content: '[from Blair] Great, what time works?' },
-    ],
-    chat_template_kwargs: { enable_thinking: false },
-    max_tokens: 256,
-    stream: false,
-  });
+  assert.equal(body.model, 'nvidia/nemotron-3.5-lightning-30b-a3b');
+  assert.deepEqual(body.chat_template_kwargs, { enable_thinking: false });
+  assert.equal(body.max_tokens, 256);
+  assert.equal(body.stream, false);
+  assert.equal(body.messages[0].role, 'system');
+  assert.ok(body.messages[0].content.startsWith('Test system instruction.'));
+  assert.match(body.messages[0].content, /Identity and recipient awareness:/);
+  assert.match(
+    body.messages[0].content,
+    /Other identified participants in this conversation: Alex, Blair\./,
+  );
+  assert.deepEqual(body.messages.slice(1), [
+    { role: 'user', content: '[from Alex] Are you free tomorrow?' },
+    { role: 'assistant', content: 'I think so.' },
+    { role: 'user', content: '[from Blair] Great, what time works?' },
+  ]);
 });
 
 test('reply generation uses a supplied system instruction before conversation messages', async () => {
@@ -227,8 +232,14 @@ test('reply generation uses a supplied system instruction before conversation me
   });
 
   const body = JSON.parse(String(requestedOptions?.body));
-  assert.deepEqual(body.messages, [
-    { role: 'system', content: 'Supplied instruction.' },
+  assert.equal(body.messages[0].role, 'system');
+  assert.ok(body.messages[0].content.startsWith('Supplied instruction.'));
+  assert.match(body.messages[0].content, /Identity and recipient awareness:/);
+  assert.match(
+    body.messages[0].content,
+    /Other identified participants in this conversation: Alex\./,
+  );
+  assert.deepEqual(body.messages.slice(1), [
     { role: 'user', content: '[from Alex] Hello.' },
   ]);
 });
@@ -953,122 +964,297 @@ test('NVIDIA service and unexpected-response failures are not reported as invali
     },
   );
 });
-test('adjudication requests a strict JSON participation decision with identity context', async () => {
-  let requestedOptions: RequestInit | undefined;
-  const result = await adjudicateNvidiaReply('nvapi-test-key', [
-    messengerMessage('in-1', 'Alex', 'INCOMING', 'Yukinon, are you around?'),
+test('generation includes identity-awareness guidance with configured identity and participants', async () => {
+  let systemInstruction = '';
+  await generateTestReply('nvapi-test-key', [
+    messengerMessage('in-1', 'Alex', 'INCOMING', 'TestBot, are you around?'),
     messengerMessage('out-1', 'You', 'OUTGOING', 'I am here.'),
     messengerMessage('in-2', 'Blair', 'INCOMING', 'Alex, can you send the file?'),
   ], {
-    identity: { name: 'Yukinon', aliases: ['Yuki'] },
-    fetch: async (_input, init) => {
-      requestedOptions = init;
-      return successfulCompletion('{"decision":"reject","reason":"addressed to Alex"}');
-    },
-  });
-
-  assert.deepEqual(result, { decision: 'reject', reason: 'addressed to Alex' });
-  const body = JSON.parse(String(requestedOptions?.body));
-  assert.equal(body.response_format.type, 'json_object');
-  assert.equal(body.max_tokens, 128);
-  assert.match(body.messages[0].content, /identity is exactly "Yukinon"/);
-  assert.match(body.messages[0].content, /Other identified participants: Alex, Blair/);
-  assert.deepEqual(body.messages.slice(1), [
-    { role: 'user', content: '[from Alex] Yukinon, are you around?' },
-    { role: 'assistant', content: 'I am here.' },
-    { role: 'user', content: '[from Blair] Alex, can you send the file?' },
-  ]);
-});
-
-test('adjudication labels known senders as authors and leaves unknown senders unlabeled', async () => {
-  let requestedOptions: RequestInit | undefined;
-  await adjudicateNvidiaReply('nvapi-test-key', [
-    messengerMessage('in-1', 'Katsuyo', 'INCOMING', 'Yukinon'),
-    messengerMessage('out-1', 'You', 'OUTGOING', 'An earlier reply.'),
-    messengerMessage('in-2', 'Katsuyo', 'INCOMING', 'Hello yukinon can you hear me?'),
-    messengerMessage('in-3', 'Katsuyo', 'INCOMING', 'Anselmo can you hear me?'),
-    messengerMessage('in-4', 'Katsuyo', 'INCOMING', 'Can you hear me?'),
-    messengerMessage('in-5', 'UNKNOWN', 'INCOMING', 'no sender label'),
-  ], {
-    identity: { name: 'Yukinon' },
-    fetch: async (_input, init) => {
-      requestedOptions = init;
-      return successfulCompletion('{"decision":"approve","reason":"direct question"}');
-    },
-  });
-
-  const body = JSON.parse(String(requestedOptions?.body));
-  assert.deepEqual(body.messages.slice(1), [
-    { role: 'user', content: '[from Katsuyo] Yukinon' },
-    { role: 'assistant', content: 'An earlier reply.' },
-    { role: 'user', content: '[from Katsuyo] Hello yukinon can you hear me?' },
-    { role: 'user', content: '[from Katsuyo] Anselmo can you hear me?' },
-    { role: 'user', content: '[from Katsuyo] Can you hear me?' },
-    { role: 'user', content: 'no sender label' },
-  ]);
-  assert.doesNotMatch(body.messages[1].content, /Katsuyo:/);
-});
-
-test('adjudication drops the configured identity from the participant list', async () => {
-  let systemInstruction = '';
-  await adjudicateNvidiaReply('nvapi-test-key', [
-    messengerMessage('in-1', 'Alex', 'INCOMING', 'hello'),
-  ], {
-    identity: { name: 'Yukinon', aliases: ['Yuki'] },
-    participantNames: ['Yukinon', 'Yuki', 'Alex', 'Alex'],
+    identity: { name: 'TestBot', aliases: ['@TestBot', 'TB'] },
     fetch: async (_input, init) => {
       systemInstruction = JSON.parse(String(init?.body)).messages[0].content;
-      return successfulCompletion('{"decision":"approve","reason":"greeting"}');
+      return successfulCompletion('Here.');
     },
   });
 
-  assert.match(systemInstruction, /Other identified participants: Alex\./);
-  assert.doesNotMatch(systemInstruction, /Other identified participants:.*Yuki/);
+  assert.match(systemInstruction, new RegExp(IDENTITY_AWARENESS_INSTRUCTION_MARKER));
+  assert.match(systemInstruction, /You are TestBot/);
+  assert.match(systemInstruction, /aliases @TestBot, TB refer to you/);
+  assert.match(systemInstruction, /Other identified participants in this conversation: Alex, Blair\./);
+  assert.doesNotMatch(systemInstruction, /Other identified participants.*TestBot/);
+  assert.match(systemInstruction, /You do not need an invitation/);
+  assert.match(systemInstruction, /addressed to another participant/);
+  assert.match(systemInstruction, /saying "I am <name>"/);
+  assert.match(systemInstruction, /configured identity is authoritative/);
 });
 
-test('adjudication fails closed on malformed, empty, and failed responses', async () => {
-  const messages = [
+test('generation keeps identity-awareness guidance across the corrective retry', async () => {
+  const instructions: string[] = [];
+  let calls = 0;
+
+  const reply = await generateTestReply('nvapi-test-key', [
+    messengerMessage('in-1', 'Alex', 'INCOMING', 'who are you?'),
+  ], {
+    identity: { name: 'TestBot' },
+    fetch: async (_input, init) => {
+      instructions.push(JSON.parse(String(init?.body)).messages[0].content);
+      calls += 1;
+      return successfulCompletion(calls === 1 ? 'I am Alex.' : 'I am TestBot.');
+    },
+  });
+
+  assert.equal(reply, 'I am TestBot.');
+  assert.equal(calls, 2);
+  for (const instruction of instructions) {
+    assert.match(instruction, new RegExp(IDENTITY_AWARENESS_INSTRUCTION_MARKER));
+    assert.match(instruction, /You are TestBot/);
+  }
+  assert.ok(instructions[1].endsWith(IDENTITY_RETRY_INSTRUCTION));
+});
+
+test('generation proceeds when the roster is unavailable', async () => {
+  let systemInstruction = '';
+  const reply = await generateTestReply('nvapi-test-key', [
     messengerMessage('in-1', 'Alex', 'INCOMING', 'hello'),
-  ];
-  const options = { identity: { name: 'Yukinon' } };
-
-  const malformed = await adjudicateNvidiaReply('nvapi-test-key', messages, {
-    ...options,
-    fetch: async () => successfulCompletion('not json'),
+  ], {
+    roster: createUnavailableGroupRoster('roster timed out'),
+    fetch: async (_input, init) => {
+      systemInstruction = JSON.parse(String(init?.body)).messages[0].content;
+      return successfulCompletion('Hi.');
+    },
   });
-  assert.equal(malformed.decision, 'reject');
 
-  const empty = await adjudicateNvidiaReply('nvapi-test-key', messages, {
-    ...options,
-    fetch: async () => successfulCompletion(''),
-  });
-  assert.equal(empty.decision, 'reject');
-
-  const failed = await adjudicateNvidiaReply('nvapi-test-key', messages, {
-    ...options,
-    fetch: async () => new Response('', { status: 500 }),
-  });
-  assert.equal(failed.decision, 'reject');
-
-  const network = await adjudicateNvidiaReply('nvapi-test-key', messages, {
-    ...options,
-    fetch: async () => { throw new TypeError('network down'); },
-  });
-  assert.equal(network.decision, 'reject');
+  assert.equal(reply, 'Hi.');
+  assert.match(systemInstruction, /Group membership context: unavailable\./u);
+  assert.match(systemInstruction, new RegExp(IDENTITY_AWARENESS_INSTRUCTION_MARKER));
+  assert.match(systemInstruction, /Other identified participants in this conversation: Alex\./);
 });
 
-test('adjudication rejects without a request when no incoming message is available', async () => {
-  let fetchCalls = 0;
-  const result = await adjudicateNvidiaReply('nvapi-test-key', [
-    messengerMessage('out-1', 'You', 'OUTGOING', 'already replied'),
+test('withheld assistant turns are reported and excluded from the transcript', async () => {
+  const diagnostics: Array<{ messageId: string | null; reason: string }> = [];
+  let body: { messages: { role: string; content: string }[] } | undefined;
+
+  const reply = await generateNvidiaReply('nvapi-test-key', [
+    messengerMessage('in-1', 'Alex', 'INCOMING', 'who are you?'),
+    messengerMessage('out-1', 'You', 'OUTGOING', 'I am Nemotron.'),
+    messengerMessage('in-2', 'Alex', 'INCOMING', 'say it again'),
+  ], {
+    systemInstruction: 'Production instruction.',
+    identity: { name: 'Yukinon' },
+    onDiagnostic: diagnostic => diagnostics.push({
+      messageId: diagnostic.messageId,
+      reason: diagnostic.reason,
+    }),
+    fetch: async (_input, init) => {
+      body = JSON.parse(String(init?.body)) as typeof body;
+      return successfulCompletion('I am Yukinon.');
+    },
+  });
+
+  assert.equal(reply, 'I am Yukinon.');
+  assert.deepEqual(diagnostics, [
+    { messageId: 'out-1', reason: 'provider-model-identity' },
+  ]);
+  assert.deepEqual(body?.messages.slice(1), [
+    { role: 'user', content: '[from Alex] who are you?' },
+    { role: 'user', content: '[from Alex] say it again' },
+  ]);
+});
+
+test('a message authored by the configured identity is serialized as an assistant turn', async () => {
+  let body: { messages: { role: string; content: string }[] } | undefined;
+
+  await generateNvidiaReply('nvapi-test-key', [
+    messengerMessage('in-1', 'Alex', 'INCOMING', 'hi'),
+    messengerMessage('own-1', 'Yukinon', 'INCOMING', 'I am here.'),
+    messengerMessage('in-2', 'Alex', 'INCOMING', 'good'),
+  ], {
+    systemInstruction: 'Production instruction.',
+    identity: { name: 'Yukinon' },
+    fetch: async (_input, init) => {
+      body = JSON.parse(String(init?.body)) as typeof body;
+      return successfulCompletion('Hey.');
+    },
+  });
+
+  assert.deepEqual(body?.messages.slice(1), [
+    { role: 'user', content: '[from Alex] hi' },
+    { role: 'assistant', content: 'I am here.' },
+    { role: 'user', content: '[from Alex] good' },
+  ]);
+});
+
+test('generation labels known senders as authors and leaves unknown senders unlabeled', async () => {
+  let body: { messages: { role: string; content: string }[] } | undefined;
+  await generateTestReply('nvapi-test-key', [
+    messengerMessage('in-1', 'Alex', 'INCOMING', 'TestBot'),
+    messengerMessage('out-1', 'You', 'OUTGOING', 'An earlier reply.'),
+    messengerMessage('in-2', 'Alex', 'INCOMING', 'Hello TestBot can you hear me?'),
+    messengerMessage('in-3', 'Alex', 'INCOMING', 'Blair can you hear me?'),
+    messengerMessage('in-4', 'Alex', 'INCOMING', 'Can you hear me?'),
+    messengerMessage('in-5', 'UNKNOWN', 'INCOMING', 'no sender label'),
+  ], {
+    identity: { name: 'TestBot' },
+    fetch: async (_input, init) => {
+      body = JSON.parse(String(init?.body)) as typeof body;
+      return successfulCompletion('Here.');
+    },
+  });
+
+  assert.deepEqual(body?.messages.slice(1), [
+    { role: 'user', content: '[from Alex] TestBot' },
+    { role: 'assistant', content: 'An earlier reply.' },
+    { role: 'user', content: '[from Alex] Hello TestBot can you hear me?' },
+    { role: 'user', content: '[from Alex] Blair can you hear me?' },
+    { role: 'user', content: '[from Alex] Can you hear me?' },
+    { role: 'user', content: 'no sender label' },
+  ]);
+  assert.doesNotMatch(body?.messages[1].content ?? '', /Alex:/);
+});
+test('generation appends roster context using first names only', async () => {
+  const roster: GroupRoster = {
+    status: 'partial',
+    members: [
+      { firstName: 'TestBot', isPuppet: true },
+      { firstName: 'Alex', isPuppet: false },
+    ],
+    puppet: { firstName: 'TestBot', isPuppet: true },
+    duplicateFirstNames: [],
+  };
+  let systemInstruction = '';
+
+  await generateTestReply('nvapi-test-key', [
+    messengerMessage('in-1', 'Alex', 'INCOMING', 'Hello.'),
+  ], {
+    roster,
+    fetch: async (_input, init) => {
+      systemInstruction = JSON.parse(String(init?.body)).messages[0].content;
+      return successfulCompletion('Hi Alex.');
+    },
+  });
+
+  assert.match(systemInstruction, /Test system instruction\./u);
+  assert.match(systemInstruction, /Group membership context: partial\./u);
+  assert.match(systemInstruction, /Observed first names: TestBot \(you\), Alex\./u);
+  assert.equal(systemInstruction.includes('Smith'), false);
+});
+
+test('generation receives roster context with duplicates preserved', async () => {
+  const roster: GroupRoster = {
+    status: 'partial',
+    members: [
+      { firstName: 'TestBot', isPuppet: true },
+      { firstName: 'Alex', isPuppet: false },
+      { firstName: 'Sam', isPuppet: false },
+      { firstName: 'Sam', isPuppet: false },
+    ],
+    puppet: { firstName: 'TestBot', isPuppet: true },
+    duplicateFirstNames: ['Sam'],
+  };
+  let systemInstruction = '';
+
+  const reply = await generateTestReply('nvapi-test-key', [
+    messengerMessage('in-1', 'Alex', 'INCOMING', 'Sam, can you send it?'),
+  ], {
+    roster,
+    fetch: async (_input, init) => {
+      systemInstruction = JSON.parse(String(init?.body)).messages[0].content;
+      return successfulCompletion('Sam can send it.');
+    },
+  });
+
+  assert.equal(reply, 'Sam can send it.');
+  assert.match(systemInstruction, /Group membership context: partial\./u);
+  assert.match(systemInstruction, /Observed first names: TestBot \(you\), Alex, Sam, Sam\./u);
+  assert.match(systemInstruction, /Duplicate first names observed: Sam/u);
+  assert.match(systemInstruction, /Other identified participants in this conversation: Alex, Sam\./u);
+});
+
+test('generation sanitizes full display names before building the request', async () => {
+  const roster = {
+    status: 'partial',
+    members: [
+      { firstName: 'Yukinon Yukinoshita', isPuppet: true },
+      { firstName: 'Geoff Markus Del Rio', isPuppet: false },
+    ],
+    puppet: { firstName: 'Yukinon Yukinoshita', isPuppet: true },
+    duplicateFirstNames: [],
+  } as GroupRoster;
+  let requestBody = '';
+
+  await generateTestReply('nvapi-test-key', [
+    messengerMessage('in-1', 'Geoff', 'INCOMING', 'Hello.'),
   ], {
     identity: { name: 'Yukinon' },
-    fetch: async () => {
-      fetchCalls += 1;
-      return successfulCompletion('{"decision":"approve","reason":"ok"}');
+    roster,
+    fetch: async (_input, init) => {
+      requestBody = String(init?.body);
+      return successfulCompletion('Hi Geoff.');
     },
   });
 
-  assert.equal(result.decision, 'reject');
-  assert.equal(fetchCalls, 0);
+  assert.match(requestBody, /Observed first names: Yukinon \(you\), Geoff\./u);
+  for (const surname of ['Yukinoshita', 'Markus', 'Del Rio']) {
+    assert.equal(requestBody.includes(surname), false);
+  }
+});
+
+test('generation sanitizes full display names and duplicate first names', async () => {
+  const roster = {
+    status: 'partial',
+    members: [
+      { firstName: 'TestBot Testbotson', isPuppet: true },
+      { firstName: 'Geoff Markus Del Rio', isPuppet: false },
+      { firstName: 'Geoff Markus Del Rio', isPuppet: false },
+    ],
+    puppet: { firstName: 'TestBot Testbotson', isPuppet: true },
+    duplicateFirstNames: ['Geoff Markus Del Rio'],
+  } as GroupRoster;
+  let requestBody = '';
+
+  const reply = await generateTestReply('nvapi-test-key', [
+    messengerMessage('in-1', 'Geoff', 'INCOMING', 'Geoff, can you send it?'),
+  ], {
+    roster,
+    fetch: async (_input, init) => {
+      requestBody = String(init?.body);
+      return successfulCompletion('Geoff can send it.');
+    },
+  });
+
+  assert.equal(reply, 'Geoff can send it.');
+  assert.match(requestBody, /Observed first names: TestBot \(you\), Geoff, Geoff\./u);
+  assert.match(requestBody, /Duplicate first names observed: Geoff/u);
+  assert.match(requestBody, /Other identified participants in this conversation: Geoff\./u);
+  for (const surname of ['Testbotson', 'Markus', 'Del Rio']) {
+    assert.equal(requestBody.includes(surname), false);
+  }
+});
+
+test('a sanitized roster puppet does not block the configured identity', async () => {
+  let calls = 0;
+  const roster = {
+    status: 'partial',
+    members: [
+      { firstName: 'Yukinon Yukinoshita', isPuppet: true },
+      { firstName: 'Geoff Markus Del Rio', isPuppet: false },
+    ],
+    puppet: { firstName: 'Yukinon Yukinoshita', isPuppet: true },
+    duplicateFirstNames: [],
+  } as GroupRoster;
+
+  const reply = await generateTestReply('nvapi-test-key', [
+    messengerMessage('in-1', 'Geoff', 'INCOMING', 'Who are you?'),
+  ], {
+    identity: { name: 'Yukinon' },
+    roster,
+    fetch: async () => {
+      calls += 1;
+      return successfulCompletion('I am Yukinon.');
+    },
+  });
+
+  assert.equal(reply, 'I am Yukinon.');
+  assert.equal(calls, 1);
 });

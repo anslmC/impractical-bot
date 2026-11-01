@@ -11,16 +11,10 @@ import {
   ENGLISH_ONLY_INSTRUCTION,
 } from '../src/components/personality.js';
 import type { Configuration } from '../src/config/configuration.js';
+import type { GroupRoster } from '../src/browser/group-roster.js';
 import * as nvidiaModule from '../src/ai/nvidia.js';
 import * as composerModule from '../src/components/composer.js';
 import { ANTI_ECHO_RETRY_INSTRUCTION } from '../src/components/anti-echo.js';
-
-(nvidiaModule as unknown as {
-  adjudicateNvidiaReply: typeof nvidiaModule.adjudicateNvidiaReply;
-}).adjudicateNvidiaReply = async () => ({
-  decision: 'approve',
-  reason: 'test approval',
-});
 
 const MESSAGE_SELECTOR =
   '[data-scope="messages_table"][aria-roledescription="message"][data-message-id]';
@@ -1916,6 +1910,329 @@ test('a duplicated incoming mention opens one packet and sends once', async cont
   }
 });
 
+test('a bare-name mention opens a mention packet when the RNG path is unavailable', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  const generatedRequests: Array<readonly { messageId: string; message: string }[]> = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    generatedRequests.push(messages as readonly { messageId: string; message: string }[]);
+    return 'mocked reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => ({ status: 'sent' });
+
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flushEngine();
+  };
+
+  const { page, inject } = createInjectedMessengerPage();
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration: { ...configuration, puppetName: 'Yukinon' },
+    aliases: ['@Yukinon'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'bare-1', sender: 'Katsuyo', message: 'Yukinon are you good?' }]);
+    await advancePoll();
+    await advancePoll();
+
+    assert.equal(generatedRequests.length, 1, 'the bare name opens a mention packet');
+    assert.equal(generatedRequests[0].at(-1)?.messageId, 'bare-1');
+
+    inject([{ messageId: 'bare-2', sender: 'Katsuyo', message: 'yukinon?' }]);
+    await advancePoll();
+    await advancePoll();
+    assert.equal(generatedRequests.length, 2, 'a mixed-case bare mention is answered too');
+    assert.equal(generatedRequests[1].at(-1)?.messageId, 'bare-2');
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('a message addressed to another participant is eligible for RNG participation', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0;
+  const generatedRequests: Array<readonly { messageId: string }[]> = [];
+  let composeCalls = 0;
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+
+  const { page, inject } = createInjectedMessengerPage();
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    generatedRequests.push(messages as readonly { messageId: string }[]);
+    return 'mocked reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => {
+    composeCalls += 1;
+    return { status: 'sent' };
+  };
+
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flushEngine();
+  };
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{
+      messageId: 'addressed-elsewhere',
+      sender: 'Anselmo',
+      message: 'Katsuyo, where are you, bro?',
+    }]);
+    await advancePoll();
+    await advancePoll();
+    await advancePoll();
+
+    assert.equal(generatedRequests.length, 1, 'the RNG packet is generated without a separate approval step');
+    assert.equal(generatedRequests[0].at(-1)?.messageId, 'addressed-elsewhere');
+    assert.equal(composeCalls, 1, 'the generated reply is sent');
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('a newer incoming message during generation prevents sending', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  let composeCalls = 0;
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  let injectedDuringGeneration = false;
+
+  const { page, inject } = createInjectedMessengerPage();
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (): Promise<string> => {
+    if (!injectedDuringGeneration) {
+      injectedDuringGeneration = true;
+      inject([{ messageId: 'newer-during-generation', sender: 'Blair', message: 'hold on' }]);
+      context.mock.timers.tick(3_000);
+      await flushEngine();
+    }
+    return 'mocked reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => {
+    composeCalls += 1;
+    return { status: 'sent' };
+  };
+
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flushEngine();
+  };
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'mention-before-generation', sender: 'Alex', message: '@Bot quick question' }]);
+    await advancePoll();
+    await advancePoll();
+    await advancePoll();
+
+    assert.equal(composeCalls, 0, 'a reply generated from superseded context is not sent');
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('an outgoing message after packet creation does not invalidate the packet', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  let composeCalls = 0;
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  let injectedOutgoing = false;
+
+  const { page, inject } = createInjectedMessengerPage();
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (): Promise<string> => {
+    if (!injectedOutgoing) {
+      injectedOutgoing = true;
+      inject([{ messageId: 'outgoing-during-generation', sender: 'You', message: 'one moment' }]);
+      context.mock.timers.tick(3_000);
+      await flushEngine();
+    }
+    return 'mocked reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => {
+    composeCalls += 1;
+    return { status: 'sent' };
+  };
+
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flushEngine();
+  };
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'mention-with-outgoing', sender: 'Alex', message: '@Bot still there?' }]);
+    await advancePoll();
+    await advancePoll();
+    await advancePoll();
+
+    assert.equal(composeCalls, 1, 'an outgoing message alone does not supersede the packet');
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('a failed generation does not mark the incoming message answered and RNG can retry it', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  const generatedRequests: Array<readonly { messageId: string }[]> = [];
+  let generationAttempts = 0;
+  let composeCalls = 0;
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    generationAttempts += 1;
+    generatedRequests.push(messages as unknown as readonly { messageId: string }[]);
+    if (generationAttempts === 1) {
+      throw new Error('provider unavailable');
+    }
+    return 'mocked reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => {
+    composeCalls += 1;
+    return { status: 'sent' };
+  };
+
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flushEngine();
+  };
+  const { page, inject } = createInjectedMessengerPage();
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'retryable-mention', sender: 'Alex', message: '@Bot are you there?' }]);
+    await advancePoll();
+    await advancePoll();
+    await advancePoll();
+
+    assert.equal(generationAttempts, 1);
+    assert.equal(generatedRequests.length, 1);
+    assert.equal(composeCalls, 0, 'a failed generation is not sent');
+
+    Math.random = () => 0;
+    for (let poll = 0; poll < 6; poll += 1) {
+      await advancePoll();
+    }
+
+    assert.equal(generationAttempts, 2, 'the message is retried through the RNG path');
+    assert.equal(generatedRequests[1].at(-1)?.messageId, 'retryable-mention');
+    assert.equal(composeCalls, 1);
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
 async function flushEngine(): Promise<void> {
   for (let turn = 0; turn < 8; turn += 1) {
     await new Promise<void>(resolve => setImmediate(resolve));
@@ -3049,5 +3366,180 @@ test('a failing anti-echo retry does not crash Combustion or send the echo', asy
     console.log = originalLog;
     Math.random = originalRandom;
     context.mock.timers.reset();
+  }
+});
+
+test('roster context reaches generation and refreshes after a destination change', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  const initialRoster: GroupRoster = {
+    status: 'partial',
+    members: [
+      { firstName: 'Test', isPuppet: true },
+      { firstName: 'Alex', isPuppet: false },
+    ],
+    puppet: { firstName: 'Test', isPuppet: true },
+    duplicateFirstNames: [],
+  };
+  const refreshedRoster: GroupRoster = {
+    status: 'partial',
+    members: [
+      { firstName: 'Test Puppet', isPuppet: true },
+      { firstName: 'Blair Chen', isPuppet: false },
+    ],
+    puppet: { firstName: 'Test Puppet', isPuppet: true },
+    duplicateFirstNames: [],
+  };
+  const sanitizedRefreshedRoster: GroupRoster = {
+    status: 'partial',
+    members: [
+      { firstName: 'Test', isPuppet: true },
+      { firstName: 'Blair', isPuppet: false },
+    ],
+    puppet: { firstName: 'Test', isPuppet: true },
+    duplicateFirstNames: [],
+  };
+  const generatedRosters: Array<GroupRoster | undefined> = [];
+  const systemInstructions: string[] = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (_apiKey, _messages, options) => {
+    generatedRosters.push(options?.roster);
+    systemInstructions.push(options?.systemInstruction ?? '');
+    return 'mocked reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => ({ status: 'sent' });
+
+  const { page, inject } = createInjectedMessengerPage();
+  const extractCalls: Array<{ page: unknown; puppetName: string }> = [];
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration: { ...configuration, puppetName: 'Test Puppet' },
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+    roster: initialRoster,
+    extractGroupRoster: async (extractPage, puppetName) => {
+      extractCalls.push({ page: extractPage, puppetName });
+      return refreshedRoster;
+    },
+    navigateDestination: async () => undefined,
+  });
+
+  try {
+    inject([{ messageId: 'roster-1', sender: 'Alex', message: '@Bot hello' }]);
+    for (let poll = 0; poll < 3; poll += 1) {
+      context.mock.timers.tick(3_000);
+      await flushEngine();
+    }
+    assert.deepEqual(generatedRosters, [initialRoster]);
+    assert.match(systemInstructions[0], /Group membership context:/u);
+    assert.match(systemInstructions[0], /Alex/u);
+    assert.equal(systemInstructions[0].includes('Blair'), false);
+
+    const change = await controller.changeDestination(
+      'https://www.facebook.com/messages/t/987654321',
+      { resume: true, persist: async () => undefined },
+    );
+    assert.deepEqual(change, { status: 'changed', resumed: true });
+    assert.deepEqual(extractCalls, [{ page, puppetName: 'Test Puppet' }]);
+
+    inject([{ messageId: 'roster-2', sender: 'Blair', message: '@Bot again' }]);
+    for (let poll = 0; poll < 3; poll += 1) {
+      context.mock.timers.tick(3_000);
+      await flushEngine();
+    }
+    assert.deepEqual(generatedRosters, [initialRoster, sanitizedRefreshedRoster]);
+    assert.match(systemInstructions[1], /Blair/u);
+    assert.equal(systemInstructions[1].includes('Alex'), false);
+    assert.equal(JSON.stringify(generatedRosters[1]).includes('Chen'), false);
+    assert.equal(systemInstructions[1].includes('Chen'), false);
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('a failed roster refresh replaces stale roster context with unavailable', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  const initialRoster: GroupRoster = {
+    status: 'partial',
+    members: [
+      { firstName: 'Test', isPuppet: true },
+      { firstName: 'Alex', isPuppet: false },
+    ],
+    puppet: { firstName: 'Test', isPuppet: true },
+    duplicateFirstNames: [],
+  };
+  const generatedRosters: Array<GroupRoster | undefined> = [];
+  const systemInstructions: string[] = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (_apiKey, _messages, options) => {
+    generatedRosters.push(options?.roster);
+    systemInstructions.push(options?.systemInstruction ?? '');
+    return 'mocked reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => ({ status: 'sent' });
+
+  const { page, inject } = createInjectedMessengerPage();
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration: { ...configuration, puppetName: 'Test Puppet' },
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+    roster: initialRoster,
+    extractGroupRoster: async () => {
+      throw new Error('member panel unavailable');
+    },
+    navigateDestination: async () => undefined,
+  });
+
+  try {
+    const change = await controller.changeDestination(
+      'https://www.facebook.com/messages/t/987654321',
+      { resume: true, persist: async () => undefined },
+    );
+    assert.deepEqual(change, { status: 'changed', resumed: true });
+
+    inject([{ messageId: 'roster-failed-1', sender: 'Blair', message: '@Bot hello' }]);
+    for (let poll = 0; poll < 3; poll += 1) {
+      context.mock.timers.tick(3_000);
+      await flushEngine();
+    }
+    assert.equal(generatedRosters.at(-1)?.status, 'unavailable');
+    assert.deepEqual(generatedRosters.at(-1)?.members, []);
+    assert.equal(systemInstructions.at(-1)?.includes('Alex'), false);
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
   }
 });

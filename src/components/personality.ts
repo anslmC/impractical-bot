@@ -1,6 +1,10 @@
+import { sanitizeGroupRoster, type GroupRoster } from '../browser/group-roster.js';
 import { ENGLISH_ONLY_INSTRUCTION } from './english-only.js';
+import { buildIdentityAwarenessInstruction } from './identity-awareness.js';
 
 export { ENGLISH_ONLY_INSTRUCTION };
+
+export const GROUP_ROSTER_INSTRUCTION_MARKER = 'Group membership context:';
 
 const DEFAULT_PERSONALITY_VOICE =
   'Write as a natural, conversational Messenger participant with a consistent voice. ' +
@@ -108,12 +112,87 @@ export function getBotIdentityInstruction({ name, aliases = [] }: BotIdentity): 
   ].join('\n');
 }
 
+function formatRosterMember(member: { firstName: string; isPuppet: boolean }): string {
+  return member.isPuppet ? `${member.firstName} (you)` : member.firstName;
+}
+
+export function getGroupRosterInstruction(roster?: GroupRoster): string {
+  if (!roster) {
+    return '';
+  }
+  const sanitized = sanitizeGroupRoster(roster);
+  if (sanitized.status === 'unavailable') {
+    return `${GROUP_ROSTER_INSTRUCTION_MARKER} unavailable. Do not assume the conversation has no other participants.`;
+  }
+  if (sanitized.status === 'not-group') {
+    return `${GROUP_ROSTER_INSTRUCTION_MARKER} not-group. This appears to be an individual conversation, so no group roster is available.`;
+  }
+
+  const lines = [
+    `${GROUP_ROSTER_INSTRUCTION_MARKER} ${sanitized.status}.`,
+    `Observed first names: ${sanitized.members.map(formatRosterMember).join(', ') || 'none observed'}.`,
+  ];
+  if (sanitized.puppet) {
+    lines.push(
+      `The configured bot is the roster entry marked "(you)" (first name: ${sanitized.puppet.firstName}).`,
+    );
+  } else {
+    lines.push(
+      'The configured bot could not be matched unambiguously to exactly one roster entry; do not assume any roster entry is you.',
+    );
+  }
+  if (sanitized.status === 'partial') {
+    lines.push('The roster is partial: the observed names may not represent every group member.');
+  } else if (sanitized.status === 'complete') {
+    lines.push('The roster is complete for this conversation.');
+  }
+  if (sanitized.duplicateFirstNames.length > 0) {
+    lines.push(
+      `Duplicate first names observed: ${sanitized.duplicateFirstNames.join(', ')}. ` +
+      'These entries may refer to different people and must not be merged.',
+    );
+  }
+  lines.push(
+    'Membership is contextual only: transcript sender labels identify who authored a message, ' +
+    'not necessarily who is being addressed.',
+  );
+  lines.push(
+    'A participant saying "I am <name>" is self-identifying, not addressing that name. ' +
+    'Naming or mentioning a participant does not by itself mean the message is addressed to them.',
+  );
+  lines.push(
+    'Your configured identity is fixed; roster membership does not allow you to claim to be another participant.',
+  );
+  return lines.join('\n');
+}
+
+export function appendGroupRosterInstruction(
+  systemInstruction: string,
+  roster?: GroupRoster,
+): string {
+  const instruction = getGroupRosterInstruction(roster);
+  if (!instruction) {
+    return systemInstruction;
+  }
+  const sections = systemInstruction.split(/\n{2,}/u);
+  const rosterIndex = sections.findIndex(section =>
+    section.trimStart().startsWith(GROUP_ROSTER_INSTRUCTION_MARKER)
+  );
+  if (rosterIndex >= 0) {
+    sections[rosterIndex] = instruction;
+    return sections.join('\n\n');
+  }
+  return [systemInstruction.trim(), instruction].filter(Boolean).join('\n\n');
+}
+
 export interface SystemInstructionLayers {
   identityInstruction: string;
   languageInstruction: string;
   conversationPolicyInstruction: string;
   personalityInstruction: string;
   outputGuidanceInstruction: string;
+  groupRosterInstruction?: string;
+  identityAwarenessInstruction?: string;
 }
 
 export function composeSystemInstruction(layers: SystemInstructionLayers): string;
@@ -132,6 +211,8 @@ export function composeSystemInstruction(
     ]
     : [
       layersOrIdentity.identityInstruction,
+      layersOrIdentity.groupRosterInstruction ?? '',
+      layersOrIdentity.identityAwarenessInstruction ?? '',
       layersOrIdentity.languageInstruction,
       layersOrIdentity.conversationPolicyInstruction,
       layersOrIdentity.personalityInstruction,
@@ -157,15 +238,19 @@ export interface ProductionSystemInstructionOptions {
   identity: BotIdentity;
   personalityMode: BotPersonalityMode;
   customPersonalityInstruction?: string;
+  roster?: GroupRoster;
 }
 
 export function composeProductionSystemInstruction({
   identity,
   personalityMode,
   customPersonalityInstruction,
+  roster,
 }: ProductionSystemInstructionOptions): string {
   return composeSystemInstruction({
     identityInstruction: getBotIdentityInstruction(identity),
+    groupRosterInstruction: getGroupRosterInstruction(roster),
+    identityAwarenessInstruction: buildIdentityAwarenessInstruction({ identity }),
     languageInstruction: ENGLISH_ONLY_INSTRUCTION,
     conversationPolicyInstruction: getConversationPolicyInstruction(),
     personalityInstruction: getPersonalityInstruction(personalityMode, customPersonalityInstruction),

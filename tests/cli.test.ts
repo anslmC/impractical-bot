@@ -9,6 +9,7 @@ import type { InitializationOptions, InitializationStatus, TerminalPrompt } from
 import { runCli, type CliRuntimeOptions } from '../src/cli.js';
 import { NvidiaApiKeyError } from '../src/ai/nvidia.js';
 import type { BrowserLaunchSession } from '../src/browser/launch.js';
+import type { GroupRoster } from '../src/browser/group-roster.js';
 import {
   MAX_PERSONALITY_INSTRUCTION_CHARS,
   loadConfiguration,
@@ -597,6 +598,130 @@ test('start debug mode skips NVIDIA validation and keeps backread read-only', as
   }
 });
 
+test('start extracts the group roster after validation and passes it to generation and Combustion', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration({ ...validConfiguration, puppetName: 'Test Puppet' }, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const originalDebugMode = process.env.IMPRACTICAL_BOT_DEBUG;
+  process.env.IMPRACTICAL_BOT_DEBUG = '1';
+  const roster: GroupRoster = {
+    status: 'partial',
+    members: [
+      { firstName: 'Test Puppet', isPuppet: true },
+      { firstName: 'Alex Smith', isPuppet: false },
+    ],
+    puppet: { firstName: 'Test Puppet', isPuppet: true },
+    duplicateFirstNames: [],
+  };
+  const sanitizedRoster: GroupRoster = {
+    status: 'partial',
+    members: [
+      { firstName: 'Test', isPuppet: true },
+      { firstName: 'Alex', isPuppet: false },
+    ],
+    puppet: { firstName: 'Test', isPuppet: true },
+    duplicateFirstNames: [],
+  };
+  const events: string[] = [];
+  const combustionStarted = deferred<void>();
+  const shutdown = deferred<void>();
+  const session: BrowserLaunchSession = {
+    endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+    browserVersion: 'Brave Chromium test',
+    disconnected: new Promise<void>(() => undefined),
+    async prepare() {
+      return stubPage;
+    },
+    async disconnect() {
+      events.push('disconnected');
+    },
+  };
+
+  try {
+    const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+      launchBrowser: async () => session,
+      readMessengerMessages: async () => {
+        events.push('backread');
+        return { diagnostics: [], messages: [] };
+      },
+      extractGroupRoster: async (page, puppetName) => {
+        assert.equal(page, stubPage);
+        assert.equal(puppetName, 'Test Puppet');
+        events.push('roster');
+        return roster;
+      },
+      generateNvidiaReply: async (_apiKey, _messages, options) => {
+        assert.deepEqual(options?.roster, sanitizedRoster);
+        return 'Generated reply';
+      },
+      composeMessengerReply: async () => ({ status: 'sent' }),
+      startCombustion: async options => {
+        assert.deepEqual(options.roster, sanitizedRoster);
+        assert.equal(JSON.stringify(options.roster).includes('Smith'), false);
+        events.push('combustion');
+        combustionStarted.resolve();
+        return createTestCombustionController();
+      },
+      waitForShutdown: () => shutdown.promise,
+    });
+
+    await combustionStarted.promise;
+    shutdown.resolve();
+    const result = await start;
+
+    assert.equal(result.exitCode, 130);
+    assert.deepEqual(events, ['roster', 'backread', 'combustion', 'disconnected']);
+    assert.deepEqual(result.errors, []);
+  } finally {
+    if (originalDebugMode === undefined) {
+      delete process.env.IMPRACTICAL_BOT_DEBUG;
+    } else {
+      process.env.IMPRACTICAL_BOT_DEBUG = originalDebugMode;
+    }
+  }
+});
+
+test('start continues with an unavailable roster when extraction fails', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration({ ...validConfiguration, puppetName: 'Test Puppet' }, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const combustionStarted = deferred<void>();
+  const shutdown = deferred<void>();
+  const session: BrowserLaunchSession = {
+    endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+    browserVersion: 'Brave Chromium test',
+    disconnected: new Promise<void>(() => undefined),
+    async prepare() {
+      return stubPage;
+    },
+    async disconnect() {
+      return undefined;
+    },
+  };
+  const start = captureCli(['start'], configurationFilePath, undefined, undefined, {
+    launchBrowser: async () => session,
+    validateNvidiaApiKey: async () => undefined,
+    readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+    extractGroupRoster: async () => {
+      throw new Error('roster panel unavailable');
+    },
+    startCombustion: async options => {
+      assert.equal(options.roster?.status, 'unavailable');
+      assert.deepEqual(options.roster?.members, []);
+      combustionStarted.resolve();
+      return createTestCombustionController();
+    },
+    waitForShutdown: () => shutdown.promise,
+  });
+
+  await combustionStarted.promise;
+  shutdown.resolve();
+  const result = await start;
+
+  assert.equal(result.exitCode, 130);
+  assert.deepEqual(result.errors, []);
+});
+
 test('start aborts and disconnects when backreading fails', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
@@ -751,7 +876,7 @@ test('start does not pass a partially seeded store to Combustion', async context
   assert.equal(result.exitCode, 1);
   assert.equal(combustionStarted, false);
   assert.equal(disconnects, 1);
-  assert.equal(contextStore.getState().size, 1);
+  assert.equal(contextStore.getState().size, 0);
   assert.deepEqual(result.errors, [
     'Unable to crank engine: Unable to seed historical message context.',
   ]);

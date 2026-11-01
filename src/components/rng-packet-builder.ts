@@ -1,5 +1,3 @@
-import type { ReplyDecision } from './reply-adjudication.js';
-
 let nextPacketNumber = 1;
 
 export interface RngPacketMessage {
@@ -12,7 +10,6 @@ export interface RngPacket {
   packetId: string;
   contextMessages: RngPacketMessage[];
   newMessages: never[];
-  reply: ReplyDecision;
 }
 
 export function buildRngPacket(recentMessages: RngPacketMessage[]): RngPacket {
@@ -35,6 +32,5 @@ export function buildRngPacket(recentMessages: RngPacketMessage[]): RngPacket {
     packetId,
     contextMessages,
     newMessages: [],
-    reply: 'pending',
   };
 }
