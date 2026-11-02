@@ -17,7 +17,7 @@ export function buildRngPacket(recentMessages: RngPacketMessage[]): RngPacket {
     throw new TypeError('recentMessages must be an array.');
   }
 
-  const contextMessages = recentMessages.slice(-15).map(message => {
+  const contextMessages = recentMessages.slice(-25).map(message => {
     if (!message || typeof message !== 'object' || Array.isArray(message) ||
         typeof message.messageId !== 'string' || !message.messageId ||
         typeof message.message !== 'string') {

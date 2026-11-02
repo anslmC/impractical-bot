@@ -175,7 +175,7 @@ test('identical text across a sender or direction change is never merged', () =>
   );
 });
 
-test('non-adjacent records are never merged even across namespaces', () => {
+test('non-adjacent numeric and mid$ copies are merged as one logical message', () => {
   const tracker = createMessageIdentityTracker();
   const { messages, duplicates } = tracker.reconcile([
     { messageId: NUMERIC_ID, message: 'ok', sender: 'You', direction: 'OUTGOING' },
@@ -185,10 +185,80 @@ test('non-adjacent records are never merged even across namespaces', () => {
 
   assert.deepEqual(
     messages.map(message => message.messageId),
-    [NUMERIC_ID, 'mid.$between', MID_ID],
-    'separation in rendered order keeps two identical-looking messages distinct',
+    [NUMERIC_ID, 'mid.$between'],
+    'the second namespace resolves to the first rendered copy',
+  );
+  assert.deepEqual(duplicates, [{
+    observedMessageId: MID_ID,
+    canonicalMessageId: NUMERIC_ID,
+    direction: 'OUTGOING',
+    sender: 'You',
+    message: 'ok',
+  }]);
+});
+
+test('non-adjacent identical text in one namespace stays distinct', () => {
+  const tracker = createMessageIdentityTracker();
+  const { messages, duplicates } = tracker.reconcile([
+    { messageId: 'mid.$first', message: 'ok', sender: 'Alex', direction: 'INCOMING' },
+    { messageId: 'mid.$between', message: 'another message', sender: 'You', direction: 'OUTGOING' },
+    { messageId: 'mid.$second', message: 'ok', sender: 'Alex', direction: 'INCOMING' },
+  ]);
+
+  assert.deepEqual(
+    messages.map(message => message.messageId),
+    ['mid.$first', 'mid.$between', 'mid.$second'],
+    'same-namespace repetition is not a duplicate rendering',
   );
   assert.deepEqual(duplicates, []);
+});
+
+test('identical text at different observed timestamps stays distinct', () => {
+  const tracker = createMessageIdentityTracker();
+  const { messages, duplicates } = tracker.reconcile([
+    {
+      messageId: NUMERIC_ID,
+      message: REPLY,
+      sender: 'You',
+      direction: 'OUTGOING',
+      timestamp: { original: '1:15 PM', normalized: null, resolved: false },
+    },
+    {
+      messageId: MID_ID,
+      message: REPLY,
+      sender: 'You',
+      direction: 'OUTGOING',
+      timestamp: { original: '1:16 PM', normalized: null, resolved: false },
+    },
+  ]);
+
+  assert.deepEqual(
+    messages.map(message => message.messageId),
+    [NUMERIC_ID, MID_ID],
+    'different timestamps are evidence of two genuine messages',
+  );
+  assert.deepEqual(duplicates, []);
+});
+
+test('a canonical message accepts only one alternate-id copy', () => {
+  const tracker = createMessageIdentityTracker();
+  const { messages, duplicates } = tracker.reconcile([
+    { messageId: NUMERIC_ID, message: REPLY, sender: 'You', direction: 'OUTGOING' },
+    { messageId: MID_ID, message: REPLY, sender: 'You', direction: 'OUTGOING' },
+    {
+      messageId: 'mid.$repeat',
+      message: REPLY,
+      sender: 'You',
+      direction: 'OUTGOING',
+    },
+  ]);
+
+  assert.deepEqual(
+    messages.map(message => message.messageId),
+    [NUMERIC_ID, 'mid.$repeat'],
+    'a later identical mid$ message is not assumed to be the same rendering',
+  );
+  assert.equal(duplicates.length, 1);
 });
 
 test('unknown namespaces, empty text and unknown direction are never merged', () => {

@@ -104,17 +104,33 @@ function parseTimestampLabel(ariaLabel: string): {
   };
 }
 
-export function classifyMessageLabel(ariaLabel: string | null): {
+const OUTGOING_PRESENTATION_PREFIX = /^(?:You\s+sent(?:\s*:\s*|\s+)|You:\s+)/u;
+
+function hasOutgoingPresentation(textWithoutSenderHeading: string | undefined): boolean {
+  return typeof textWithoutSenderHeading === 'string' &&
+    OUTGOING_PRESENTATION_PREFIX.test(textWithoutSenderHeading.trimStart());
+}
+
+export function classifyMessageLabel(
+  ariaLabel: string | null,
+  textWithoutSenderHeading?: string,
+): {
   timestamp: ExtractedTimestamp;
   sender: string;
   direction: 'INCOMING' | 'OUTGOING' | 'UNKNOWN';
 } {
   if (typeof ariaLabel !== 'string') {
-    return {
-      timestamp: unresolvedTimestamp(null),
-      sender: 'UNKNOWN',
-      direction: 'UNKNOWN',
-    };
+    return hasOutgoingPresentation(textWithoutSenderHeading)
+      ? {
+          timestamp: unresolvedTimestamp(null),
+          sender: 'You',
+          direction: 'OUTGOING',
+        }
+      : {
+          timestamp: unresolvedTimestamp(null),
+          sender: 'UNKNOWN',
+          direction: 'UNKNOWN',
+        };
   }
 
   const { timestamp, remainder } = parseTimestampLabel(ariaLabel);
@@ -127,7 +143,9 @@ export function classifyMessageLabel(ariaLabel: string | null): {
       : '';
 
   if (!sender) {
-    return { timestamp, sender: 'UNKNOWN', direction: 'UNKNOWN' };
+    return hasOutgoingPresentation(textWithoutSenderHeading)
+      ? { timestamp, sender: 'You', direction: 'OUTGOING' }
+      : { timestamp, sender: 'UNKNOWN', direction: 'UNKNOWN' };
   }
 
   return {
@@ -229,7 +247,10 @@ export function extractMessageDetails({
   ariaLabel: string | null;
   textWithoutSenderHeading: string;
 }): MessageDetails {
-  const { sender, direction } = classifyMessageLabel(ariaLabel);
+  const { sender, direction } = classifyMessageLabel(
+    ariaLabel,
+    textWithoutSenderHeading,
+  );
   return {
     messageId,
     message: extractMessageContent(ariaLabel, textWithoutSenderHeading),

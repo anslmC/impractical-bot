@@ -1,5 +1,6 @@
 const MAX_ALIASES = 5;
 const HANDLE_SEPARATORS = ['', '_'];
+const MIN_SHORT_NAME_LENGTH = 3;
 
 export interface AliasGenerationResult {
   base: string[];
@@ -27,10 +28,21 @@ function generateHandleVariations(name: string): string[] {
   return variations;
 }
 
+function generateShortNameVariations(name: string): string[] {
+  const tokens = normalizeName(name).split(' ').filter(Boolean);
+  if (tokens.length < 2 || tokens[0].length < MIN_SHORT_NAME_LENGTH) {
+    return [];
+  }
+  return [`@${tokens[0]}`];
+}
+
 export function generateAliases(baseName: string): AliasGenerationResult {
   const base = [`@${baseName}`];
+  const shortNameVariations = generateShortNameVariations(baseName);
   const handleVariations = generateHandleVariations(baseName);
-  const valids = [...new Set([...base, ...handleVariations])].slice(0, MAX_ALIASES);
+  const valids = [
+    ...new Set([...base, ...shortNameVariations, ...handleVariations]),
+  ].slice(0, MAX_ALIASES);
 
   return { base, handleVariations, valids };
 }

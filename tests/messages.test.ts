@@ -282,6 +282,52 @@ test('backread uses shared normalization for status and fallback presentation', 
       ['legitimate-status-body', 'I have Sent'],
     ],
   );
+  assert.deepEqual(
+    result.messages.map(message => [message.id, message.sender, message.direction]),
+    [
+      ['outgoing-delivered', 'You', 'OUTGOING'],
+      ['outgoing-fallback', 'You', 'OUTGOING'],
+      ['legitimate-status-body', 'You', 'OUTGOING'],
+    ],
+    'the outgoing presentation identifies an unparseable label without guessing a participant',
+  );
+});
+
+test('classifies outgoing presentation only when the accessible label is unusable', () => {
+  assert.deepEqual(
+    classifyMessageLabel(null, 'You sent hello'),
+    {
+      timestamp: { original: null, normalized: null, resolved: false },
+      sender: 'You',
+      direction: 'OUTGOING',
+    },
+  );
+  assert.deepEqual(
+    classifyMessageLabel('unrecognized label', 'You: hello'),
+    {
+      timestamp: { original: null, normalized: null, resolved: false },
+      sender: 'You',
+      direction: 'OUTGOING',
+    },
+  );
+  assert.deepEqual(
+    classifyMessageLabel('At 1:15 PM, Alex: hello', 'You sent hello'),
+    {
+      timestamp: { original: '1:15 PM', normalized: null, resolved: false },
+      sender: 'Alex',
+      direction: 'INCOMING',
+    },
+    'a usable sender label is not overridden by body text',
+  );
+  assert.deepEqual(
+    classifyMessageLabel(null, 'hello'),
+    {
+      timestamp: { original: null, normalized: null, resolved: false },
+      sender: 'UNKNOWN',
+      direction: 'UNKNOWN',
+    },
+    'absence of outgoing presentation leaves attribution unknown',
+  );
 });
 
 test('continues scrolling without new IDs until the conversation top', async () => {

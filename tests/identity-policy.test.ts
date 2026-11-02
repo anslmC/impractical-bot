@@ -12,15 +12,19 @@ const context: IdentityValidationContext = {
   participantNames: ['Alex', 'Blair'],
 };
 
-function assertAccepted(reply: string): void {
-  assert.deepEqual(validateReplyIdentity(reply, context), { valid: true }, reply);
+function assertAccepted(
+  reply: string,
+  options?: Parameters<typeof validateReplyIdentity>[2],
+): void {
+  assert.deepEqual(validateReplyIdentity(reply, context, options), { valid: true }, reply);
 }
 
 function assertRejected(
   reply: string,
   reason: string,
+  options?: Parameters<typeof validateReplyIdentity>[2],
 ): void {
-  const result = validateReplyIdentity(reply, context);
+  const result = validateReplyIdentity(reply, context, options);
   assert.equal(result.valid, false, reply);
   if (!result.valid) {
     assert.equal(result.reason, reason, reply);
@@ -38,6 +42,25 @@ test('identity validation accepts the configured puppet name and its aliases', (
   ]) {
     assertAccepted(reply);
   }
+});
+
+test('identity validation accepts the configured short name and appositives', () => {
+  const fullContext: IdentityValidationContext = {
+    name: 'Yukinon Yukinoshita',
+    aliases: ['@Yukinon Yukinoshita'],
+    participantNames: ['Alex', 'Blair'],
+  };
+
+  for (const reply of [
+    'I am Yukinon.',
+    'I am Yukinon, obviously.',
+    'I am Yukinon Yukinoshita.',
+    'I am Yukinon Yukinoshita, obviously.',
+    'My name is Yukinon.',
+  ]) {
+    assert.deepEqual(validateReplyIdentity(reply, fullContext), { valid: true }, reply);
+  }
+  assert.equal(validateReplyIdentity('I am Alex, obviously.', fullContext).valid, false);
 });
 
 test('identity validation follows whatever puppet is configured', () => {
@@ -133,6 +156,16 @@ test('identity validation keeps ordinary first-person and playful replies valid'
   ]) {
     assertAccepted(reply);
   }
+});
+
+test('historical assistant turns keep ambiguous descriptive phrasing', () => {
+  assertAccepted("It's Donut Day.", { historical: true });
+  assertAccepted("It's Showtime.", { historical: true });
+  assertRejected("It's Alex.", 'participant-impersonation', { historical: true });
+  assertRejected("It's ChatGPT.", 'provider-model-identity', { historical: true });
+  assertRejected('This is Bob.', 'other-identity', { historical: true });
+  assertRejected('I am Batman.', 'other-identity', { historical: true });
+  assertRejected('My name is Bob.', 'other-identity', { historical: true });
 });
 
 test('identity validation does not treat third-person discussion as a claim', () => {

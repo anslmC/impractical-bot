@@ -10,11 +10,12 @@ test('always puts the configured name first as the @-prefixed default alias', ()
   assert.ok(aliases.valids.includes('@PleaseGetout Daily'));
 });
 
-test('generates only a few deliberate combinations of the full configured name', () => {
+test('generates a short first-name alias plus a few deliberate combinations', () => {
   const aliases = generateAliases('PleaseGetout Daily');
 
   assert.deepEqual(aliases.valids, [
     '@PleaseGetout Daily',
+    '@PleaseGetout',
     '@PleaseGetoutDaily',
     '@PleaseGetout_Daily',
   ]);
@@ -23,17 +24,28 @@ test('generates only a few deliberate combinations of the full configured name',
   assert.ok(aliases.valids.every(alias => alias.startsWith('@')));
 });
 
-test('never generates generic words or shortened name fragments', () => {
+test('uses the configured first name as the only shortened form', () => {
   const { valids } = generateAliases('PleaseGetout Daily');
 
   for (const unwanted of ['Daily', 'Please', 'Getout', '@Daily', '@Please', '@Getout']) {
     assert.equal(valids.includes(unwanted), false);
   }
+  assert.ok(valids.includes('@PleaseGetout'));
   for (const alias of valids) {
     const name = alias.slice(1).toLowerCase();
     assert.ok(name.includes('pleasegetout'));
-    assert.ok(name.includes('daily'));
   }
+});
+
+test('derives the natural short name from a multiword configured identity', () => {
+  const aliases = generateAliases('Yukinon Yukinoshita');
+
+  assert.deepEqual(aliases.valids, [
+    '@Yukinon Yukinoshita',
+    '@Yukinon',
+    '@YukinonYukinoshita',
+    '@Yukinon_Yukinoshita',
+  ]);
 });
 
 test('keeps the raw configured name while normalizing whitespace for variations', () => {
@@ -43,6 +55,7 @@ test('keeps the raw configured name while normalizing whitespace for variations'
   assert.equal(aliases.valids[0], '@PleaseGetout  daily Name');
   assert.deepEqual(aliases.valids, [
     '@PleaseGetout  daily Name',
+    '@PleaseGetout',
     '@PleaseGetoutdailyName',
     '@PleaseGetout_daily_Name',
   ]);

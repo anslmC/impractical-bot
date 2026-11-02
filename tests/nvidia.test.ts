@@ -17,6 +17,7 @@ import {
   ENGLISH_ONLY_INSTRUCTION,
   ENGLISH_ONLY_RETRY_INSTRUCTION,
 } from '../src/components/english-only.js';
+import { EMOJI_RETRY_INSTRUCTION } from '../src/components/emoji.js';
 import { IDENTITY_RETRY_INSTRUCTION } from '../src/components/identity-policy.js';
 import { IDENTITY_AWARENESS_INSTRUCTION_MARKER } from '../src/components/identity-awareness.js';
 import {
@@ -352,6 +353,54 @@ test('a persistently non-English reply is suppressed instead of sent', async () 
     /repeatedly returned a non-English reply/,
   );
   assert.equal(call, 2, 'there is no unbounded retry loop');
+});
+
+test('a reply containing an emoji is retried once without the emoji', async () => {
+  const bodies: { messages: { role: string; content: string }[] }[] = [];
+  let call = 0;
+
+  const reply = await generateTestReply('nvapi-test-key', [{
+    id: 'incoming-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Alex',
+    direction: 'INCOMING',
+    message: 'how are you?',
+    ariaLabel: null,
+  }], {
+    fetch: async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as typeof bodies[number]);
+      call += 1;
+      return call === 1
+        ? successfulCompletion('I am fine 😀')
+        : successfulCompletion('I am fine.');
+    },
+  });
+
+  assert.equal(call, 2, 'the emoji reply is retried exactly once');
+  assert.equal(reply, 'I am fine.');
+  assert.ok(bodies[1].messages[0].content.endsWith(EMOJI_RETRY_INSTRUCTION));
+});
+
+test('a persistently emoji reply is suppressed instead of sent', async () => {
+  let call = 0;
+
+  await assert.rejects(
+    generateTestReply('nvapi-test-key', [{
+      id: 'incoming-1',
+      timestamp: { original: null, normalized: null, resolved: false },
+      sender: 'Alex',
+      direction: 'INCOMING',
+      message: 'how are you?',
+      ariaLabel: null,
+    }], {
+      fetch: async () => {
+        call += 1;
+        return successfulCompletion('I am fine 😀');
+      },
+    }),
+    /repeatedly returned a reply containing an emoji/,
+  );
+  assert.equal(call, 2, 'there is no unbounded emoji retry loop');
 });
 
 test('an invalid identity is retried once with the identity correction', async () => {
@@ -1093,6 +1142,38 @@ test('withheld assistant turns are reported and excluded from the transcript', a
   ]);
 });
 
+test('historical assistant turns keep legitimate descriptive text while false claims stay withheld', async () => {
+  const diagnostics: Array<{ messageId: string | null; reason: string }> = [];
+  let body: { messages: { role: string; content: string }[] } | undefined;
+
+  await generateNvidiaReply('nvapi-test-key', [
+    messengerMessage('in-1', 'Alex', 'INCOMING', 'what day is it?'),
+    messengerMessage('out-1', 'You', 'OUTGOING', "It's Donut Day."),
+    messengerMessage('out-2', 'You', 'OUTGOING', 'I am Nemotron.'),
+    messengerMessage('in-2', 'Alex', 'INCOMING', 'okay'),
+  ], {
+    systemInstruction: 'Production instruction.',
+    identity: { name: 'Yukinon' },
+    onDiagnostic: diagnostic => diagnostics.push({
+      messageId: diagnostic.messageId,
+      reason: diagnostic.reason,
+    }),
+    fetch: async (_input, init) => {
+      body = JSON.parse(String(init?.body)) as typeof body;
+      return successfulCompletion('It is.');
+    },
+  });
+
+  assert.deepEqual(body?.messages.slice(1), [
+    { role: 'user', content: '[from Alex] what day is it?' },
+    { role: 'assistant', content: "It's Donut Day." },
+    { role: 'user', content: '[from Alex] okay' },
+  ]);
+  assert.deepEqual(diagnostics, [
+    { messageId: 'out-2', reason: 'provider-model-identity' },
+  ]);
+});
+
 test('a message authored by the configured identity is serialized as an assistant turn', async () => {
   let body: { messages: { role: string; content: string }[] } | undefined;
 
@@ -1113,6 +1194,33 @@ test('a message authored by the configured identity is serialized as an assistan
     { role: 'user', content: '[from Alex] hi' },
     { role: 'assistant', content: 'I am here.' },
     { role: 'user', content: '[from Alex] good' },
+  ]);
+});
+
+test('Backread-seeded outgoing messages reach generation as assistant turns in order', async () => {
+  let body: { messages: { role: string; content: string }[] } | undefined;
+
+  await generateNvidiaReply('nvapi-test-key', [
+    messengerMessage('in-1', 'Alex', 'INCOMING', 'first'),
+    messengerMessage('own-1', 'You', 'OUTGOING', 'I am here.'),
+    messengerMessage('in-2', 'Alex', 'INCOMING', 'second'),
+    messengerMessage('own-2', 'You', 'OUTGOING', 'Still here.'),
+    messengerMessage('in-3', 'Alex', 'INCOMING', 'third'),
+  ], {
+    systemInstruction: 'Production instruction.',
+    identity: { name: 'Yukinon' },
+    fetch: async (_input, init) => {
+      body = JSON.parse(String(init?.body)) as typeof body;
+      return successfulCompletion('Yes.');
+    },
+  });
+
+  assert.deepEqual(body?.messages.slice(1), [
+    { role: 'user', content: '[from Alex] first' },
+    { role: 'assistant', content: 'I am here.' },
+    { role: 'user', content: '[from Alex] second' },
+    { role: 'assistant', content: 'Still here.' },
+    { role: 'user', content: '[from Alex] third' },
   ]);
 });
 

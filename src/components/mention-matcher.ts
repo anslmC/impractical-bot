@@ -20,6 +20,10 @@ function mentionForms({ name = '', aliases = [] }: MentionIdentity): string[] {
   };
 
   add(name);
+  const nameTokens = name.trim().replace(/\s+/gu, ' ').split(' ').filter(Boolean);
+  if (nameTokens.length > 1 && nameTokens[0].length >= 3) {
+    add(nameTokens[0]);
+  }
   for (const alias of aliases) {
     add(alias);
   }

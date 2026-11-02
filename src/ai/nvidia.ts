@@ -19,6 +19,10 @@ import {
   isEnglishOnlyReply,
 } from '../components/english-only.js';
 import {
+  EMOJI_RETRY_INSTRUCTION,
+  containsEmoji,
+} from '../components/emoji.js';
+import {
   IDENTITY_RETRY_INSTRUCTION,
   validateReplyIdentity,
   type IdentityValidationContext,
@@ -417,7 +421,11 @@ function buildConversationTurns(
       ? stripParticipantSpeakerLabel(content, participantNames)
       : content;
     if (isAssistantTurn) {
-      const identityResult = validateReplyIdentity(turnContent, identityContext);
+      const identityResult = validateReplyIdentity(
+        turnContent,
+        identityContext,
+        { historical: true },
+      );
       if (!identityResult.valid) {
         onDiagnostic?.({
           messageId: message.id || null,
@@ -642,14 +650,18 @@ export async function generateNvidiaReply(
   );
   const firstReply = await requestCompletion(systemInstruction);
   const firstLanguageValid = isEnglishOnlyReply(firstReply);
+  const firstEmojiFree = !containsEmoji(firstReply);
   const firstIdentityResult = validateReplyIdentity(firstReply, identityContext);
-  if (firstLanguageValid && firstIdentityResult.valid) {
+  if (firstLanguageValid && firstEmojiFree && firstIdentityResult.valid) {
     return firstReply;
   }
 
   const retryInstructions: string[] = [];
   if (!firstLanguageValid) {
     retryInstructions.push(ENGLISH_ONLY_RETRY_INSTRUCTION);
+  }
+  if (!firstEmojiFree) {
+    retryInstructions.push(EMOJI_RETRY_INSTRUCTION);
   }
   if (!firstIdentityResult.valid) {
     retryInstructions.push(IDENTITY_RETRY_INSTRUCTION);
@@ -668,6 +680,12 @@ export async function generateNvidiaReply(
     throw new NvidiaRequestError(
       'service',
       'NVIDIA repeatedly returned a non-English reply. The reply was not sent.',
+    );
+  }
+  if (containsEmoji(retryReply)) {
+    throw new NvidiaRequestError(
+      'service',
+      'NVIDIA repeatedly returned a reply containing an emoji. The reply was not sent.',
     );
   }
   return retryReply;

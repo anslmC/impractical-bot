@@ -76,10 +76,12 @@ const MESSAGE_LIMIT = 20;
 const CONTEXT_STORE_CAPACITY = 60;
 const POLL_INTERVAL_MS = 1500;
 const RNG_ROLL_INTERVAL_MS = 7000;
-const RNG_CONTEXT_MESSAGE_LIMIT = 15;
-const PACKET_CONTEXT_MESSAGE_LIMIT = 13;
+const RNG_CONTEXT_MESSAGE_LIMIT = 25;
+const PACKET_CONTEXT_MESSAGE_LIMIT = 20;
 const IDLE_THRESHOLD_MS = 120000;
 const MESSAGE_HISTORY_LIMIT = 200;
+const PENDING_OUTGOING_REPLY_TTL_MS = 120000;
+const MAX_PENDING_OUTGOING_REPLIES = 8;
 const LOG_PREFIX = '__MESSENGER_WAKER__:';
 const DEBUG_ENGINE = true;
 
@@ -102,6 +104,15 @@ type PacketTriggerType = 'rng' | 'mention' | 'unknown';
 type ScheduledPacket = (PacketBuilderPacket | RngPacket) & {
   mentionMessages?: PacketBuilderMessage[];
 };
+
+interface PendingOutgoingReply extends ContextMessage {
+  messageId: string;
+  message: string;
+  sender: 'You';
+  direction: 'OUTGOING';
+  afterMessageId: string | null;
+  createdAt: number;
+}
 
 interface PacketTiming {
   detectedAt?: number;
@@ -573,6 +584,171 @@ export async function startCombustion({
     !isBotAuthoredMessage(message) &&
     typeof message.message === 'string' &&
     message.message.trim().length > 0;
+
+  const normalizeReplyText = (message: string): string =>
+    message.normalize('NFC').replace(/\s+/gu, ' ').trim();
+
+  let nextPendingOutgoingReplyId = 1;
+  const pendingOutgoingReplies: PendingOutgoingReply[] = [];
+
+  const prunePendingOutgoingReplies = (now = Date.now()): void => {
+    while (pendingOutgoingReplies.length > 0 &&
+           now - pendingOutgoingReplies[0].createdAt > PENDING_OUTGOING_REPLY_TTL_MS) {
+      pendingOutgoingReplies.shift();
+    }
+  };
+
+  const recordPendingOutgoingReply = (message: string): void => {
+    const trimmedMessage = message.trim();
+    if (!trimmedMessage) {
+      return;
+    }
+    prunePendingOutgoingReplies();
+    pendingOutgoingReplies.push({
+      messageId: `pending-outgoing-${String(nextPendingOutgoingReplyId)}`,
+      message: trimmedMessage,
+      sender: 'You',
+      direction: 'OUTGOING',
+      afterMessageId: contextStore.getRecent(1)[0]?.messageId ?? null,
+      createdAt: Date.now(),
+    });
+    nextPendingOutgoingReplyId += 1;
+    while (pendingOutgoingReplies.length > MAX_PENDING_OUTGOING_REPLIES) {
+      pendingOutgoingReplies.shift();
+    }
+  };
+
+  const reconcilePendingOutgoingReplies = (
+    messages: readonly { message: string; sender?: unknown; direction?: unknown }[],
+  ): void => {
+    prunePendingOutgoingReplies();
+    for (const message of messages) {
+      if (!isBotAuthoredMessage(message)) {
+        continue;
+      }
+      const comparable = normalizeReplyText(message.message);
+      const pendingIndex = pendingOutgoingReplies.findIndex(
+        pending => normalizeReplyText(pending.message) === comparable,
+      );
+      if (pendingIndex !== -1) {
+        pendingOutgoingReplies.splice(pendingIndex, 1);
+      }
+    }
+  };
+
+  const latestIncomingMessageId = (
+    messages: readonly { messageId?: string; message?: string; sender?: unknown; direction?: unknown }[],
+  ): string | null => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (isUsableIncomingMessage(message) && message.messageId) {
+        return message.messageId;
+      }
+    }
+    return null;
+  };
+
+  const mergePendingOutgoingReplies = (
+    context: readonly ContextMessage[],
+    pendingReplies: readonly PendingOutgoingReply[],
+  ): ContextMessage[] => {
+    if (pendingReplies.length === 0) {
+      return [...context];
+    }
+    const outgoingTexts = new Set(
+      context
+        .filter(message => isBotAuthoredMessage(message))
+        .map(message => normalizeReplyText(message.message)),
+    );
+    const additions: ContextMessage[] = [];
+    for (const pending of pendingReplies) {
+      const comparable = normalizeReplyText(pending.message);
+      if (outgoingTexts.has(comparable)) {
+        continue;
+      }
+      outgoingTexts.add(comparable);
+      additions.push({
+        messageId: pending.messageId,
+        message: pending.message,
+        sender: pending.sender,
+        direction: pending.direction,
+      });
+    }
+    if (additions.length === 0) {
+      return [...context];
+    }
+
+    let insertionIndex = context.length;
+    for (let index = context.length - 1; index >= 0; index -= 1) {
+      if (isUsableIncomingMessage(context[index])) {
+        insertionIndex = index;
+        break;
+      }
+    }
+    return [
+      ...context.slice(0, insertionIndex),
+      ...additions,
+      ...context.slice(insertionIndex),
+    ];
+  };
+
+  const buildGenerationMessages = (
+    packet: ScheduledPacket,
+    fallbackMessages: readonly PacketBuilderMessage[],
+  ): PacketBuilderMessage[] => {
+    prunePendingOutgoingReplies();
+    const isRngPacket = activePacketContext?.type === 'rng' ||
+      packet.packetId === rngPacketInFlightId;
+    const triggerId = latestIncomingMessageId(fallbackMessages);
+    const storedMessages = contextStore.getRecent(contextStore.getState().maxMessages);
+    const triggerIndex = triggerId === null
+      ? -1
+      : storedMessages.findIndex(message => message.messageId === triggerId);
+    const pendingBeforeTrigger = pendingOutgoingReplies.filter(pending => {
+      if (triggerIndex === -1 || pending.afterMessageId === null) {
+        return true;
+      }
+      const afterIndex = storedMessages.findIndex(
+        message => message.messageId === pending.afterMessageId,
+      );
+      return afterIndex === -1 || afterIndex < triggerIndex;
+    });
+
+    if (triggerIndex === -1) {
+      return mergePendingOutgoingReplies(
+        fallbackMessages as ContextMessage[],
+        pendingBeforeTrigger,
+      ) as PacketBuilderMessage[];
+    }
+
+    const messagesUpToTrigger = storedMessages.slice(0, triggerIndex + 1);
+    const windowSize = isRngPacket
+      ? RNG_CONTEXT_MESSAGE_LIMIT
+      : PACKET_CONTEXT_MESSAGE_LIMIT + 1;
+    const windowMessages = messagesUpToTrigger.slice(-windowSize);
+    const windowIds = new Set(windowMessages.map(message => message.messageId));
+    const merged = mergePendingOutgoingReplies(windowMessages, pendingBeforeTrigger);
+    const mergedIds = new Set(merged.map(message => message.messageId));
+    const mergedOutgoingTexts = new Set(
+      merged
+        .filter(message => isBotAuthoredMessage(message))
+        .map(message => normalizeReplyText(message.message)),
+    );
+
+    for (let index = messagesUpToTrigger.length - 1; index >= 0; index -= 1) {
+      const message = messagesUpToTrigger[index];
+      if (!isBotAuthoredMessage(message) || windowIds.has(message.messageId)) {
+        continue;
+      }
+      if (mergedIds.has(message.messageId) ||
+          mergedOutgoingTexts.has(normalizeReplyText(message.message))) {
+        break;
+      }
+      merged.unshift(message);
+      break;
+    }
+    return merged as PacketBuilderMessage[];
+  };
 
   const newestParticipantMessageId = (): string | null => {
     const recentMessages = contextStore.getRecent(CONTEXT_STORE_CAPACITY);
@@ -1057,6 +1233,7 @@ export async function startCombustion({
             }
           }
         }
+        reconcilePendingOutgoingReplies(newMessages);
 
         const newMessagesWithMentions = newMessages.map(message => ({
           ...message,
@@ -1239,6 +1416,7 @@ export async function startCombustion({
     packetBuilderState.nextPacketNumber = nextPacketNumber;
     contextStore.clear();
     answeredIncomingMessageIds.clear();
+    pendingOutgoingReplies.length = 0;
     seenMessageIds.clear();
     for (const message of baseline) {
       if (message.messageId) {
@@ -1292,6 +1470,7 @@ export async function startCombustion({
     for (const messageId of snapshot.answeredIncomingMessageIds) {
       answeredIncomingMessageIds.add(messageId);
     }
+    pendingOutgoingReplies.length = 0;
     detectedAtByMessageId.clear();
     for (const [messageId, detectedAt] of snapshot.detectedAtByMessageId) {
       detectedAtByMessageId.set(messageId, detectedAt);
@@ -1559,8 +1738,12 @@ export async function startCombustion({
     >({
       page,
       apiKey,
-      generateReply: async (requestApiKey, messages) => {
+      generateReply: async (requestApiKey, packetMessages, packet) => {
         const startedAt = performance.now();
+        const messages = buildGenerationMessages(
+          packet as ScheduledPacket,
+          packetMessages,
+        );
         const latestIncoming = findLatestIncomingMessage(messages);
         const participantNames = collectParticipantNames({
           messages,
@@ -1648,7 +1831,11 @@ export async function startCombustion({
       composeReply: async (packetPage, reply, options) => {
         const startedAt = performance.now();
         try {
-          return await composeMessengerReply(packetPage, reply, options);
+          const composition = await composeMessengerReply(packetPage, reply, options);
+          if (composition.status === 'sent') {
+            recordPendingOutgoingReply(reply);
+          }
+          return composition;
         } finally {
           if (activePacketTiming) {
             activePacketTiming.composeMs = performance.now() - startedAt;

@@ -21,10 +21,19 @@ export interface IdentifiableMessage {
   message: string;
   sender?: unknown;
   direction?: unknown;
+  timestamp?: unknown;
 }
 
 function normalizedField(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function normalizedTimestamp(value: unknown): string {
+  if (!value || typeof value !== 'object') {
+    return '';
+  }
+  const timestamp = value as Record<string, unknown>;
+  return normalizedField(timestamp.normalized) || normalizedField(timestamp.original);
 }
 
 export function isSameLogicalMessage(
@@ -55,6 +64,11 @@ export function isSameLogicalMessage(
     return false;
   }
   if (normalizedField(left.sender) !== normalizedField(right.sender)) {
+    return false;
+  }
+  const leftTimestamp = normalizedTimestamp(left.timestamp);
+  const rightTimestamp = normalizedTimestamp(right.timestamp);
+  if (leftTimestamp && rightTimestamp && leftTimestamp !== rightTimestamp) {
     return false;
   }
   const leftNamespace = getMessageIdNamespace(left.messageId);
@@ -104,7 +118,11 @@ export function createMessageIdentityTracker({
   }
 
   const aliases = new Map<string, string>();
+  const canonicalAliasCounts = new Map<string, number>();
   const recentCanonical: IdentifiableMessage[] = [];
+
+  const canonicalHasAlias = (messageId: string): boolean =>
+    (canonicalAliasCounts.get(messageId) ?? 0) > 0;
 
   const resolve = (messageId: string): string => {
     let current = messageId;
@@ -121,12 +139,25 @@ export function createMessageIdentityTracker({
       return;
     }
     aliases.set(observedMessageId, canonicalMessageId);
+    canonicalAliasCounts.set(
+      canonicalMessageId,
+      (canonicalAliasCounts.get(canonicalMessageId) ?? 0) + 1,
+    );
     while (aliases.size > maxAliases) {
       const oldestObservedId = aliases.keys().next().value;
       if (oldestObservedId === undefined) {
         break;
       }
+      const evictedCanonicalId = aliases.get(oldestObservedId);
       aliases.delete(oldestObservedId);
+      if (evictedCanonicalId !== undefined) {
+        const remaining = (canonicalAliasCounts.get(evictedCanonicalId) ?? 1) - 1;
+        if (remaining > 0) {
+          canonicalAliasCounts.set(evictedCanonicalId, remaining);
+        } else {
+          canonicalAliasCounts.delete(evictedCanonicalId);
+        }
+      }
     }
   };
 
@@ -149,7 +180,8 @@ export function createMessageIdentityTracker({
   ): IdentifiableMessage | null => {
     for (let index = recentCanonical.length - 1; index >= 0; index -= 1) {
       const candidate = recentCanonical[index];
-      if (renderedCanonicalIds.has(candidate.messageId)) {
+      if (renderedCanonicalIds.has(candidate.messageId) ||
+          canonicalHasAlias(candidate.messageId)) {
         continue;
       }
       if (isSameLogicalMessage(candidate, message)) {
@@ -176,7 +208,6 @@ export function createMessageIdentityTracker({
           )
           .map(message => resolve(message.messageId)),
       );
-      let previous: IdentifiableMessage | null = null;
 
       for (const message of messages) {
         if (!message || typeof message !== 'object' ||
@@ -188,10 +219,17 @@ export function createMessageIdentityTracker({
         const knownCanonicalId = resolve(observedMessageId);
         let canonicalMessageId = knownCanonicalId;
 
-        if (canonicalMessageId === observedMessageId &&
-            previous !== null &&
-            isSameLogicalMessage(previous, message)) {
-          canonicalMessageId = previous.messageId;
+        if (canonicalMessageId === observedMessageId) {
+          for (let index = reconciled.length - 1; index >= 0; index -= 1) {
+            const candidate = reconciled[index];
+            if (canonicalHasAlias(candidate.messageId)) {
+              continue;
+            }
+            if (isSameLogicalMessage(candidate, message)) {
+              canonicalMessageId = candidate.messageId;
+              break;
+            }
+          }
         }
 
         if (canonicalMessageId === observedMessageId) {
@@ -228,13 +266,13 @@ export function createMessageIdentityTracker({
           : { ...message, messageId: canonicalMessageId };
         reconciled.push(trackedMessage);
         rememberRecent(trackedMessage);
-        previous = trackedMessage;
       }
 
       return { messages: reconciled, duplicates };
     },
     clear() {
       aliases.clear();
+      canonicalAliasCounts.clear();
       recentCanonical.length = 0;
     },
   };

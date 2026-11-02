@@ -148,23 +148,27 @@ test('packet builder holds a mention turn until the next poll', () => {
   assert.deepEqual(secondTurn.packet?.contextMessages.map(message => message.messageId), ['context-1']);
 });
 
-test('packet builder applies the context limit after deduplicating history', () => {
-  const history = Array.from({ length: 8 }, (_, index) => ({
+test('packet builder applies the twenty-message context limit after deduplicating history', () => {
+  const history = Array.from({ length: 30 }, (_, index) => ({
     messageId: `context-${index + 1}`,
     message: `context message ${index + 1}`,
   }));
+  const renderedOnly = { messageId: 'rendered-only', message: 'Only in the rendered window' };
   const result = buildPacketTurn({
     newMessages: [{
       messageId: 'in-1', message: '@Bot still on?', mention: true, direction: 'INCOMING',
     }],
-    recentContext: [...history, ...history.slice(-3)],
-    contextLimit: 5,
+    recentContext: [...history, ...history.slice(-6), renderedOnly],
+    contextLimit: 20,
   });
 
   assert.deepEqual(
     result.pendingPacket?.contextMessages.map(message => message.messageId),
-    ['context-4', 'context-5', 'context-6', 'context-7', 'context-8'],
-    'the newest five distinct messages survive a rendered/store overlap',
+    [
+      ...history.slice(-19).map(message => message.messageId),
+      'rendered-only',
+    ],
+    'the newest twenty distinct messages survive a rendered/store merge',
   );
   assert.deepEqual(
     result.pendingPacket?.newMessages.map(message => message.messageId),
@@ -287,6 +291,59 @@ test('message extraction preserves the parsed sender and message body', () => {
     message: 'hello',
     sender: 'Alex Smith',
     direction: 'INCOMING',
+  });
+});
+
+test('message extraction attributes outgoing presentation when the label is unusable', () => {
+  assert.deepEqual(extractMessageDetails({
+    messageId: 'outgoing-fallback',
+    ariaLabel: null,
+    textWithoutSenderHeading: "You sent Gg it's borken Seen",
+  }), {
+    messageId: 'outgoing-fallback',
+    message: "Gg it's borken",
+    sender: 'You',
+    direction: 'OUTGOING',
+  });
+  assert.deepEqual(extractMessageDetails({
+    messageId: 'outgoing-unrecognized-label',
+    ariaLabel: 'unrecognized label',
+    textWithoutSenderHeading: 'You: hello there',
+  }), {
+    messageId: 'outgoing-unrecognized-label',
+    message: 'hello there',
+    sender: 'You',
+    direction: 'OUTGOING',
+  });
+  assert.deepEqual(extractMessageDetails({
+    messageId: 'incoming-with-sender',
+    ariaLabel: 'At 1:15 PM, Alex: You sent me a file',
+    textWithoutSenderHeading: 'You sent me a file',
+  }), {
+    messageId: 'incoming-with-sender',
+    message: 'You sent me a file',
+    sender: 'Alex',
+    direction: 'INCOMING',
+  });
+  assert.deepEqual(extractMessageDetails({
+    messageId: 'outgoing-without-label',
+    ariaLabel: null,
+    textWithoutSenderHeading: 'You sent me a file',
+  }), {
+    messageId: 'outgoing-without-label',
+    message: 'me a file',
+    sender: 'You',
+    direction: 'OUTGOING',
+  });
+  assert.deepEqual(extractMessageDetails({
+    messageId: 'unknown-no-presentation',
+    ariaLabel: null,
+    textWithoutSenderHeading: 'me a file',
+  }), {
+    messageId: 'unknown-no-presentation',
+    message: 'me a file',
+    sender: 'UNKNOWN',
+    direction: 'UNKNOWN',
   });
 });
 
@@ -1124,15 +1181,13 @@ test('conversation policy honors explicit corrections without treating jokes as 
   assert.doesNotMatch(getDefaultPersonalityInstruction(), /explicit corrections and preferences/);
 });
 
-test('output guidance keeps emojis available but rare', () => {
+test('output guidance forbids emojis entirely', () => {
   const output = getOutputGuidanceInstruction();
 
-  assert.match(output, /Most replies should contain no emoji/);
-  assert.match(output, /roughly one reply in ten/);
-  assert.match(output, /Never stack or chain emojis/);
-  assert.match(output, /never add an emoji to decorate/);
-  assert.doesNotMatch(output, /(?:do not|never) (?:use|add) emojis?/i);
-  assert.doesNotMatch(getDefaultPersonalityInstruction(), /Most replies should contain no emoji/);
+  assert.match(output, /Never use emojis, emoticons, pictographs, flags, or decorative symbols/);
+  assert.match(output, /Express tone and personality with words and punctuation instead/);
+  assert.doesNotMatch(output, /roughly one reply in ten/);
+  assert.doesNotMatch(getDefaultPersonalityInstruction(), /Never use emojis/);
 });
 
 test('natural writing guidance bans em dashes and leaves voice to the personality', () => {
@@ -1182,15 +1237,15 @@ test('configured personality stays the primary voice in the assembled instructio
   assert.doesNotMatch(behavioral, /tsundere/i);
 });
 
-test('RNG packet keeps only the latest fifteen messages in their existing order', () => {
-  const recentMessages = Array.from({ length: 20 }, (_, index) => ({
+test('RNG packet keeps only the latest twenty-five messages in their existing order', () => {
+  const recentMessages = Array.from({ length: 30 }, (_, index) => ({
     messageId: `m-${index + 1}`,
     message: `Message ${index + 1}`,
     sender: 'Alex',
   }));
   const packet = buildRngPacket(recentMessages);
 
-  assert.deepEqual(packet.contextMessages, recentMessages.slice(-15));
+  assert.deepEqual(packet.contextMessages, recentMessages.slice(-25));
   assert.deepEqual(packet.newMessages, []);
 });
 
@@ -1905,7 +1960,19 @@ test('mention matcher honours multiword configured identities and existing alias
   assert.equal(matcher('pleasegetoutdaily are you there'), true);
   assert.equal(matcher('@PleaseGetout_Daily explain'), true);
   assert.equal(matcher('@PleaseGetoutDailyX explain'), false);
-  assert.equal(matcher('PleaseGetout Dailybreak is not the name'), false);
+  assert.equal(matcher('PleaseGetoutDailybreak is not the name'), false);
+});
+
+test('mention matcher recognizes the configured short name without a separate alias', () => {
+  const matcher = createMentionMatcher({
+    name: 'Yukinon Yukinoshita',
+    aliases: ['@Yukinon Yukinoshita'],
+  });
+
+  assert.equal(matcher('Yukinon, what do you think?'), true);
+  assert.equal(matcher('@Yukinon hello'), true);
+  assert.equal(matcher('Yukinon Yukinoshita, what do you think?'), true);
+  assert.equal(matcher('Yukinoshita hello'), false);
 });
 
 test('mention matcher follows the configured identity and never matches without one', () => {

@@ -180,7 +180,7 @@ test('a failing retry propagates as a generation error without suppressing the c
 test('the shared identity instruction forbids restating the incoming message', () => {
   const identity = getBotIdentityInstruction({ name: 'Anselmo', aliases: ['@Anselmo'] });
 
-  assert.match(identity, /Reply to the latest incoming message as a new conversational turn/);
+  assert.match(identity, /Respond to the latest incoming message in light of the conversation so far/);
   assert.match(identity, /Do not copy, quote, or restate that message as your response/);
   assert.match(identity, /do not continue it as if finishing the sender's line/);
   assert.match(identity, /never write a line as another participant/);

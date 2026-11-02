@@ -22,6 +22,7 @@ interface RenderedMessage {
   messageId: string | null;
   ariaLabel: string | null;
   message: string;
+  textWithoutSenderHeading?: string;
 }
 
 export interface BackreadMessage {
@@ -96,6 +97,7 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
         element.ariaLabel,
         element.textWithoutSenderHeading,
       ),
+      textWithoutSenderHeading: element.textWithoutSenderHeading,
     }));
   };
 
@@ -106,11 +108,15 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
       (message): message is RenderedMessage & { messageId: string } => message.messageId !== null,
     );
     const reconciled = messageIdentity.reconcile(identifiedMessages.map(message => {
-      const classification = classifyMessageLabel(message.ariaLabel);
+      const classification = classifyMessageLabel(
+        message.ariaLabel,
+        message.textWithoutSenderHeading,
+      );
       return {
         ...message,
         sender: classification.sender,
         direction: classification.direction,
+        timestamp: classification.timestamp,
       };
     }));
     for (const duplicate of reconciled.duplicates) {
@@ -304,7 +310,10 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
 
   diagnostics.push(...duplicateDiagnostics);
   const messages = collectedMessages.map(message => {
-    const classification = classifyMessageLabel(message.ariaLabel);
+    const classification = classifyMessageLabel(
+      message.ariaLabel,
+      message.textWithoutSenderHeading,
+    );
     return {
       id: message.messageId!,
       timestamp: classification.timestamp,
