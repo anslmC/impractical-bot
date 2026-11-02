@@ -10,9 +10,13 @@ export interface RngPacket {
   packetId: string;
   contextMessages: RngPacketMessage[];
   newMessages: never[];
+  triggerMessageId?: string;
 }
 
-export function buildRngPacket(recentMessages: RngPacketMessage[]): RngPacket {
+export function buildRngPacket(
+  recentMessages: RngPacketMessage[],
+  triggerMessageId?: string,
+): RngPacket {
   if (!Array.isArray(recentMessages)) {
     throw new TypeError('recentMessages must be an array.');
   }
@@ -27,10 +31,17 @@ export function buildRngPacket(recentMessages: RngPacketMessage[]): RngPacket {
   });
   const packetId = `rng-packet-${String(nextPacketNumber).padStart(3, '0')}`;
   nextPacketNumber += 1;
+  const resolvedTriggerId = triggerMessageId ??
+    [...contextMessages].reverse().find(message =>
+      message.direction === 'INCOMING' &&
+      typeof message.messageId === 'string' &&
+      message.messageId !== ''
+    )?.messageId;
 
   return {
     packetId,
     contextMessages,
     newMessages: [],
+    ...(resolvedTriggerId === undefined ? {} : { triggerMessageId: resolvedTriggerId }),
   };
 }

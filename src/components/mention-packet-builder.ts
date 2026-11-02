@@ -13,6 +13,7 @@ export interface PacketBuilderPacket {
   newMessages: PacketBuilderMessage[];
   mentionMessages: PacketBuilderMessage[];
   contextMessages: PacketBuilderMessage[];
+  triggerMessageId?: string;
 }
 
 export interface PacketBuilderState {
@@ -182,6 +183,7 @@ export function buildPacketTurn({
       contextMessages: [...contextById.values()]
         .slice(contextLimit === undefined ? 0 : -contextLimit)
         .map(message => ({ ...message })),
+      triggerMessageId: uniqueNewMessages.find(isMentionTrigger)?.messageId,
     };
     nextPacketNumber += 1;
   }

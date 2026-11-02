@@ -32,7 +32,9 @@ test('identity awareness distinguishes message authors from intended recipients'
   assert.match(instruction, /identifies the author, not the intended recipient/);
   assert.match(instruction, /addressed to you, to another participant/);
   assert.match(instruction, /You do not need an invitation/);
-  assert.match(instruction, /may still respond naturally/);
+  assert.match(instruction, /may relay it naturally/);
+  assert.match(instruction, /do not answer as that participant or on their behalf/);
+  assert.match(instruction, /may still join as yourself/);
   assert.match(instruction, /Keep every participant distinct from yourself/);
 });
 

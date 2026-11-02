@@ -1,3 +1,5 @@
+import { extractConversationMessageBody } from './conversation-context.js';
+
 export interface ExtractedTimestamp {
   original: string | null;
   normalized: string | null;
@@ -253,7 +255,9 @@ export function extractMessageDetails({
   );
   return {
     messageId,
-    message: extractMessageContent(ariaLabel, textWithoutSenderHeading),
+    message: extractConversationMessageBody(
+      extractMessageContent(ariaLabel, textWithoutSenderHeading),
+    ).text,
     sender,
     direction,
   };

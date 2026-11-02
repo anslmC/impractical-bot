@@ -119,6 +119,35 @@ export function stripSelfIdentifyingPrefix(
   return reply;
 }
 
+const FILLER_QUESTION =
+  /^(?:so\s+|and\s+|but\s+)?(?:what(?:'s| is) (?:up|good(?: lately)?|new)|what about you|how about you|how(?:'s| is) your day(?: going)?|anything new(?: going on)?(?:,? or just checking in)?|anything else|just checking in|what(?:'s| is) on your mind|anything exciting happen(?:ing)?|what are you up to|how are you(?: doing)?|what have you been up to)\??$/iu;
+const FILLER_QUESTION_SOURCE =
+  "(?:so\\s+|and\\s+|but\\s+)?(?:what(?:'s| is) (?:up|good(?: lately)?|new)|what about you|how about you|how(?:'s| is) your day(?: going)?|anything new(?: going on)?(?:,? or just checking in)?|anything else|just checking in|what(?:'s| is) on your mind|anything exciting happen(?:ing)?|what are you up to|how are you(?: doing)?|what have you been up to)";
+
+export function stripGenericTrailingQuestions(reply: string): string {
+  const trimmedReply = reply.trim();
+  if (!trimmedReply) {
+    return reply;
+  }
+
+  const segments = trimmedReply.split(/(?<=[.!?])\s+/u);
+  const lastSegment = segments.at(-1) ?? '';
+  const withoutTerminalPunctuation = lastSegment.replace(/[.!?]+$/u, '').trim();
+  if (FILLER_QUESTION.test(withoutTerminalPunctuation) && segments.length > 1) {
+    return segments.slice(0, -1).join(' ').trimEnd();
+  }
+
+  const commaFiller = new RegExp(
+    '^(.*?)[,;]\\s*' + FILLER_QUESTION_SOURCE + '[.!?]*\\s*$',
+    'iu',
+  );
+  const match = commaFiller.exec(trimmedReply);
+  if (match && match[1].trim()) {
+    return match[1].trimEnd();
+  }
+  return reply;
+}
+
 export function stripParticipantSpeakerLabel(
   reply: string,
   participantNames: readonly string[],

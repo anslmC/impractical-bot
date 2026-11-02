@@ -17,6 +17,7 @@ import {
   ENGLISH_ONLY_INSTRUCTION,
   ENGLISH_ONLY_RETRY_INSTRUCTION,
 } from '../src/components/english-only.js';
+import { CONVERSATION_METADATA_RETRY_INSTRUCTION } from '../src/components/conversation-context.js';
 import { EMOJI_RETRY_INSTRUCTION } from '../src/components/emoji.js';
 import { IDENTITY_RETRY_INSTRUCTION } from '../src/components/identity-policy.js';
 import { IDENTITY_AWARENESS_INSTRUCTION_MARKER } from '../src/components/identity-awareness.js';
@@ -71,6 +72,44 @@ function messengerMessage(
     message,
     ariaLabel: null,
   };
+}
+
+function serializedMessage(
+  id: string,
+  sender: string,
+  direction: 'INCOMING' | 'OUTGOING' | 'UNKNOWN',
+  message: string,
+  options: {
+    participant?: string;
+    trigger?: boolean;
+    time?: string;
+    addressedTo?: string;
+  } = {},
+): string {
+  if (direction === 'OUTGOING') {
+    return message.trim();
+  }
+  const participant = options.participant ?? (
+    sender === 'UNKNOWN'
+      ? 'unknown'
+      : sender === 'You'
+        ? 'TestBot'
+        : sender
+  );
+  const fields = [
+    `id=${JSON.stringify(id)}`,
+    `time=${JSON.stringify(options.time ?? 'unknown')}`,
+    `sender=${JSON.stringify(sender)}`,
+    `participant=${JSON.stringify(participant)}`,
+    `direction=${direction}`,
+  ];
+  if (options.addressedTo) {
+    fields.push(`addressed_to=${JSON.stringify(options.addressedTo)}`);
+  }
+  if (options.trigger) {
+    fields.push('trigger=true');
+  }
+  return `[MESSAGE ${fields.join(' ')}]\n${message.trim()}`;
 }
 
 test('NVIDIA environment path is beside an explicitly selected configuration', () => {
@@ -212,10 +251,127 @@ test('reply generation sends known-direction messages in order and extracts trim
     /Other identified participants in this conversation: Alex, Blair\./,
   );
   assert.deepEqual(body.messages.slice(1), [
-    { role: 'user', content: '[from Alex] Are you free tomorrow?' },
-    { role: 'assistant', content: 'I think so.' },
-    { role: 'user', content: '[from Blair] Great, what time works?' },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'incoming-1',
+        'Alex',
+        'INCOMING',
+        'Are you free tomorrow?',
+      ),
+    },
+    {
+      role: 'assistant',
+      content: serializedMessage(
+        'outgoing-1',
+        'You',
+        'OUTGOING',
+        'I think so.',
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'unknown-1',
+        'UNKNOWN',
+        'UNKNOWN',
+        'Do not include this.',
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'incoming-2',
+        'Blair',
+        'INCOMING',
+        'Great, what time works?',
+        { trigger: true },
+      ),
+    },
   ]);
+  assert.match(body.messages[0].content, /CURRENT TRIGGER/);
+  assert.match(body.messages[0].content, /MESSAGE ID: incoming-2/);
+  assert.match(body.messages[0].content, /DIRECTION: INCOMING/);
+  assert.doesNotMatch(body.messages[0].content, /HISTORY POSITION: outside/);
+});
+
+test('a trigger outside the transcript is described without being duplicated', async () => {
+  let body: { messages: { role: string; content: string }[] } | undefined;
+  const trigger = messengerMessage(
+    'trigger-old',
+    'Alex',
+    'INCOMING',
+    'the original request',
+  );
+
+  await generateTestReply('nvapi-test-key', [
+    messengerMessage('later-1', 'Blair', 'INCOMING', 'a later message'),
+    messengerMessage('later-2', 'Casey', 'INCOMING', 'the newest message'),
+  ], {
+    trigger,
+    fetch: async (_input, init) => {
+      body = JSON.parse(String(init?.body)) as typeof body;
+      return successfulCompletion('Here.');
+    },
+  });
+
+  assert.match(body?.messages[0].content ?? '', /MESSAGE ID: trigger-old/);
+  assert.match(body?.messages[0].content ?? '', /HISTORY POSITION: outside/);
+  assert.match(body?.messages[0].content ?? '', /the original request/);
+  assert.deepEqual(body?.messages.slice(1), [
+    {
+      role: 'user',
+      content: serializedMessage(
+        'later-1',
+        'Blair',
+        'INCOMING',
+        'a later message',
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'later-2',
+        'Casey',
+        'INCOMING',
+        'the newest message',
+      ),
+    },
+  ]);
+  assert.equal(
+    body?.messages.filter(message => message.content.includes('the original request')).length,
+    1,
+    'the outside trigger appears only in the trigger instruction',
+  );
+});
+
+test('generation labels duplicate roster participants as ambiguous', async () => {
+  let body: { messages: { role: string; content: string }[] } | undefined;
+  const roster: GroupRoster = {
+    status: 'partial',
+    members: [
+      { firstName: 'TestBot', isPuppet: true },
+      { firstName: 'Sam', isPuppet: false },
+      { firstName: 'Sam', isPuppet: false },
+    ],
+    puppet: { firstName: 'TestBot', isPuppet: true },
+    duplicateFirstNames: ['Sam'],
+  };
+
+  await generateTestReply('nvapi-test-key', [
+    messengerMessage('sam-1', 'Sam', 'INCOMING', 'Hello.'),
+  ], {
+    roster,
+    fetch: async (_input, init) => {
+      body = JSON.parse(String(init?.body)) as typeof body;
+      return successfulCompletion('Hi.');
+    },
+  });
+
+  assert.match(
+    body?.messages[1].content ?? '',
+    /participant="ambiguous: Sam"/,
+  );
 });
 
 test('reply generation uses a supplied system instruction before conversation messages', async () => {
@@ -245,7 +401,16 @@ test('reply generation uses a supplied system instruction before conversation me
     /Other identified participants in this conversation: Alex\./,
   );
   assert.deepEqual(body.messages.slice(1), [
-    { role: 'user', content: '[from Alex] Hello.' },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'incoming-1',
+        'Alex',
+        'INCOMING',
+        'Hello.',
+        { trigger: true },
+      ),
+    },
   ]);
 });
 
@@ -315,12 +480,34 @@ test('a non-English reply is retried without dropping multilingual context', asy
   assert.equal(call, 2, 'the rejected reply is retried exactly once');
   assert.equal(reply, 'I hear you. What are you actually asking?');
   assert.deepEqual(bodies[0].messages.slice(1), [
-    { role: 'user', content: '[from Alex] dont speak atagalog' },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'incoming-1',
+        'Alex',
+        'INCOMING',
+        'dont speak atagalog',
+      ),
+    },
     {
       role: 'assistant',
-      content: 'Okay lang naman yan. :p Ang sagot ko ay nakapag-alam ka naman...',
+      content: serializedMessage(
+        'outgoing-1',
+        'You',
+        'OUTGOING',
+        'Okay lang naman yan. :p Ang sagot ko ay nakapag-alam ka naman...',
+      ),
     },
-    { role: 'user', content: '[from Blair] Ano ba yan, nakakaloka ka?' },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'incoming-2',
+        'Blair',
+        'INCOMING',
+        'Ano ba yan, nakakaloka ka?',
+        { trigger: true },
+      ),
+    },
   ]);
   assert.deepEqual(bodies[1].messages.slice(1), bodies[0].messages.slice(1));
   assert.match(bodies[1].messages[0].content, /previous proposed reply was rejected/);
@@ -401,6 +588,63 @@ test('a persistently emoji reply is suppressed instead of sent', async () => {
     /repeatedly returned a reply containing an emoji/,
   );
   assert.equal(call, 2, 'there is no unbounded emoji retry loop');
+});
+
+test('a metadata-wrapped reply is retried once and replaced with plain text', async () => {
+  const metadataReply =
+    '[MESSAGE id="outgoing-1" time="unknown" sender="You" participant="TestBot" ' +
+    'direction=OUTGOING]\nI am fine.';
+  const bodies: { messages: { role: string; content: string }[] }[] = [];
+  let call = 0;
+
+  const reply = await generateTestReply('nvapi-test-key', [{
+    id: 'incoming-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Alex',
+    direction: 'INCOMING',
+    message: 'how are you?',
+    ariaLabel: null,
+  }], {
+    fetch: async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as typeof bodies[number]);
+      call += 1;
+      return call === 1
+        ? successfulCompletion(metadataReply)
+        : successfulCompletion('I am fine.');
+    },
+  });
+
+  assert.equal(call, 2, 'the metadata-wrapped reply is retried exactly once');
+  assert.equal(reply, 'I am fine.');
+  assert.ok(bodies[1].messages[0].content.endsWith(
+    CONVERSATION_METADATA_RETRY_INSTRUCTION,
+  ));
+  assert.match(CONVERSATION_METADATA_RETRY_INSTRUCTION, /Do not use emojis/);
+});
+
+test('a persistently metadata-wrapped reply is withheld instead of sent', async () => {
+  const metadataReply =
+    '[MESSAGE id="outgoing-1" time="unknown" sender="You" participant="TestBot" ' +
+    'direction=OUTGOING]\nI am fine.';
+  let call = 0;
+
+  await assert.rejects(
+    generateTestReply('nvapi-test-key', [{
+      id: 'incoming-1',
+      timestamp: { original: null, normalized: null, resolved: false },
+      sender: 'Alex',
+      direction: 'INCOMING',
+      message: 'how are you?',
+      ariaLabel: null,
+    }], {
+      fetch: async () => {
+        call += 1;
+        return successfulCompletion(metadataReply);
+      },
+    }),
+    /repeatedly returned a reply containing conversation metadata/,
+  );
+  assert.equal(call, 2, 'there is no unbounded metadata retry loop');
 });
 
 test('an invalid identity is retried once with the identity correction', async () => {
@@ -600,11 +844,52 @@ test('reply generation keeps one API turn per Messenger message and ends with th
 
   const body = JSON.parse(String(requestedOptions?.body));
   assert.deepEqual(body.messages.slice(1), [
-    { role: 'user', content: '[from Alex] First incoming.' },
-    { role: 'user', content: '[from Blair] Second incoming.' },
-    { role: 'assistant', content: 'First outgoing.' },
-    { role: 'assistant', content: 'Second outgoing.' },
-    { role: 'user', content: '[from Casey] Latest incoming.' },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'incoming-1',
+        'Alex',
+        'INCOMING',
+        'First incoming.',
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'incoming-2',
+        'Blair',
+        'INCOMING',
+        'Second incoming.',
+      ),
+    },
+    {
+      role: 'assistant',
+      content: serializedMessage(
+        'outgoing-1',
+        'You',
+        'OUTGOING',
+        'First outgoing.',
+      ),
+    },
+    {
+      role: 'assistant',
+      content: serializedMessage(
+        'outgoing-2',
+        'You',
+        'OUTGOING',
+        'Second outgoing.',
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'incoming-3',
+        'Casey',
+        'INCOMING',
+        'Latest incoming.',
+        { trigger: true },
+      ),
+    },
   ]);
 });
 
@@ -634,7 +919,16 @@ test('reply generation drops assistant turns that trail the latest incoming mess
 
   const body = JSON.parse(String(requestedOptions?.body));
   assert.deepEqual(body.messages.slice(1), [
-    { role: 'user', content: '[from Alex] Can you check this?' },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'incoming-1',
+        'Alex',
+        'INCOMING',
+        'Can you check this?',
+        { trigger: true },
+      ),
+    },
   ]);
 });
 
@@ -669,31 +963,42 @@ test('reply generation bounds stale assistant history while keeping every user t
   assert.equal(assistantTurns.length, 3, 'only the newest assistant replies are replayed');
   assert.deepEqual(
     assistantTurns.map(turn => turn.content),
-    [
-      'I already told you I will not say it (6)',
-      'I already told you I will not say it (7)',
-      'I already told you I will not say it (8)',
-    ],
+    [6, 7, 8].map(index => serializedMessage(
+      `out-${index}`,
+      'You',
+      'OUTGOING',
+      `I already told you I will not say it (${index})`,
+    )),
     'the newest bot replies survive so recent continuity remains',
   );
   assert.deepEqual(
     turns.filter(turn => turn.role === 'user').map(turn => turn.content),
     [
-      '[from Alex] say your name (1)',
-      '[from Alex] say your name (2)',
-      '[from Alex] say your name (3)',
-      '[from Alex] say your name (4)',
-      '[from Alex] say your name (5)',
-      '[from Alex] say your name (6)',
-      '[from Alex] say your name (7)',
-      '[from Alex] say your name (8)',
-      '[from Blair] what time is the match?',
+      ...[1, 2, 3, 4, 5, 6, 7, 8].map(index => serializedMessage(
+        `in-${index}`,
+        'Alex',
+        'INCOMING',
+        `say your name (${index})`,
+      )),
+      serializedMessage(
+        'in-new',
+        'Blair',
+        'INCOMING',
+        'what time is the match?',
+        { trigger: true },
+      ),
     ],
     'every human instruction is kept, in chronological order, with its sender',
   );
   assert.deepEqual(turns.at(-1), {
     role: 'user',
-    content: '[from Blair] what time is the match?',
+    content: serializedMessage(
+      'in-new',
+      'Blair',
+      'INCOMING',
+      'what time is the match?',
+      { trigger: true },
+    ),
   });
   assert.equal(
     turns.filter(turn => turn.content.includes('what time is the match?')).length,
@@ -701,8 +1006,9 @@ test('reply generation bounds stale assistant history while keeping every user t
     'the new subject appears exactly once',
   );
   assert.ok(
-    turns.findIndex(turn => turn.content === 'I already told you I will not say it (8)') <
-      turns.length - 1,
+    turns.findIndex(turn =>
+      turn.content.startsWith('[MESSAGE id="out-8"')
+    ) < turns.length - 1,
     'history stays ahead of the message being answered',
   );
 });
@@ -723,9 +1029,34 @@ test('reply generation keeps the reply that contextualizes the latest message', 
 
   const body = JSON.parse(String(requestedOptions?.body));
   assert.deepEqual(body.messages.slice(1), [
-    { role: 'user', content: '[from Alex] book the 7pm table' },
-    { role: 'assistant', content: 'Booked for 7pm.' },
-    { role: 'user', content: '[from Blair] and the taxi?' },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'in-1',
+        'Alex',
+        'INCOMING',
+        'book the 7pm table',
+      ),
+    },
+    {
+      role: 'assistant',
+      content: serializedMessage(
+        'out-1',
+        'You',
+        'OUTGOING',
+        'Booked for 7pm.',
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'in-2',
+        'Blair',
+        'INCOMING',
+        'and the taxi?',
+        { trigger: true },
+      ),
+    },
   ]);
 });
 
@@ -746,10 +1077,43 @@ test('reply generation drops a participant speaker label from assistant history'
 
   const body = JSON.parse(String(requestedOptions?.body));
   assert.deepEqual(body.messages.slice(1), [
-    { role: 'user', content: '[from Anselmo] you the grumpy one lmao' },
-    { role: 'assistant', content: 'whatever you say kid, keep dreaming' },
-    { role: 'assistant', content: 'You have no taste, Anselmo.' },
-    { role: 'user', content: '[from Anselmo] ok whatever' },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'in-1',
+        'Anselmo',
+        'INCOMING',
+        'you the grumpy one lmao',
+      ),
+    },
+    {
+      role: 'assistant',
+      content: serializedMessage(
+        'out-1',
+        'You',
+        'OUTGOING',
+        'whatever you say kid, keep dreaming',
+      ),
+    },
+    {
+      role: 'assistant',
+      content: serializedMessage(
+        'out-2',
+        'You',
+        'OUTGOING',
+        'You have no taste, Anselmo.',
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'in-2',
+        'Anselmo',
+        'INCOMING',
+        'ok whatever',
+        { trigger: true },
+      ),
+    },
   ]);
 });
 
@@ -787,15 +1151,40 @@ test('reply generation preserves the literal trigger and attributes prior bot ou
 
   const body = JSON.parse(String(requestedOptions?.body));
   assert.deepEqual(body.messages.slice(1), [
-    { role: 'user', content: '[from Alex] hey' },
-    { role: 'assistant', content: 'Hey, what is up?' },
-    { role: 'user', content: `[from Blair] ${literalRequest}` },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'incoming-1',
+        'Alex',
+        'INCOMING',
+        'hey',
+      ),
+    },
+    {
+      role: 'assistant',
+      content: serializedMessage(
+        'outgoing-1',
+        'You',
+        'OUTGOING',
+        'Hey, what is up?',
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'incoming-2',
+        'Blair',
+        'INCOMING',
+        literalRequest,
+        { trigger: true },
+      ),
+    },
   ]);
   assert.equal(
     body.messages.filter((message: { content: string }) =>
       message.content.includes(literalRequest)).length,
-    1,
-    'the literal trigger appears exactly once, unchanged',
+    2,
+    'the literal trigger appears in its message and the trigger instruction',
   );
 });
 
@@ -826,8 +1215,25 @@ test('reply generation includes every message once and never repeats the latest 
 
   const body = JSON.parse(String(requestedOptions?.body));
   assert.deepEqual(body.messages.slice(1), [
-    { role: 'user', content: '[from Alex] same text' },
-    { role: 'user', content: '[from Blair] same text' },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'incoming-1',
+        'Alex',
+        'INCOMING',
+        'same text',
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'incoming-2',
+        'Blair',
+        'INCOMING',
+        'same text',
+        { trigger: true },
+      ),
+    },
   ]);
 });
 
@@ -850,7 +1256,16 @@ test('reply generation omits the sender prefix when the sender is unknown', asyn
 
   const body = JSON.parse(String(requestedOptions?.body));
   assert.deepEqual(body.messages.slice(1), [
-    { role: 'user', content: 'no sender label' },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'incoming-1',
+        'UNKNOWN',
+        'INCOMING',
+        'no sender label',
+        { trigger: true },
+      ),
+    },
   ]);
 });
 
@@ -1137,8 +1552,25 @@ test('withheld assistant turns are reported and excluded from the transcript', a
     { messageId: 'out-1', reason: 'provider-model-identity' },
   ]);
   assert.deepEqual(body?.messages.slice(1), [
-    { role: 'user', content: '[from Alex] who are you?' },
-    { role: 'user', content: '[from Alex] say it again' },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'in-1',
+        'Alex',
+        'INCOMING',
+        'who are you?',
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'in-2',
+        'Alex',
+        'INCOMING',
+        'say it again',
+        { trigger: true },
+      ),
+    },
   ]);
 });
 
@@ -1165,16 +1597,42 @@ test('historical assistant turns keep legitimate descriptive text while false cl
   });
 
   assert.deepEqual(body?.messages.slice(1), [
-    { role: 'user', content: '[from Alex] what day is it?' },
-    { role: 'assistant', content: "It's Donut Day." },
-    { role: 'user', content: '[from Alex] okay' },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'in-1',
+        'Alex',
+        'INCOMING',
+        'what day is it?',
+      ),
+    },
+    {
+      role: 'assistant',
+      content: serializedMessage(
+        'out-1',
+        'You',
+        'OUTGOING',
+        "It's Donut Day.",
+        { participant: 'Yukinon' },
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'in-2',
+        'Alex',
+        'INCOMING',
+        'okay',
+        { trigger: true },
+      ),
+    },
   ]);
   assert.deepEqual(diagnostics, [
     { messageId: 'out-2', reason: 'provider-model-identity' },
   ]);
 });
 
-test('a message authored by the configured identity is serialized as an assistant turn', async () => {
+test('a message authored by the configured identity reaches generation as raw assistant text', async () => {
   let body: { messages: { role: string; content: string }[] } | undefined;
 
   await generateNvidiaReply('nvapi-test-key', [
@@ -1191,9 +1649,29 @@ test('a message authored by the configured identity is serialized as an assistan
   });
 
   assert.deepEqual(body?.messages.slice(1), [
-    { role: 'user', content: '[from Alex] hi' },
-    { role: 'assistant', content: 'I am here.' },
-    { role: 'user', content: '[from Alex] good' },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'in-1',
+        'Alex',
+        'INCOMING',
+        'hi',
+      ),
+    },
+    {
+      role: 'assistant',
+      content: 'I am here.',
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'in-2',
+        'Alex',
+        'INCOMING',
+        'good',
+        { trigger: true },
+      ),
+    },
   ]);
 });
 
@@ -1216,12 +1694,61 @@ test('Backread-seeded outgoing messages reach generation as assistant turns in o
   });
 
   assert.deepEqual(body?.messages.slice(1), [
-    { role: 'user', content: '[from Alex] first' },
-    { role: 'assistant', content: 'I am here.' },
-    { role: 'user', content: '[from Alex] second' },
-    { role: 'assistant', content: 'Still here.' },
-    { role: 'user', content: '[from Alex] third' },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'in-1',
+        'Alex',
+        'INCOMING',
+        'first',
+      ),
+    },
+    {
+      role: 'assistant',
+      content: serializedMessage(
+        'own-1',
+        'You',
+        'OUTGOING',
+        'I am here.',
+        { participant: 'Yukinon' },
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'in-2',
+        'Alex',
+        'INCOMING',
+        'second',
+      ),
+    },
+    {
+      role: 'assistant',
+      content: serializedMessage(
+        'own-2',
+        'You',
+        'OUTGOING',
+        'Still here.',
+        { participant: 'Yukinon' },
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'in-3',
+        'Alex',
+        'INCOMING',
+        'third',
+        { trigger: true },
+      ),
+    },
   ]);
+  assert.ok(
+    body?.messages.slice(1)
+      .filter(message => message.role === 'assistant')
+      .every(message => !message.content.startsWith('[MESSAGE ')),
+    'assistant history never contains a transcript envelope',
+  );
 });
 
 test('generation labels known senders as authors and leaves unknown senders unlabeled', async () => {
@@ -1242,12 +1769,56 @@ test('generation labels known senders as authors and leaves unknown senders unla
   });
 
   assert.deepEqual(body?.messages.slice(1), [
-    { role: 'user', content: '[from Alex] TestBot' },
-    { role: 'assistant', content: 'An earlier reply.' },
-    { role: 'user', content: '[from Alex] Hello TestBot can you hear me?' },
-    { role: 'user', content: '[from Alex] Blair can you hear me?' },
-    { role: 'user', content: '[from Alex] Can you hear me?' },
-    { role: 'user', content: 'no sender label' },
+    {
+      role: 'user',
+      content: serializedMessage('in-1', 'Alex', 'INCOMING', 'TestBot'),
+    },
+    {
+      role: 'assistant',
+      content: serializedMessage(
+        'out-1',
+        'You',
+        'OUTGOING',
+        'An earlier reply.',
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'in-2',
+        'Alex',
+        'INCOMING',
+        'Hello TestBot can you hear me?',
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'in-3',
+        'Alex',
+        'INCOMING',
+        'Blair can you hear me?',
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'in-4',
+        'Alex',
+        'INCOMING',
+        'Can you hear me?',
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'in-5',
+        'UNKNOWN',
+        'INCOMING',
+        'no sender label',
+        { trigger: true },
+      ),
+    },
   ]);
   assert.doesNotMatch(body?.messages[1].content ?? '', /Alex:/);
 });

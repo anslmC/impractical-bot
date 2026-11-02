@@ -33,6 +33,22 @@ test('a sender-prefixed restatement is detected as an echo', () => {
   );
 });
 
+test('a metadata-prefixed restatement is detected as an echo', () => {
+  const envelope =
+    '[MESSAGE id="outgoing-1" time="unknown" sender="You" participant="TestBot" ' +
+    'direction=OUTGOING]\n';
+
+  assert.equal(isEchoReply(`${envelope}dude who are you`, 'dude who are you'), true);
+  assert.equal(
+    isEchoReply(
+      `${envelope}Anselmo: dude who are you`,
+      'dude who are you',
+      { participantNames: names },
+    ),
+    true,
+  );
+});
+
 test('an emoji-suffixed restatement is detected as an echo', () => {
   assert.equal(
     isEchoReply('Anselmo: dude who are you 😳', 'dude who are you', { participantNames: names }),

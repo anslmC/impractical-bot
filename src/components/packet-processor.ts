@@ -35,6 +35,7 @@ export interface ProcessablePacket<Message = unknown> {
   packetId?: string;
   contextMessages?: Message[];
   newMessages?: Message[];
+  triggerMessageId?: string;
 }
 
 export interface ComposeReplyOptions {

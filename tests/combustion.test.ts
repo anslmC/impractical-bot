@@ -1295,6 +1295,92 @@ test('a sent reply reaches the next mention before Messenger renders it', async 
   }
 });
 
+test('a metadata-wrapped generated reply cannot persist in pending outgoing context', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  const generatedRequests: Array<readonly {
+    messageId: string;
+    message: string;
+  }[]> = [];
+  const metadataReply =
+    '[MESSAGE id="outgoing-1" time="unknown" sender="You" participant="TestBot" ' +
+    'direction=OUTGOING]\nfirst reply';
+  const generatedReplies = [metadataReply, 'second reply'];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    generatedRequests.push(messages as typeof generatedRequests[number]);
+    return generatedReplies.shift() ?? 'ok';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => ({ status: 'sent' });
+
+  const flush = async (): Promise<void> => {
+    for (let turn = 0; turn < 8; turn += 1) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+  };
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flush();
+  };
+
+  const { page, inject } = createInjectedMessengerPage();
+  const contextStore = createContextStore();
+  const aliases = generateAliases('PleaseGetout Daily').valids;
+  const controller = await startCombustion({
+    page,
+    contextStore,
+    configuration: { ...configuration, puppetName: 'PleaseGetout Daily' },
+    aliases,
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{
+      messageId: 'envelope-1',
+      sender: 'Alex',
+      message: '@PleaseGetout Daily first question',
+    }]);
+    await advancePoll();
+    await advancePoll();
+    assert.equal(generatedRequests.length, 1);
+
+    inject([{
+      messageId: 'envelope-2',
+      sender: 'Alex',
+      message: '@PleaseGetout Daily second question',
+    }]);
+    await advancePoll();
+    await advancePoll();
+    assert.equal(generatedRequests.length, 2);
+
+    const pending = generatedRequests[1].find(
+      message => message.messageId.startsWith('pending-outgoing-'),
+    );
+    assert.equal(pending?.message, 'first reply');
+    assert.equal(pending?.message.includes('[MESSAGE '), false);
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
 test('an observed sent reply replaces its pending copy without duplication', async context => {
   context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
   const originalRandom = Math.random;
@@ -4428,5 +4514,77 @@ test('a thrown roster refresh rolls back to the previous destination', async con
   } finally {
     await controller.stop();
     context.mock.timers.reset();
+  }
+});
+
+
+test('a mention reply targets the original trigger while keeping the later burst', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  const generated = [] as Array<{
+    messages: readonly { messageId: string; message: string }[];
+    targeting?: { messageId: string | null; kind: string; addressedTo: string | null };
+  }>;
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+    options,
+  ): Promise<string> => {
+    generated.push({
+      messages: messages as readonly { messageId: string; message: string }[],
+      targeting: options.targeting,
+    });
+    return 'mocked reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => ({ status: 'sent' });
+
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flushEngine();
+  };
+
+  const { page, inject } = createInjectedMessengerPage();
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration: { ...configuration, puppetName: 'Yukinon' },
+    aliases: ['@Yukinon'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'trigger-1', sender: 'Katsuyo', message: 'Yukinon, first question?' }]);
+    await advancePoll();
+
+    inject([{ messageId: 'later-1', sender: 'Blair', message: 'a later side comment' }]);
+    await advancePoll();
+    await advancePoll();
+
+    assert.equal(generated.length, 1);
+    assert.deepEqual(
+      generated[0].messages.map(message => message.messageId),
+      ['trigger-1', 'later-1'],
+    );
+    assert.equal(generated[0].targeting?.messageId, 'trigger-1');
+    assert.equal(generated[0].targeting?.kind, 'bot');
+    assert.equal(generated[0].targeting?.addressedTo, null);
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
   }
 });

@@ -13,7 +13,19 @@ import { randomUUID } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import { config as loadDotenv, parse } from 'dotenv';
 import { resolveConfigurationPaths } from '../config/configuration.js';
-import type { BackreadMessage } from '../components/backread.js';
+import {
+  CONVERSATION_METADATA_RETRY_INSTRUCTION,
+  appendCurrentTriggerInstruction,
+  extractConversationMessageBody,
+  normalizeConversationDirection,
+  normalizeConversationSender,
+  resolveConversationMessageId,
+  serializeConversationMessage,
+  targetingForTrigger,
+  type ConversationDirection,
+  type ConversationMessage,
+  type ConversationTriggerInfo,
+} from '../components/conversation-context.js';
 import {
   ENGLISH_ONLY_RETRY_INSTRUCTION,
   isEnglishOnlyReply,
@@ -37,6 +49,17 @@ import {
 } from '../components/personality.js';
 import { sanitizeGroupRoster, type GroupRoster } from '../browser/group-roster.js';
 import { appendIdentityAwarenessInstruction } from '../components/identity-awareness.js';
+import {
+  appendMessageTargetingInstruction,
+  classifyMessageTargeting,
+  type MessageTargetingContext,
+} from '../components/message-targeting.js';
+import {
+  buildParticipantAwareness,
+  findParticipantIdentity,
+  normalizeParticipantName,
+  type ParticipantAwareness,
+} from '../components/participant-awareness.js';
 import { stripParticipantSpeakerLabel } from '../components/reply-normalization.js';
 
 const NVIDIA_CHAT_COMPLETIONS_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
@@ -91,6 +114,8 @@ export interface NvidiaReplyRequestOptions extends NvidiaRequestOptions {
   systemInstruction: string;
   identity: BotIdentity;
   roster?: GroupRoster;
+  targeting?: MessageTargetingContext;
+  trigger?: ConversationMessage | null;
   onDiagnostic?: ConversationDiagnosticHandler;
 }
 
@@ -295,6 +320,21 @@ export async function validateNvidiaApiKey(
 interface ConversationTurn {
   role: 'user' | 'assistant';
   content: string;
+  messageId: string | null;
+  direction: ConversationDirection;
+  isAssistant: boolean;
+}
+
+interface PreparedConversationMessage {
+  rawIndex: number;
+  raw: ConversationMessage;
+  messageId: string | null;
+  timestamp: ConversationMessage['timestamp'];
+  sender: string;
+  direction: ConversationDirection;
+  content: string;
+  isAssistant: boolean;
+  isBotAuthored: boolean;
 }
 
 function limitAssistantHistory(
@@ -332,58 +372,6 @@ function identityComparableNames(identity: BotIdentity): Set<string> {
   );
 }
 
-function collectParticipantNames(
-  messages: readonly BackreadMessage[],
-  identity: BotIdentity,
-): string[] {
-  const ownNames = identityComparableNames(identity);
-  const participantNames: string[] = [];
-  const seen = new Set<string>();
-  for (const message of messages) {
-    if (message.direction === 'OUTGOING') {
-      continue;
-    }
-    const senderName = typeof message.sender === 'string' ? message.sender.trim() : '';
-    const comparable = normalizeIdentityValue(senderName);
-    if (!senderName || comparable === 'unknown' || comparable === 'you' ||
-        ownNames.has(comparable) || seen.has(comparable)) {
-      continue;
-    }
-    seen.add(comparable);
-    participantNames.push(senderName);
-  }
-  return participantNames;
-}
-
-function combineParticipantNames(
-  identity: BotIdentity,
-  ...nameLists: readonly (readonly string[])[]
-): string[] {
-  const ownNames = identityComparableNames(identity);
-  const seen = new Set<string>();
-  const participantNames: string[] = [];
-  for (const name of nameLists.flat()) {
-    const normalized = name.trim();
-    const comparable = normalizeIdentityValue(normalized);
-    if (!normalized || comparable === 'unknown' || comparable === 'you' ||
-        ownNames.has(comparable) || seen.has(comparable)) {
-      continue;
-    }
-    seen.add(comparable);
-    participantNames.push(normalized);
-  }
-  return participantNames;
-}
-
-function collectRosterParticipantNames(roster?: GroupRoster): string[] {
-  if (!roster || roster.status === 'unavailable' || roster.status === 'not-group') {
-    return [];
-  }
-  return roster.members
-    .filter(member => !member.isPuppet)
-    .map(member => member.firstName);
-}
-
 function createIdentityContext(
   identity: BotIdentity,
   participantNames: readonly string[],
@@ -395,32 +383,31 @@ function createIdentityContext(
   };
 }
 
-function buildConversationTurns(
-  messages: readonly BackreadMessage[],
+function prepareConversationMessages(
+  messages: readonly ConversationMessage[],
   identityContext: IdentityValidationContext,
   participantNames: readonly string[],
   onDiagnostic?: ConversationDiagnosticHandler,
-): ConversationTurn[] {
+): PreparedConversationMessage[] {
   const ownNames = identityComparableNames(identityContext);
-  const conversationMessages: ConversationTurn[] = [];
-  for (const message of messages) {
-    if (message.direction !== 'INCOMING' && message.direction !== 'OUTGOING') {
-      continue;
-    }
-    const content = message.message.trim();
+  const prepared: PreparedConversationMessage[] = [];
+  for (let rawIndex = 0; rawIndex < messages.length; rawIndex += 1) {
+    const raw = messages[rawIndex];
+    const content = raw.message.trim();
     if (!content) {
       continue;
     }
-    const senderName = typeof message.sender === 'string' ? message.sender.trim() : '';
-    const senderIsBot = senderName !== '' &&
-      senderName.toUpperCase() !== 'UNKNOWN' &&
-      ownNames.has(normalizeIdentityValue(senderName));
-    const isAssistantTurn = message.direction === 'OUTGOING' ||
-      (message.direction === 'INCOMING' && senderIsBot);
-    const turnContent = isAssistantTurn
+    const messageId = resolveConversationMessageId(raw);
+    const direction = normalizeConversationDirection(raw.direction);
+    const sender = normalizeConversationSender(raw.sender);
+    const senderIsBot = sender !== 'UNKNOWN' &&
+      ownNames.has(normalizeIdentityValue(sender));
+    const isAssistant = direction === 'OUTGOING' ||
+      (direction === 'INCOMING' && senderIsBot);
+    const turnContent = isAssistant
       ? stripParticipantSpeakerLabel(content, participantNames)
       : content;
-    if (isAssistantTurn) {
+    if (isAssistant) {
       const identityResult = validateReplyIdentity(
         turnContent,
         identityContext,
@@ -428,48 +415,122 @@ function buildConversationTurns(
       );
       if (!identityResult.valid) {
         onDiagnostic?.({
-          messageId: message.id || null,
+          messageId,
           reason: identityResult.reason,
         });
         continue;
       }
     }
+    prepared.push({
+      rawIndex,
+      raw,
+      messageId,
+      timestamp: raw.timestamp ?? null,
+      sender,
+      direction,
+      content: turnContent,
+      isAssistant,
+      isBotAuthored: isAssistant,
+    });
+  }
+  return prepared;
+}
+
+function participantLabel(
+  sender: string,
+  isBotAuthored: boolean,
+  awareness: ParticipantAwareness,
+  identity: BotIdentity,
+): string {
+  if (isBotAuthored) {
+    return identity.name.trim() || 'unknown';
+  }
+  if (sender === 'UNKNOWN') {
+    return 'unknown';
+  }
+  const participant = findParticipantIdentity(awareness, sender);
+  if (!participant) {
+    return normalizeParticipantName(sender) || 'unknown';
+  }
+  return participant.ambiguous
+    ? `ambiguous: ${participant.canonicalName}`
+    : participant.canonicalName;
+}
+
+function buildConversationTurns(
+  messages: readonly ConversationMessage[],
+  prepared: readonly PreparedConversationMessage[],
+  participantAwareness: ParticipantAwareness,
+  roster: GroupRoster | undefined,
+  identity: BotIdentity,
+  targeting: MessageTargetingContext | undefined,
+  trigger: ConversationMessage | null,
+): ConversationTurn[] {
+  const triggerId = trigger ? resolveConversationMessageId(trigger) : null;
+  const ownTargeting = targetingForTrigger(targeting, triggerId);
+  const conversationMessages: ConversationTurn[] = [];
+
+  for (const message of prepared) {
+    const isTrigger = message.raw === trigger ||
+      (triggerId !== null && message.messageId === triggerId);
+    const prefixAwareness = buildParticipantAwareness({
+      bot: identity,
+      roster,
+      messages: messages.slice(0, message.rawIndex + 1),
+    });
+    const messageTargeting = isTrigger && ownTargeting
+      ? ownTargeting
+      : message.isAssistant
+        ? null
+        : classifyMessageTargeting({
+          message: message.raw,
+          awareness: prefixAwareness,
+          recentMessages: prepared
+            .filter(candidate => candidate.rawIndex < message.rawIndex)
+            .map(candidate => candidate.raw),
+        });
+    const content = message.isAssistant
+      ? message.content
+      : serializeConversationMessage({
+        id: message.messageId,
+        timestamp: message.timestamp ?? null,
+        sender: message.sender,
+        participant: participantLabel(
+          message.sender,
+          message.isBotAuthored,
+          participantAwareness,
+          identity,
+        ),
+        direction: message.direction,
+        addressedTo: messageTargeting?.addressedTo ?? null,
+        isTrigger,
+      }, message.content);
     conversationMessages.push({
-      role: isAssistantTurn ? 'assistant' : 'user',
-      content: isAssistantTurn || !senderName || senderName === 'UNKNOWN'
-        ? turnContent
-        : `[from ${senderName}] ${turnContent}`,
+      role: message.isAssistant ? 'assistant' : 'user',
+      content,
+      messageId: message.messageId,
+      direction: message.direction,
+      isAssistant: message.isAssistant,
     });
   }
   return conversationMessages;
 }
 
-function buildRequestTranscript(
-  messages: readonly BackreadMessage[],
-  identityContext: IdentityValidationContext,
-  participantNames: readonly string[],
-  onDiagnostic?: ConversationDiagnosticHandler,
-): ConversationTurn[] | null {
-  return selectRequestTurns(
-    buildConversationTurns(messages, identityContext, participantNames, onDiagnostic),
-  );
-}
-
 function selectRequestTurns(
   conversationMessages: readonly ConversationTurn[],
 ): ConversationTurn[] | null {
-  let latestIncomingIndex = -1;
+  let latestUserIndex = -1;
   for (let index = conversationMessages.length - 1; index >= 0; index -= 1) {
-    if (conversationMessages[index].role === 'user') {
-      latestIncomingIndex = index;
+    if (!conversationMessages[index].isAssistant) {
+      latestUserIndex = index;
       break;
     }
   }
-  if (latestIncomingIndex === -1) {
+  if (latestUserIndex === -1) {
     return null;
   }
   return limitAssistantHistory(
-    conversationMessages.slice(0, latestIncomingIndex + 1),
+    conversationMessages.slice(0, latestUserIndex + 1),
   );
 }
 
@@ -514,7 +575,10 @@ async function requestNvidiaCompletion({
         model: NVIDIA_CHAT_COMPLETIONS_MODEL,
         messages: [
           { role: 'system', content: systemInstruction },
-          ...messages,
+          ...messages.map(message => ({
+            role: message.role,
+            content: message.content,
+          })),
         ],
         ...(responseFormat === undefined ? {} : { response_format: responseFormat }),
         chat_template_kwargs: { enable_thinking: false },
@@ -584,7 +648,7 @@ async function requestNvidiaCompletion({
 
 export async function generateNvidiaReply(
   apiKey: string,
-  messages: readonly BackreadMessage[],
+  messages: readonly ConversationMessage[],
   options: NvidiaReplyRequestOptions,
 ): Promise<string> {
   if (!apiKey.trim() || /[\r\n]/.test(apiKey)) {
@@ -598,23 +662,111 @@ export async function generateNvidiaReply(
   }
 
   const roster = options.roster ? sanitizeGroupRoster(options.roster) : undefined;
-  const participantNames = collectParticipantNames(messages, options.identity);
+  const explicitTrigger = options.trigger ?? null;
+  const triggerId = explicitTrigger
+    ? resolveConversationMessageId(explicitTrigger)
+    : null;
+  const triggerFromHistory = triggerId === null
+    ? undefined
+    : messages.find(message => resolveConversationMessageId(message) === triggerId);
+  const trigger = triggerFromHistory ?? explicitTrigger;
+  const awarenessMessages = trigger && !messages.includes(trigger)
+    ? [...messages, trigger]
+    : messages;
+  const participantAwareness = buildParticipantAwareness({
+    bot: options.identity,
+    roster,
+    messages: awarenessMessages,
+  });
+  const participantNames = participantAwareness.participantNames;
   const identityContext = createIdentityContext(
     options.identity,
-    combineParticipantNames(
-      options.identity,
-      participantNames,
-      collectRosterParticipantNames(roster),
-    ),
+    participantNames,
   );
-  const requestMessages = buildRequestTranscript(
+  const prepared = prepareConversationMessages(
     messages,
     identityContext,
     participantNames,
     options.onDiagnostic,
   );
+  if (!prepared.some(message => message.direction === 'INCOMING')) {
+    throw new Error('No usable Messenger messages are available to generate a reply.');
+  }
+  const latestIncoming = [...prepared]
+    .reverse()
+    .find(message => message.direction === 'INCOMING');
+  const resolvedTrigger = trigger ?? latestIncoming?.raw ?? null;
+  const resolvedTriggerId = resolvedTrigger
+    ? resolveConversationMessageId(resolvedTrigger)
+    : null;
+  const preparedTrigger = resolvedTriggerId === null
+    ? undefined
+    : prepared.find(message => message.messageId === resolvedTriggerId);
+  const triggerPrefixMessages = preparedTrigger
+    ? messages.slice(0, preparedTrigger.rawIndex)
+    : [];
+  const triggerAwareness = buildParticipantAwareness({
+    bot: options.identity,
+    roster,
+    messages: resolvedTrigger
+      ? [...triggerPrefixMessages, resolvedTrigger]
+      : triggerPrefixMessages,
+  });
+  const triggerTargeting = targetingForTrigger(
+    options.targeting,
+    resolvedTriggerId,
+  ) ?? (resolvedTrigger
+    ? classifyMessageTargeting({
+      message: resolvedTrigger,
+      awareness: triggerAwareness,
+      recentMessages: triggerPrefixMessages,
+    })
+    : null);
+  const triggerSender = resolvedTrigger
+    ? normalizeConversationSender(resolvedTrigger.sender)
+    : 'UNKNOWN';
+  const triggerDirection = resolvedTrigger
+    ? normalizeConversationDirection(resolvedTrigger.direction)
+    : 'UNKNOWN';
+  const triggerIsBot = triggerSender !== 'UNKNOWN' &&
+    identityComparableNames(identityContext).has(
+      normalizeIdentityValue(triggerSender),
+    );
+  const triggerInfo: ConversationTriggerInfo | null = resolvedTrigger
+    ? {
+      messageId: resolvedTriggerId,
+      timestamp: resolvedTrigger.timestamp ?? null,
+      sender: triggerSender,
+      participant: participantLabel(
+        triggerSender,
+        triggerIsBot || triggerDirection === 'OUTGOING',
+        triggerAwareness,
+        options.identity,
+      ),
+      direction: triggerDirection,
+      addressedTo: triggerTargeting?.addressedTo ?? null,
+      targetKind: triggerTargeting?.kind ?? null,
+      text: resolvedTrigger.message.trim(),
+      presentInHistory: false,
+    }
+    : null;
+  const requestMessages = selectRequestTurns(
+    buildConversationTurns(
+      messages,
+      prepared,
+      participantAwareness,
+      roster,
+      options.identity,
+      triggerTargeting ?? undefined,
+      resolvedTrigger,
+    ),
+  );
   if (!requestMessages) {
     throw new Error('No usable Messenger messages are available to generate a reply.');
+  }
+  if (triggerInfo) {
+    triggerInfo.presentInHistory = triggerInfo.messageId !== null &&
+      requestMessages.some(message => message.messageId === triggerInfo.messageId);
   }
 
   const requestCompletion = (systemInstruction: string): Promise<string> =>
@@ -633,26 +785,30 @@ export async function generateNvidiaReply(
       emptyMessage: 'NVIDIA returned an empty reply.',
     });
 
+  const awarenessInstruction = appendIdentityAwarenessInstruction(
+    appendGroupRosterInstruction(options.systemInstruction.trim(), roster),
+    {
+      identity: options.identity,
+      participantNames: participantAwareness.canonicalNames,
+    },
+  );
   const systemInstruction = appendConversationalInitiativeInstruction(
     appendMemoryHonestyInstruction(
-      appendIdentityAwarenessInstruction(
-        appendGroupRosterInstruction(options.systemInstruction.trim(), roster),
-        {
-          identity: options.identity,
-          participantNames: combineParticipantNames(
-            options.identity,
-            participantNames,
-            collectRosterParticipantNames(roster),
-          ),
-        },
+      appendMessageTargetingInstruction(
+        triggerInfo
+          ? appendCurrentTriggerInstruction(awarenessInstruction, triggerInfo)
+          : awarenessInstruction,
+        triggerTargeting ?? undefined,
       ),
     ),
   );
   const firstReply = await requestCompletion(systemInstruction);
   const firstLanguageValid = isEnglishOnlyReply(firstReply);
   const firstEmojiFree = !containsEmoji(firstReply);
+  const firstMetadataFree = !extractConversationMessageBody(firstReply).hadEnvelope;
   const firstIdentityResult = validateReplyIdentity(firstReply, identityContext);
-  if (firstLanguageValid && firstEmojiFree && firstIdentityResult.valid) {
+  if (firstLanguageValid && firstEmojiFree && firstMetadataFree &&
+      firstIdentityResult.valid) {
     return firstReply;
   }
 
@@ -662,6 +818,9 @@ export async function generateNvidiaReply(
   }
   if (!firstEmojiFree) {
     retryInstructions.push(EMOJI_RETRY_INSTRUCTION);
+  }
+  if (!firstMetadataFree) {
+    retryInstructions.push(CONVERSATION_METADATA_RETRY_INSTRUCTION);
   }
   if (!firstIdentityResult.valid) {
     retryInstructions.push(IDENTITY_RETRY_INSTRUCTION);
@@ -686,6 +845,12 @@ export async function generateNvidiaReply(
     throw new NvidiaRequestError(
       'service',
       'NVIDIA repeatedly returned a reply containing an emoji. The reply was not sent.',
+    );
+  }
+  if (extractConversationMessageBody(retryReply).hadEnvelope) {
+    throw new NvidiaRequestError(
+      'service',
+      'NVIDIA repeatedly returned a reply containing conversation metadata. The reply was not sent.',
     );
   }
   return retryReply;

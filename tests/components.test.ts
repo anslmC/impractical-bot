@@ -40,6 +40,44 @@ import { generateNvidiaReply } from '../src/ai/nvidia.js';
 
 const testIdentity = { name: 'Ada', aliases: ['@Ada'] };
 
+function serializedMessage(
+  id: string,
+  sender: string,
+  direction: 'INCOMING' | 'OUTGOING' | 'UNKNOWN',
+  message: string,
+  options: {
+    participant?: string;
+    trigger?: boolean;
+    time?: string;
+    addressedTo?: string;
+  } = {},
+): string {
+  if (direction === 'OUTGOING') {
+    return message.trim();
+  }
+  const participant = options.participant ?? (
+    sender === 'UNKNOWN'
+      ? 'unknown'
+      : sender === 'You'
+        ? 'TestBot'
+        : sender
+  );
+  const fields = [
+    `id=${JSON.stringify(id)}`,
+    `time=${JSON.stringify(options.time ?? 'unknown')}`,
+    `sender=${JSON.stringify(sender)}`,
+    `participant=${JSON.stringify(participant)}`,
+    `direction=${direction}`,
+  ];
+  if (options.addressedTo) {
+    fields.push(`addressed_to=${JSON.stringify(options.addressedTo)}`);
+  }
+  if (options.trigger) {
+    fields.push('trigger=true');
+  }
+  return `[MESSAGE ${fields.join(' ')}]\n${message.trim()}`;
+}
+
 function composeTestPrompt(
   personalityMode: 'default' | 'custom' = 'default',
   customPersonalityInstruction?: string,
@@ -1423,9 +1461,35 @@ test('reply generation sends the production identity rule with the incoming text
   assert.match(body?.messages[0].content ?? '', /Do not begin an ordinary reply with your own name or alias/);
   assert.match(body?.messages[0].content ?? '', /This includes reproducing your own name or alias/);
   assert.deepEqual(body?.messages.slice(1), [
-    { role: 'user', content: '[from Alex] @PleaseGetout Daily nice' },
-    { role: 'assistant', content: '@PleaseGetout Daily an earlier reply' },
-    { role: 'user', content: "[from Blair] say '@PleaseGetout Daily'" },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'incoming-1',
+        'Alex',
+        'INCOMING',
+        '@PleaseGetout Daily nice',
+      ),
+    },
+    {
+      role: 'assistant',
+      content: serializedMessage(
+        'outgoing-1',
+        'You',
+        'OUTGOING',
+        '@PleaseGetout Daily an earlier reply',
+        { participant: 'PleaseGetout Daily' },
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'incoming-2',
+        'Blair',
+        'INCOMING',
+        "say '@PleaseGetout Daily'",
+        { trigger: true },
+      ),
+    },
   ]);
 });
 
@@ -1501,11 +1565,53 @@ test('the English-only rule survives multilingual incoming and historical messag
   assert.match(body?.messages[0].content ?? '', /even when someone explicitly asks you to switch languages/);
   assert.match(body?.messages[0].content ?? '', /does not reduce your understanding of the conversation/);
   assert.deepEqual(body?.messages.slice(1), [
-    { role: 'user', content: '[from Alex] Kumusta ka na?' },
-    { role: 'assistant', content: 'Okay lang, ikaw?' },
-    { role: 'user', content: '[from Blair] Ano ba yan, nakakaloka ka?' },
-    { role: 'user', content: '[from Casey] 何をしていますか？' },
-    { role: 'user', content: '[from Dana] Responde en español, por favor.' },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'incoming-1',
+        'Alex',
+        'INCOMING',
+        'Kumusta ka na?',
+      ),
+    },
+    {
+      role: 'assistant',
+      content: serializedMessage(
+        'outgoing-1',
+        'You',
+        'OUTGOING',
+        'Okay lang, ikaw?',
+        { participant: 'Ada' },
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'incoming-2',
+        'Blair',
+        'INCOMING',
+        'Ano ba yan, nakakaloka ka?',
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'incoming-3',
+        'Casey',
+        'INCOMING',
+        '何をしていますか？',
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'incoming-4',
+        'Dana',
+        'INCOMING',
+        'Responde en español, por favor.',
+        { trigger: true },
+      ),
+    },
   ]);
 });
 
@@ -1816,10 +1922,43 @@ test('a follow-up mention keeps the previous user turn, the bot reply, and one t
   );
 
   assert.deepEqual(body?.messages.slice(1), [
-    { role: 'user', content: '[from Blair] planning the trip' },
-    { role: 'user', content: '[from Alex] @Bot are you around?' },
-    { role: 'assistant', content: 'Yep, what do you need?' },
-    { role: 'user', content: '[from Alex] @Bot summarise the plan' },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'ctx-1',
+        'Blair',
+        'INCOMING',
+        'planning the trip',
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'in-1',
+        'Alex',
+        'INCOMING',
+        '@Bot are you around?',
+      ),
+    },
+    {
+      role: 'assistant',
+      content: serializedMessage(
+        'out-1',
+        'You',
+        'OUTGOING',
+        'Yep, what do you need?',
+      ),
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'in-2',
+        'Alex',
+        'INCOMING',
+        '@Bot summarise the plan',
+        { trigger: true },
+      ),
+    },
   ]);
 });
 

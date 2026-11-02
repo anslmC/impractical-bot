@@ -1,3 +1,5 @@
+import { extractConversationMessageBody } from './conversation-context.js';
+
 export interface AntiEchoMessage {
   message: string;
   messageId?: string;
@@ -71,7 +73,7 @@ export function normalizeForEchoComparison(
   if (typeof text !== 'string') {
     return '';
   }
-  let normalized = text.normalize('NFKC').trim();
+  let normalized = extractConversationMessageBody(text).text.normalize('NFKC').trim();
   normalized = stripParticipantPrefix(normalized, participantNames);
   normalized = stripLeadingMentions(normalized);
   normalized = normalized.replace(/\s+/gu, ' ').trim();

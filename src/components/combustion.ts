@@ -14,7 +14,6 @@ import {
 import {
   ANTI_ECHO_RETRY_INSTRUCTION,
   AntiEchoSuppressedError,
-  collectParticipantNames,
   findLatestIncomingMessage,
   generateReplyWithAntiEchoGuard,
   isEchoReply,
@@ -33,6 +32,7 @@ import {
   type BotTemperament,
 } from '../config/configuration.js';
 import type { ContextMessage, ContextStore } from './context-store.js';
+import { extractConversationMessageBody } from './conversation-context.js';
 import {
   extractMessageDetails,
   type MessageDetails,
@@ -54,6 +54,15 @@ import { createMentionMatcher } from './mention-matcher.js';
 import { createBoundedIdSet } from './bounded-id-set.js';
 import { validateReplyIdentity } from './identity-policy.js';
 import {
+  classifyMessageTargeting,
+  isRelayStillNeeded,
+  relayWasDelivered,
+  type MessageTargetingContext,
+  type RelayDirective,
+} from './message-targeting.js';
+import { buildParticipantAwareness, participantNameKey } from './participant-awareness.js';
+import {
+  stripGenericTrailingQuestions,
   stripLeadingParticipantMentions,
   stripParticipantSpeakerLabel,
   stripSelfIdentifyingPrefix,
@@ -103,6 +112,7 @@ type EngineMessage = MessageDetails & { mention?: boolean };
 type PacketTriggerType = 'rng' | 'mention' | 'unknown';
 type ScheduledPacket = (PacketBuilderPacket | RngPacket) & {
   mentionMessages?: PacketBuilderMessage[];
+  triggerMessageId?: string;
 };
 
 interface PendingOutgoingReply extends ContextMessage {
@@ -112,6 +122,12 @@ interface PendingOutgoingReply extends ContextMessage {
   direction: 'OUTGOING';
   afterMessageId: string | null;
   createdAt: number;
+}
+
+interface GenerationContext {
+  messages: PacketBuilderMessage[];
+  trigger: PacketBuilderMessage | null;
+  targetingMessages: PacketBuilderMessage[];
 }
 
 interface PacketTiming {
@@ -545,6 +561,8 @@ export async function startCombustion({
   let packetScheduler: PacketScheduler | undefined;
   let packetBuilderState: PacketBuilderState | undefined;
   let pollRng: (() => void) | undefined;
+  let activeRelay: { directive: RelayDirective; key: string } | null = null;
+  const relayedCallKeys = createBoundedIdSet(200);
   let listenerAttached = false;
   const messageIdentity = createMessageIdentityTracker();
   const mentionsConfiguredAlias = createMentionMatcher({ name: configuration.puppetName ?? '', aliases });
@@ -586,7 +604,10 @@ export async function startCombustion({
     message.message.trim().length > 0;
 
   const normalizeReplyText = (message: string): string =>
-    message.normalize('NFC').replace(/\s+/gu, ' ').trim();
+    extractConversationMessageBody(message).text
+      .normalize('NFC')
+      .replace(/\s+/gu, ' ')
+      .trim();
 
   let nextPendingOutgoingReplyId = 1;
   const pendingOutgoingReplies: PendingOutgoingReply[] = [];
@@ -599,7 +620,7 @@ export async function startCombustion({
   };
 
   const recordPendingOutgoingReply = (message: string): void => {
-    const trimmedMessage = message.trim();
+    const trimmedMessage = extractConversationMessageBody(message).text.trim();
     if (!trimmedMessage) {
       return;
     }
@@ -655,99 +676,137 @@ export async function startCombustion({
     if (pendingReplies.length === 0) {
       return [...context];
     }
+    const result = [...context];
     const outgoingTexts = new Set(
-      context
+      result
         .filter(message => isBotAuthoredMessage(message))
         .map(message => normalizeReplyText(message.message)),
     );
-    const additions: ContextMessage[] = [];
+    const pendingIds = new Set<string>();
     for (const pending of pendingReplies) {
-      const comparable = normalizeReplyText(pending.message);
+      const pendingText = extractConversationMessageBody(pending.message).text;
+      if (!pendingText) {
+        continue;
+      }
+      const comparable = normalizeReplyText(pendingText);
       if (outgoingTexts.has(comparable)) {
         continue;
       }
+      let insertionIndex: number;
+      if (pending.afterMessageId === null) {
+        insertionIndex = 0;
+      } else {
+        const anchorIndex = result.findIndex(
+          message => message.messageId === pending.afterMessageId,
+        );
+        if (anchorIndex === -1) {
+          continue;
+        }
+        insertionIndex = anchorIndex + 1;
+        while (insertionIndex < result.length &&
+               pendingIds.has(result[insertionIndex].messageId)) {
+          insertionIndex += 1;
+        }
+      }
       outgoingTexts.add(comparable);
-      additions.push({
+      pendingIds.add(pending.messageId);
+      result.splice(insertionIndex, 0, {
         messageId: pending.messageId,
-        message: pending.message,
+        message: pendingText,
         sender: pending.sender,
         direction: pending.direction,
       });
     }
-    if (additions.length === 0) {
-      return [...context];
-    }
+    return result;
+  };
 
-    let insertionIndex = context.length;
-    for (let index = context.length - 1; index >= 0; index -= 1) {
-      if (isUsableIncomingMessage(context[index])) {
-        insertionIndex = index;
-        break;
+  const resolveGenerationTrigger = (
+    triggerId: string | null,
+    storedMessages: readonly ContextMessage[],
+    fallbackMessages: readonly PacketBuilderMessage[],
+  ): PacketBuilderMessage | null => {
+    if (triggerId !== null) {
+      const storedTrigger = storedMessages.find(
+        message => message.messageId === triggerId,
+      );
+      if (storedTrigger) {
+        return storedTrigger as PacketBuilderMessage;
+      }
+      const fallbackTrigger = fallbackMessages.find(
+        message => message.messageId === triggerId,
+      );
+      if (fallbackTrigger) {
+        return fallbackTrigger;
       }
     }
-    return [
-      ...context.slice(0, insertionIndex),
-      ...additions,
-      ...context.slice(insertionIndex),
-    ];
+    const latestId = latestIncomingMessageId(fallbackMessages) ??
+      latestIncomingMessageId(storedMessages);
+    if (latestId === null) {
+      return null;
+    }
+    const storedLatest = storedMessages.find(
+      message => message.messageId === latestId,
+    );
+    if (storedLatest) {
+      return storedLatest as PacketBuilderMessage;
+    }
+    return fallbackMessages.find(message => message.messageId === latestId) ?? null;
   };
 
   const buildGenerationMessages = (
     packet: ScheduledPacket,
     fallbackMessages: readonly PacketBuilderMessage[],
-  ): PacketBuilderMessage[] => {
+  ): GenerationContext => {
     prunePendingOutgoingReplies();
     const isRngPacket = activePacketContext?.type === 'rng' ||
       packet.packetId === rngPacketInFlightId;
-    const triggerId = latestIncomingMessageId(fallbackMessages);
+    const triggerId = packet.triggerMessageId ?? latestIncomingMessageId(fallbackMessages);
     const storedMessages = contextStore.getRecent(contextStore.getState().maxMessages);
     const triggerIndex = triggerId === null
       ? -1
       : storedMessages.findIndex(message => message.messageId === triggerId);
-    const pendingBeforeTrigger = pendingOutgoingReplies.filter(pending => {
-      if (triggerIndex === -1 || pending.afterMessageId === null) {
-        return true;
-      }
-      const afterIndex = storedMessages.findIndex(
-        message => message.messageId === pending.afterMessageId,
-      );
-      return afterIndex === -1 || afterIndex < triggerIndex;
-    });
+    const trigger = resolveGenerationTrigger(
+      triggerId,
+      storedMessages,
+      fallbackMessages,
+    );
+    const targetingMessages = triggerIndex === -1
+      ? []
+      : storedMessages.slice(0, triggerIndex) as PacketBuilderMessage[];
 
-    if (triggerIndex === -1) {
-      return mergePendingOutgoingReplies(
-        fallbackMessages as ContextMessage[],
-        pendingBeforeTrigger,
-      ) as PacketBuilderMessage[];
+    const latestIncomingId = latestIncomingMessageId(storedMessages) ?? triggerId;
+    const endIndex = latestIncomingId === null
+      ? -1
+      : storedMessages.findIndex(message => message.messageId === latestIncomingId);
+    if (endIndex === -1) {
+      const fallbackTriggerIndex = trigger
+        ? fallbackMessages.indexOf(trigger)
+        : -1;
+      return {
+        messages: mergePendingOutgoingReplies(
+          fallbackMessages as ContextMessage[],
+          pendingOutgoingReplies,
+        ) as PacketBuilderMessage[],
+        trigger,
+        targetingMessages: fallbackTriggerIndex === -1
+          ? []
+          : fallbackMessages.slice(0, fallbackTriggerIndex) as PacketBuilderMessage[],
+      };
     }
 
-    const messagesUpToTrigger = storedMessages.slice(0, triggerIndex + 1);
     const windowSize = isRngPacket
       ? RNG_CONTEXT_MESSAGE_LIMIT
       : PACKET_CONTEXT_MESSAGE_LIMIT + 1;
-    const windowMessages = messagesUpToTrigger.slice(-windowSize);
-    const windowIds = new Set(windowMessages.map(message => message.messageId));
-    const merged = mergePendingOutgoingReplies(windowMessages, pendingBeforeTrigger);
-    const mergedIds = new Set(merged.map(message => message.messageId));
-    const mergedOutgoingTexts = new Set(
-      merged
-        .filter(message => isBotAuthoredMessage(message))
-        .map(message => normalizeReplyText(message.message)),
-    );
-
-    for (let index = messagesUpToTrigger.length - 1; index >= 0; index -= 1) {
-      const message = messagesUpToTrigger[index];
-      if (!isBotAuthoredMessage(message) || windowIds.has(message.messageId)) {
-        continue;
-      }
-      if (mergedIds.has(message.messageId) ||
-          mergedOutgoingTexts.has(normalizeReplyText(message.message))) {
-        break;
-      }
-      merged.unshift(message);
-      break;
-    }
-    return merged as PacketBuilderMessage[];
+    const startIndex = Math.max(0, endIndex - windowSize + 1);
+    const windowMessages = storedMessages.slice(startIndex, endIndex + 1);
+    return {
+      messages: mergePendingOutgoingReplies(
+        windowMessages,
+        pendingOutgoingReplies,
+      ) as PacketBuilderMessage[],
+      trigger,
+      targetingMessages,
+    };
   };
 
   const newestParticipantMessageId = (): string | null => {
@@ -1740,15 +1799,55 @@ export async function startCombustion({
       apiKey,
       generateReply: async (requestApiKey, packetMessages, packet) => {
         const startedAt = performance.now();
-        const messages = buildGenerationMessages(
+        const generation = buildGenerationMessages(
           packet as ScheduledPacket,
           packetMessages,
         );
+        const messages = generation.messages;
         const latestIncoming = findLatestIncomingMessage(messages);
-        const participantNames = collectParticipantNames({
-          messages,
-          names: [configuration.puppetName ?? '', ...aliases],
+        const triggerMessage = (generation.trigger ?? latestIncoming) as
+          PacketBuilderMessage | null;
+        const targetingAwareness = buildParticipantAwareness({
+          bot: identity,
+          roster: groupRoster,
+          messages: triggerMessage
+            ? [...generation.targetingMessages, triggerMessage]
+            : generation.targetingMessages,
         });
+        const participantAwareness = buildParticipantAwareness({
+          bot: identity,
+          roster: groupRoster,
+          messages: triggerMessage && !messages.includes(triggerMessage)
+            ? [...messages, triggerMessage]
+            : messages,
+        });
+        const participantNames = participantAwareness.participantNames;
+        let targeting: MessageTargetingContext | null = triggerMessage
+          ? classifyMessageTargeting({
+            message: triggerMessage,
+            awareness: targetingAwareness,
+            recentMessages: generation.targetingMessages,
+          })
+          : null;
+        let effectiveRelay = targeting?.relay ?? null;
+        let relayKey: string | null = null;
+        if (effectiveRelay) {
+          relayKey = `${effectiveRelay.sourceMessageId}|` +
+            participantNameKey(effectiveRelay.recipient);
+          if (relayedCallKeys.has(relayKey) ||
+              !isRelayStillNeeded({
+                relay: effectiveRelay,
+                messages,
+              })) {
+            effectiveRelay = null;
+          }
+        }
+        if (targeting) {
+          targeting = { ...targeting, relay: effectiveRelay };
+        }
+        activeRelay = effectiveRelay && relayKey
+          ? { directive: effectiveRelay, key: relayKey }
+          : null;
         const requestReply = async (retry: boolean): Promise<string> => {
           const reply = await generateNvidiaReply(
             requestApiKey,
@@ -1759,22 +1858,20 @@ export async function startCombustion({
                 : systemInstruction,
               identity,
               roster: groupRoster,
+              targeting: targeting ?? undefined,
+              trigger: triggerMessage,
               onDiagnostic: reportTranscriptDiagnostic,
             },
           );
-          const normalizedReply = stripLeadingParticipantMentions(
-            stripParticipantSpeakerLabel(
-              stripSelfIdentifyingPrefix(
-                reply,
-                { name: configuration.puppetName ?? '', aliases },
-                messages,
-              ),
-              participantNames,
-              messages,
-            ),
+          const withoutSpeakerLabel = stripParticipantSpeakerLabel(
+            stripSelfIdentifyingPrefix(reply, identity, messages),
             participantNames,
             messages,
           );
+          const withoutLeadingMention = effectiveRelay
+            ? withoutSpeakerLabel
+            : stripLeadingParticipantMentions(withoutSpeakerLabel, participantNames, messages);
+          const normalizedReply = stripGenericTrailingQuestions(withoutLeadingMention);
           if (normalizedReply !== reply) {
             const trimmedReply = reply.trim();
             const removedPrefix = trimmedReply
@@ -1834,6 +1931,9 @@ export async function startCombustion({
           const composition = await composeMessengerReply(packetPage, reply, options);
           if (composition.status === 'sent') {
             recordPendingOutgoingReply(reply);
+            if (activeRelay && relayWasDelivered(reply, activeRelay.directive)) {
+              relayedCallKeys.add(activeRelay.key);
+            }
           }
           return composition;
         } finally {
@@ -1853,6 +1953,7 @@ export async function startCombustion({
       timing.startedAt = performance.now();
       activePacketTiming = timing;
       const isRngPacket = packet.packetId === rngPacketInFlightId;
+      activeRelay = null;
       activePacketContext = {
         packetId: packet.packetId,
         type: isRngPacket ? 'rng' : 'mention',
@@ -2033,7 +2134,7 @@ export async function startCombustion({
           return;
         }
 
-        const packet = buildRngPacket(recentMessages);
+        const packet = buildRngPacket(recentMessages, latestIncomingMessage.messageId);
         rngPacketInFlightId = packet.packetId;
         rngPacketEpoch = destinationEpoch;
         const timing = timingForPacket(packet);
