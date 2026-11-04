@@ -22,6 +22,20 @@ export const DEFAULT_BOT_PERSONALITY_MODE = 'default' as const;
 
 export const MAX_PERSONALITY_INSTRUCTION_CHARS = 4000;
 
+export const DEFAULT_COMPOSER_SLICER_MAX_CHARACTERS = 200;
+
+export interface ComposerSlicerSettings {
+  enabled: boolean;
+  maxCharacters: number;
+}
+
+export type ComposerSlicerOverrides = Partial<ComposerSlicerSettings>;
+
+export const DEFAULT_COMPOSER_SLICER: ComposerSlicerSettings = {
+  enabled: true,
+  maxCharacters: DEFAULT_COMPOSER_SLICER_MAX_CHARACTERS,
+};
+
 export type BrowserId = typeof BROWSER_IDS[number];
 export type BotTemperament = typeof BOT_TEMPERAMENTS[number];
 export type BotPersonalityMode = typeof BOT_PERSONALITY_MODES[number];
@@ -52,6 +66,7 @@ export interface Configuration {
   botTemperament?: BotTemperament;
   botPersonality?: BotPersonalityMode;
   customPersonalityInstruction?: string;
+  composerSlicer?: ComposerSlicerOverrides;
 }
 
 export function isBotTemperament(value: unknown): value is BotTemperament {
@@ -80,6 +95,16 @@ export function resolveBotPersonalityMode(
   configuration: Pick<Configuration, 'botPersonality'>,
 ): BotPersonalityMode {
   return configuration.botPersonality ?? DEFAULT_BOT_PERSONALITY_MODE;
+}
+
+export function resolveComposerSlicer(
+  configuration: Pick<Configuration, 'composerSlicer'>,
+): ComposerSlicerSettings {
+  return {
+    enabled: configuration.composerSlicer?.enabled ?? DEFAULT_COMPOSER_SLICER.enabled,
+    maxCharacters:
+      configuration.composerSlicer?.maxCharacters ?? DEFAULT_COMPOSER_SLICER.maxCharacters,
+  };
 }
 
 export type ConfigurationWithoutPin = Omit<Configuration, 'pin'>;
@@ -118,7 +143,9 @@ const CONFIGURATION_KEYS = new Set([
   'botTemperament',
   'botPersonality',
   'customPersonalityInstruction',
+  'composerSlicer',
 ]);
+const COMPOSER_SLICER_KEYS = new Set(['enabled', 'maxCharacters']);
 const BROWSER_EXECUTABLE_NAMES: Record<BrowserId, string> = {
   brave: 'brave.exe',
   chrome: 'chrome.exe',
@@ -164,6 +191,38 @@ function requireWindowsAbsolutePath(value: unknown, field: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function validateComposerSlicer(value: unknown): ComposerSlicerOverrides {
+  if (value === undefined) {
+    return {};
+  }
+  if (!isRecord(value)) {
+    throw new Error('composerSlicer must be a JSON object.');
+  }
+  const unknownKeys = Object.keys(value).filter(key => !COMPOSER_SLICER_KEYS.has(key));
+  if (unknownKeys.length > 0) {
+    throw new Error(`composerSlicer contains unsupported field '${unknownKeys[0]}'.`);
+  }
+  const overrides: ComposerSlicerOverrides = {};
+  if (value.enabled !== undefined) {
+    if (typeof value.enabled !== 'boolean') {
+      throw new Error('composerSlicer.enabled must be a boolean.');
+    }
+    overrides.enabled = value.enabled;
+  }
+  if (value.maxCharacters !== undefined) {
+    const maxCharacters = value.maxCharacters;
+    if (
+      typeof maxCharacters !== 'number' ||
+      !Number.isInteger(maxCharacters) ||
+      maxCharacters < 1
+    ) {
+      throw new Error('composerSlicer.maxCharacters must be a positive integer.');
+    }
+    overrides.maxCharacters = maxCharacters;
+  }
+  return overrides;
 }
 
 function validateConfigurationFields(value: unknown): ConfigurationWithoutPin {
@@ -294,6 +353,9 @@ function validateConfigurationFields(value: unknown): ConfigurationWithoutPin {
     ...(value.customPersonalityInstruction === undefined
       ? {}
       : { customPersonalityInstruction: value.customPersonalityInstruction }),
+    ...(value.composerSlicer === undefined
+      ? {}
+      : { composerSlicer: validateComposerSlicer(value.composerSlicer) }),
   };
 }
 

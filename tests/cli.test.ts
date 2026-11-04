@@ -11,8 +11,10 @@ import { NvidiaApiKeyError } from '../src/ai/nvidia.js';
 import type { BrowserLaunchSession } from '../src/browser/launch.js';
 import type { GroupRoster } from '../src/browser/group-roster.js';
 import {
+  DEFAULT_COMPOSER_SLICER,
   MAX_PERSONALITY_INSTRUCTION_CHARS,
   loadConfiguration,
+  resolveComposerSlicer,
   saveConfiguration,
   type Configuration,
 } from '../src/config/configuration.js';
@@ -149,6 +151,24 @@ function createTemporaryConfigPath(context: TestContext): string {
   return join(directory, 'config.json');
 }
 
+async function captureComposerSlicer(
+  configurationFilePath: string,
+  args: string[],
+  runtime?: CliRuntimeOptions,
+  prompt?: TerminalPrompt,
+) {
+  return captureCli(
+    ['setcomposerslicer', ...args],
+    configurationFilePath,
+    prompt,
+    undefined,
+    {
+      requestRuntimeStatus: async () => ({ status: 'not-running' }),
+      ...runtime,
+    },
+  );
+}
+
 function saveApplicationApiKey(configurationFilePath: string, apiKey = 'nvapi-test-key'): string {
   const environmentFilePath = join(dirname(configurationFilePath), '.env');
   writeFileSync(environmentFilePath, `NVIDIA_API_KEY=${apiKey}\n`);
@@ -167,6 +187,7 @@ const validConfiguration: Configuration = {
   messageDestination: 'https://www.facebook.com/messages/t/1618007223454558',
   botTemperament: 'balanced',
   botPersonality: 'default',
+  composerSlicer: { enabled: true, maxCharacters: 500 },
 };
 const profileButton = {
   count: async () => 1,
@@ -3680,6 +3701,492 @@ test('config reports persisted settings and puppet name', async context => {
   saveConfiguration({ ...validConfiguration, puppetName: '' }, filePath);
   const emptyPuppetNameResult = await captureCli(['config'], filePath);
   assert.match(emptyPuppetNameResult.output[0], /Puppet name: Not set/);
+});
+
+test('setcomposerslicer enables and disables the slicer without resetting maxCharacters', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(
+    { ...validConfiguration, composerSlicer: { enabled: false, maxCharacters: 250 } },
+    filePath,
+  );
+
+  const enabled = await captureComposerSlicer(filePath, ['enabled', 'true']);
+  assert.equal(enabled.exitCode, 0);
+  assert.match(enabled.output[0], /Composer Slicer configuration saved: enabled true/);
+  let loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.deepEqual(loaded.configuration.composerSlicer, { enabled: true, maxCharacters: 250 });
+  }
+
+  const disabled = await captureComposerSlicer(filePath, ['enabled', 'false']);
+  assert.equal(disabled.exitCode, 0);
+  assert.match(disabled.output[0], /Composer Slicer configuration saved: enabled false/);
+  loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.deepEqual(loaded.configuration.composerSlicer, { enabled: false, maxCharacters: 250 });
+  }
+});
+
+test('setcomposerslicer changes maxCharacters without resetting enabled', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(
+    { ...validConfiguration, composerSlicer: { enabled: false, maxCharacters: 500 } },
+    filePath,
+  );
+
+  const result = await captureComposerSlicer(filePath, ['maxCharacters', '10']);
+  assert.equal(result.exitCode, 0);
+  assert.match(result.output[0], /Composer Slicer configuration saved: maxCharacters 10/);
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.deepEqual(loaded.configuration.composerSlicer, { enabled: false, maxCharacters: 10 });
+    assert.deepEqual(resolveComposerSlicer(loaded.configuration), {
+      enabled: false,
+      maxCharacters: 10,
+    });
+  }
+});
+
+test('setcomposerslicer status reports the resolved configuration', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(
+    { ...validConfiguration, composerSlicer: { maxCharacters: 10 } },
+    filePath,
+  );
+
+  const enabled = await captureComposerSlicer(filePath, ['status']);
+  assert.equal(enabled.exitCode, 0);
+  assert.deepEqual(enabled.output, [
+    [
+      'Composer Slicer Configuration',
+      '',
+      'Enabled:        Yes',
+      'Max Characters: 10',
+    ].join('\n'),
+  ]);
+  assert.deepEqual(enabled.errors, []);
+
+  saveConfiguration(
+    { ...validConfiguration, composerSlicer: { enabled: false } },
+    filePath,
+  );
+  const disabled = await captureComposerSlicer(filePath, ['status']);
+  assert.equal(disabled.exitCode, 0);
+  assert.deepEqual(disabled.output, [
+    [
+      'Composer Slicer Configuration',
+      '',
+      'Enabled:        No',
+      `Max Characters: ${String(DEFAULT_COMPOSER_SLICER.maxCharacters)}`,
+    ].join('\n'),
+  ]);
+  assert.deepEqual(disabled.errors, []);
+});
+
+test('setcomposerslicer rejects invalid boolean values without changing configuration', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, filePath);
+
+  for (const value of ['TRUE', '1', 'yes', 'on']) {
+    const result = await captureComposerSlicer(filePath, ['enabled', value]);
+    assert.equal(result.exitCode, 1, value);
+    assert.match(result.errors[0], /'enabled' must be 'true' or 'false'/, value);
+    assert.deepEqual(loadConfiguration(filePath), {
+      status: 'valid',
+      configuration: validConfiguration,
+    });
+  }
+});
+
+test('setcomposerslicer rejects zero and negative character limits without changing configuration', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, filePath);
+
+  for (const value of ['0', '-1', '-500']) {
+    const result = await captureComposerSlicer(filePath, ['maxCharacters', value]);
+    assert.equal(result.exitCode, 1, value);
+    assert.match(result.errors[0], /'maxCharacters' must be a positive integer/, value);
+    assert.deepEqual(loadConfiguration(filePath), {
+      status: 'valid',
+      configuration: validConfiguration,
+    });
+  }
+});
+
+test('setcomposerslicer rejects decimal and non-numeric character limits without changing configuration', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, filePath);
+
+  for (const value of ['1.5', '10.0', 'abc', 'NaN', 'Infinity', '1e3']) {
+    const result = await captureComposerSlicer(filePath, ['maxCharacters', value]);
+    assert.equal(result.exitCode, 1, value);
+    assert.match(result.errors[0], /'maxCharacters' must be a positive integer/, value);
+    assert.deepEqual(loadConfiguration(filePath), {
+      status: 'valid',
+      configuration: validConfiguration,
+    });
+  }
+});
+
+test('setcomposerslicer rejects unknown settings and unexpected arguments', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, filePath);
+
+  for (const args of [['unknown', 'true'], ['status', 'extra']]) {
+    const result = await captureComposerSlicer(filePath, args);
+    assert.equal(result.exitCode, 1, args.join(' '));
+    assert.match(result.errors[0], /Error: /, args.join(' '));
+    assert.match(result.errors[0], /Composer Slicer commands:/, args.join(' '));
+    assert.deepEqual(loadConfiguration(filePath), {
+      status: 'valid',
+      configuration: validConfiguration,
+    });
+  }
+});
+
+test('setcomposerslicer rejects missing arguments', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, filePath);
+
+  const missingSetting = await captureComposerSlicer(filePath, []);
+  assert.equal(missingSetting.exitCode, 1);
+  assert.match(missingSetting.errors[0], /missing Composer Slicer setting/);
+
+  for (const setting of ['enabled', 'maxCharacters']) {
+    const result = await captureComposerSlicer(filePath, [setting]);
+    assert.equal(result.exitCode, 1, setting);
+    assert.match(result.errors[0], new RegExp(`missing value for Composer Slicer setting '${setting}'`));
+  }
+  assert.deepEqual(loadConfiguration(filePath), {
+    status: 'valid',
+    configuration: validConfiguration,
+  });
+});
+
+test('setcomposerslicer preserves unrelated configuration values', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  const initial: Configuration = {
+    ...validConfiguration,
+    puppetName: 'Keep Puppet',
+    botTemperament: 'talkative',
+    messageDestination: 'https://www.facebook.com/messages/t/111111111',
+    composerSlicer: { enabled: false, maxCharacters: 250 },
+  };
+  saveConfiguration(initial, filePath);
+
+  const result = await captureComposerSlicer(filePath, ['maxCharacters', '10']);
+  assert.equal(result.exitCode, 0);
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.deepEqual(loaded.configuration, {
+      ...initial,
+      composerSlicer: { enabled: false, maxCharacters: 10 },
+    });
+  }
+});
+
+test('setcomposerslicer preserves the other slicer setting across changes and reloads', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(
+    { ...validConfiguration, composerSlicer: { enabled: false, maxCharacters: 250 } },
+    filePath,
+  );
+
+  assert.equal(
+    (await captureComposerSlicer(filePath, ['maxCharacters', '10'])).exitCode,
+    0,
+  );
+  assert.equal(
+    (await captureComposerSlicer(filePath, ['enabled', 'true'])).exitCode,
+    0,
+  );
+
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.deepEqual(loaded.configuration.composerSlicer, { enabled: true, maxCharacters: 10 });
+    assert.deepEqual(resolveComposerSlicer(loaded.configuration), {
+      enabled: true,
+      maxCharacters: 10,
+    });
+  }
+});
+
+test('setcomposerslicer writes only configured fields and never materializes defaults', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  const legacy: Configuration = { ...validConfiguration };
+  delete legacy.composerSlicer;
+  saveConfiguration(legacy, filePath);
+
+  assert.equal(
+    (await captureComposerSlicer(filePath, ['enabled', 'false'])).exitCode,
+    0,
+  );
+  const enabledText = readFileSync(filePath, 'utf8');
+  assert.match(enabledText, /"composerSlicer"/);
+  assert.doesNotMatch(enabledText, /"maxCharacters"/);
+  let loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.deepEqual(loaded.configuration.composerSlicer, { enabled: false });
+    assert.deepEqual(resolveComposerSlicer(loaded.configuration), {
+      enabled: false,
+      maxCharacters: DEFAULT_COMPOSER_SLICER.maxCharacters,
+    });
+  }
+
+  saveConfiguration(legacy, filePath);
+  assert.equal(
+    (await captureComposerSlicer(filePath, ['maxCharacters', '10'])).exitCode,
+    0,
+  );
+  const maximumText = readFileSync(filePath, 'utf8');
+  assert.doesNotMatch(maximumText, /"enabled"/);
+  loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.deepEqual(loaded.configuration.composerSlicer, { maxCharacters: 10 });
+    assert.deepEqual(resolveComposerSlicer(loaded.configuration), {
+      enabled: DEFAULT_COMPOSER_SLICER.enabled,
+      maxCharacters: 10,
+    });
+  }
+});
+
+test('setcomposerslicer saves a running engine change when confirmation is accepted', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, filePath);
+  const questions: string[] = [];
+
+  const result = await captureComposerSlicer(
+    filePath,
+    ['maxCharacters', '10'],
+    { requestRuntimeStatus: async () => ({ status: 'running', instanceId: 'engine-1' }) },
+    async question => {
+      questions.push(question);
+      return 'y';
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(questions.length, 1);
+  assert.match(questions[0], /Save these changes anyway\? \[y\/N\]: /);
+  const output = result.output.join('\n');
+  assert.match(output, /WARNING: Impractical Bot engine is currently running/);
+  assert.match(output, /Changes to Composer Slicer will NOT affect the active engine/);
+  assert.match(output, /A restart is required before the new settings take effect/);
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.deepEqual(loaded.configuration.composerSlicer, { enabled: true, maxCharacters: 10 });
+  }
+});
+
+test('setcomposerslicer aborts a running engine change when confirmation is declined', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, filePath);
+  const originalContent = readFileSync(filePath, 'utf8');
+
+  const result = await captureComposerSlicer(
+    filePath,
+    ['enabled', 'false'],
+    { requestRuntimeStatus: async () => ({ status: 'running', instanceId: 'engine-1' }) },
+    async () => 'n',
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.match(result.output.join('\n'), /Composer Slicer configuration was not changed/);
+  assert.equal(readFileSync(filePath, 'utf8'), originalContent);
+});
+
+test('setcomposerslicer treats an empty running engine confirmation as No', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, filePath);
+  const originalContent = readFileSync(filePath, 'utf8');
+
+  const result = await captureComposerSlicer(
+    filePath,
+    ['maxCharacters', '10'],
+    { requestRuntimeStatus: async () => ({ status: 'running', instanceId: 'engine-1' }) },
+    async () => '',
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.match(result.output.join('\n'), /Composer Slicer configuration was not changed/);
+  assert.equal(readFileSync(filePath, 'utf8'), originalContent);
+});
+
+test('setcomposerslicer rejects invalid running engine confirmation input', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, filePath);
+  const originalContent = readFileSync(filePath, 'utf8');
+
+  const result = await captureComposerSlicer(
+    filePath,
+    ['maxCharacters', '10'],
+    { requestRuntimeStatus: async () => ({ status: 'running', instanceId: 'engine-1' }) },
+    async () => 'maybe',
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.errors[0], /Enter 'y' to save the changes or 'n' to cancel/);
+  assert.equal(readFileSync(filePath, 'utf8'), originalContent);
+});
+
+test('setcomposerslicer --force bypasses confirmation but still warns for a running engine', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, filePath);
+  let promptCalls = 0;
+
+  const result = await captureComposerSlicer(
+    filePath,
+    ['enabled', 'false', '--force'],
+    { requestRuntimeStatus: async () => ({ status: 'running', instanceId: 'engine-1' }) },
+    async () => {
+      promptCalls += 1;
+      return 'y';
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(promptCalls, 0);
+  const output = result.output.join('\n');
+  assert.match(output, /WARNING: Impractical Bot engine is currently running/);
+  assert.match(output, /Continuing because --force was supplied/);
+  assert.match(output, /retains its existing configuration until restarted/);
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.deepEqual(loaded.configuration.composerSlicer, { enabled: false, maxCharacters: 500 });
+  }
+});
+
+test('setcomposerslicer aborts a non-interactive running engine change without --force', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, filePath);
+  const originalContent = readFileSync(filePath, 'utf8');
+
+  const result = await captureComposerSlicer(filePath, ['maxCharacters', '10'], {
+    requestRuntimeStatus: async () => ({ status: 'running', instanceId: 'engine-1' }),
+    isInteractive: () => false,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.errors[0], /Confirmation is required to change Composer Slicer/);
+  assert.match(result.errors[0], /--force/);
+  assert.equal(readFileSync(filePath, 'utf8'), originalContent);
+});
+
+test('setcomposerslicer saves a non-interactive running engine change with --force', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, filePath);
+
+  const result = await captureComposerSlicer(filePath, ['maxCharacters', '10', '--force'], {
+    requestRuntimeStatus: async () => ({ status: 'running', instanceId: 'engine-1' }),
+    isInteractive: () => false,
+  });
+
+  assert.equal(result.exitCode, 0);
+  const output = result.output.join('\n');
+  assert.match(output, /WARNING: Impractical Bot engine is currently running/);
+  assert.match(output, /Continuing because --force was supplied/);
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.deepEqual(loaded.configuration.composerSlicer, { enabled: true, maxCharacters: 10 });
+  }
+});
+
+test('setcomposerslicer saves a stopped engine change without confirmation', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, filePath);
+  let promptCalls = 0;
+
+  const result = await captureComposerSlicer(
+    filePath,
+    ['maxCharacters', '10'],
+    { requestRuntimeStatus: async () => ({ status: 'not-running' }) },
+    async () => {
+      promptCalls += 1;
+      return 'n';
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(promptCalls, 0);
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.deepEqual(loaded.configuration.composerSlicer, { enabled: true, maxCharacters: 10 });
+  }
+});
+
+test('setcomposerslicer status does not request confirmation while running', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, filePath);
+  const originalContent = readFileSync(filePath, 'utf8');
+  let runtimeChecks = 0;
+  let promptCalls = 0;
+
+  const result = await captureComposerSlicer(
+    filePath,
+    ['status'],
+    {
+      requestRuntimeStatus: async () => {
+        runtimeChecks += 1;
+        return { status: 'running', instanceId: 'engine-1' };
+      },
+    },
+    async () => {
+      promptCalls += 1;
+      return 'n';
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(runtimeChecks, 0);
+  assert.equal(promptCalls, 0);
+  assert.match(result.output[0], /Composer Slicer Configuration/);
+  assert.equal(readFileSync(filePath, 'utf8'), originalContent);
+});
+
+test('setcomposerslicer status reports configuration load failures', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  writeFileSync(filePath, '{not json', 'utf8');
+
+  const result = await captureComposerSlicer(filePath, ['status']);
+  assert.equal(result.exitCode, 1);
+  assert.match(result.errors[0], /not valid JSON/);
+  assert.deepEqual(result.output, []);
+});
+
+test('setcomposerslicer keeps the config command working', async context => {
+  const filePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, filePath);
+
+  assert.equal(
+    (await captureComposerSlicer(filePath, ['maxCharacters', '10'])).exitCode,
+    0,
+  );
+  const result = await captureCli(['config'], filePath);
+  assert.equal(result.exitCode, 0);
+  assert.match(result.output[0], /Composer slicer: enabled at 10 characters/);
+  assert.deepEqual(result.errors, []);
+});
+
+test('help lists setcomposerslicer settings', async () => {
+  const result = await captureCli(['--help']);
+
+  assert.equal(result.exitCode, 0);
+  assert.match(result.output[0], /setcomposerslicer\s+Configure Composer Slicer/);
+  assert.match(result.output[0], /setcomposerslicer enabled <true\|false>/);
+  assert.match(result.output[0], /setcomposerslicer maxCharacters <positive-integer>/);
+  assert.match(result.output[0], /setcomposerslicer status/);
+  assert.deepEqual(result.errors, []);
 });
 
 test('help options and no command display usage', async () => {

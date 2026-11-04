@@ -20,6 +20,7 @@ import {
 import { CONVERSATION_METADATA_RETRY_INSTRUCTION } from '../src/components/conversation-context.js';
 import { EMOJI_RETRY_INSTRUCTION } from '../src/components/emoji.js';
 import { IDENTITY_RETRY_INSTRUCTION } from '../src/components/identity-policy.js';
+import { INTERNAL_NARRATION_RETRY_INSTRUCTION } from '../src/components/internal-narration.js';
 import { IDENTITY_AWARENESS_INSTRUCTION_MARKER } from '../src/components/identity-awareness.js';
 import {
   generateReplyWithAntiEchoGuard,
@@ -63,6 +64,7 @@ function messengerMessage(
   sender: string,
   direction: 'INCOMING' | 'OUTGOING' | 'UNKNOWN',
   message: string,
+  replyBatchId?: string,
 ) {
   return {
     id,
@@ -71,6 +73,7 @@ function messengerMessage(
     direction,
     message,
     ariaLabel: null,
+    ...(replyBatchId === undefined ? {} : { replyBatchId }),
   };
 }
 
@@ -227,11 +230,11 @@ test('reply generation sends known-direction messages in order and extracts trim
     fetch: async (input, init) => {
       requestedUrl = String(input);
       requestedOptions = init;
-      return successfulCompletion('  How about 6 PM?  ');
+      return successfulCompletion('  No thanks, I am happy chatting here.  ');
     },
   });
 
-  assert.equal(reply, 'How about 6 PM?');
+  assert.equal(reply, 'No thanks, I am happy chatting here.');
   assert.equal(requestedUrl, 'https://integrate.api.nvidia.com/v1/chat/completions');
   assert.equal(requestedOptions?.method, 'POST');
   assert.deepEqual(requestedOptions?.headers, {
@@ -289,8 +292,11 @@ test('reply generation sends known-direction messages in order and extracts trim
       ),
     },
   ]);
-  assert.match(body.messages[0].content, /CURRENT TRIGGER/);
-  assert.match(body.messages[0].content, /MESSAGE ID: incoming-2/);
+  assert.match(body.messages[0].content, /ACTIVE TURN/);
+  assert.match(body.messages[0].content, /PACKET OPENED BY MESSAGE ID: incoming-2/);
+  assert.match(body.messages[0].content, /RESPONSE TARGET MESSAGE ID: incoming-2/);
+  assert.match(body.messages[0].content, /NEWEST INCOMING MESSAGE ID: incoming-2/);
+  assert.doesNotMatch(body.messages[0].content, /CURRENT TRIGGER/);
   assert.match(body.messages[0].content, /DIRECTION: INCOMING/);
   assert.doesNotMatch(body.messages[0].content, /HISTORY POSITION: outside/);
 });
@@ -620,6 +626,56 @@ test('a metadata-wrapped reply is retried once and replaced with plain text', as
     CONVERSATION_METADATA_RETRY_INSTRUCTION,
   ));
   assert.match(CONVERSATION_METADATA_RETRY_INSTRUCTION, /Do not use emojis/);
+});
+
+test('an internal-narration draft is retried once and replaced with a natural reply', async () => {
+  const bodies: { messages: { role: string; content: string }[] }[] = [];
+  let call = 0;
+
+  const reply = await generateTestReply('nvapi-test-key', [{
+    id: 'incoming-1',
+    timestamp: { original: null, normalized: null, resolved: false },
+    sender: 'Alex',
+    direction: 'INCOMING',
+    message: 'how are you?',
+    ariaLabel: null,
+  }], {
+    fetch: async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as typeof bodies[number]);
+      call += 1;
+      return call === 1
+        ? successfulCompletion('I will answer the trigger message now.')
+        : successfulCompletion('Doing all right, thanks.');
+    },
+  });
+
+  assert.equal(call, 2, 'internal narration is retried exactly once');
+  assert.equal(reply, 'Doing all right, thanks.');
+  assert.ok(bodies[1].messages[0].content.endsWith(
+    INTERNAL_NARRATION_RETRY_INSTRUCTION,
+  ));
+});
+
+test('a persistently internal-narration reply is withheld instead of sent', async () => {
+  let call = 0;
+
+  await assert.rejects(
+    generateTestReply('nvapi-test-key', [{
+      id: 'incoming-1',
+      timestamp: { original: null, normalized: null, resolved: false },
+      sender: 'Alex',
+      direction: 'INCOMING',
+      message: 'how are you?',
+      ariaLabel: null,
+    }], {
+      fetch: async () => {
+        call += 1;
+        return successfulCompletion('The selected trigger is message id incoming-1.');
+      },
+    }),
+    /repeatedly returned a reply that discussed internal generation details/,
+  );
+  assert.equal(call, 2, 'there is no unbounded internal-narration retry loop');
 });
 
 test('a persistently metadata-wrapped reply is withheld instead of sent', async () => {
@@ -1183,8 +1239,8 @@ test('reply generation preserves the literal trigger and attributes prior bot ou
   assert.equal(
     body.messages.filter((message: { content: string }) =>
       message.content.includes(literalRequest)).length,
-    2,
-    'the literal trigger appears in its message and the trigger instruction',
+    1,
+    'the literal trigger appears in its message without being duplicated in the active-turn instruction',
   );
 });
 
@@ -1967,4 +2023,121 @@ test('a sanitized roster puppet does not block the configured identity', async (
 
   assert.equal(reply, 'I am Yukinon.');
   assert.equal(calls, 1);
+});
+
+test('assistant history counts logical reply batches rather than individual chunks', async () => {
+  let body: { messages: { role: string; content: string }[] } | undefined;
+  const messages = [];
+  for (let batch = 1; batch <= 4; batch += 1) {
+    messages.push(
+      messengerMessage(`in-${batch}`, 'Alex', 'INCOMING', `question ${batch}`),
+      messengerMessage(`out-${batch}-a`, 'You', 'OUTGOING', `reply ${batch} part one`, `batch-${batch}`),
+      messengerMessage(`out-${batch}-b`, 'You', 'OUTGOING', `reply ${batch} part two`, `batch-${batch}`),
+    );
+  }
+  messages.push(messengerMessage('in-latest', 'Blair', 'INCOMING', 'new question'));
+
+  await generateNvidiaReply('nvapi-test-key', messages, {
+    systemInstruction: 'Production instruction.',
+    identity: { name: 'Yukinon' },
+    fetch: async (_input, init) => {
+      body = JSON.parse(String(init?.body)) as typeof body;
+      return successfulCompletion('Answer.');
+    },
+  });
+
+  const assistantReplies = (body?.messages.slice(1) ?? [])
+    .filter(message => message.role === 'assistant')
+    .map(message => message.content);
+  assert.deepEqual(assistantReplies, [
+    'reply 2 part one',
+    'reply 2 part two',
+    'reply 3 part one',
+    'reply 3 part two',
+    'reply 4 part one',
+    'reply 4 part two',
+  ]);
+});
+
+test('the selected response target keeps later messages in the request without displacing the target', async () => {
+  let body: { messages: { role: string; content: string }[] } | undefined;
+  const trigger = messengerMessage('in-1', 'Alex', 'INCOMING', '@Bot first question');
+  const responseTarget = messengerMessage('in-2', 'Alex', 'INCOMING', 'it is stale, ask me who I am');
+  const laterSideComment = messengerMessage('in-3', 'Blair', 'INCOMING', 'unrelated side comment');
+
+  await generateNvidiaReply('nvapi-test-key', [
+    trigger,
+    responseTarget,
+    laterSideComment,
+  ], {
+    systemInstruction: 'Production instruction.',
+    identity: { name: 'Yukinon' },
+    trigger,
+    responseTarget,
+    fetch: async (_input, init) => {
+      body = JSON.parse(String(init?.body)) as typeof body;
+      return successfulCompletion('You are Alex.');
+    },
+  });
+
+  const turns = body?.messages.slice(1) ?? [];
+  assert.equal(turns.at(-1)?.role, 'user');
+  assert.match(turns.at(-1)?.content ?? '', /id="in-3"/u);
+  assert.match(turns.at(-1)?.content ?? '', /unrelated side comment/u);
+  assert.equal(
+    turns.filter(turn => turn.content.includes('trigger=true')).length,
+    1,
+    'only the selected response target is marked as the active turn',
+  );
+  const targetTurn = turns.find(turn => turn.content.includes('id="in-2"'));
+  assert.match(targetTurn?.content ?? '', /trigger=true/u);
+  assert.equal(
+    turns.findIndex(turn => turn.content.includes('id="in-2"')),
+    turns.length - 2,
+    'the selected response target remains immediately before the newest incoming message',
+  );
+  const systemInstruction = body?.messages[0].content ?? '';
+  assert.match(systemInstruction, /PACKET OPENED BY MESSAGE ID: in-1/u);
+  assert.match(systemInstruction, /RESPONSE TARGET MESSAGE ID: in-2/u);
+  assert.match(systemInstruction, /NEWEST INCOMING MESSAGE ID: in-3/u);
+});
+
+test('request diagnostics log the resolved trigger, bounded turn previews, and history restoration', async () => {
+  const logs: string[] = [];
+  const originalLog = console.log;
+  console.log = (...values: unknown[]) => {
+    logs.push(values.map(String).join(' '));
+  };
+
+  try {
+    await generateNvidiaReply('nvapi-test-key', [
+      messengerMessage('in-1', 'Alex', 'INCOMING', 'what did we decide?'),
+      messengerMessage('out-1', 'You', 'OUTGOING', 'We decided on the blue plan.'),
+      messengerMessage('in-2', 'Alex', 'INCOMING', 'remind me again?'),
+    ], {
+      systemInstruction: 'Production instruction.',
+      identity: { name: 'Yukinon' },
+      requestDiagnostics: {
+        packetId: 'packet-007',
+        packetType: 'mention',
+        restoredOutgoingMessageIds: ['out-1'],
+        mergedPendingMessageIds: ['pending-outgoing-1'],
+      },
+      fetch: async () => successfulCompletion('The blue plan.'),
+    });
+  } finally {
+    console.log = originalLog;
+  }
+
+  const summary = logs.find(line => line.startsWith('[request] packet='));
+  assert.ok(summary);
+  assert.match(summary ?? '', /packet=packet-007 type=mention/u);
+  assert.match(summary ?? '', /trigger=in-2 triggerInHistory=true/u);
+  assert.match(summary ?? '', /incoming=2 assistant=1/u);
+  assert.match(summary ?? '', /restoredOutgoing=out-1/u);
+  assert.match(summary ?? '', /mergedPending=pending-outgoing-1/u);
+  const turnPreviews = logs.filter(line => line.startsWith('[request] role='));
+  assert.equal(turnPreviews.length, 3);
+  assert.ok(turnPreviews.every(line => line.length < 220));
+  assert.ok(turnPreviews.some(line => line.includes('preview="what did we decide?"')));
 });

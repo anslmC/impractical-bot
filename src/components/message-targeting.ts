@@ -562,11 +562,11 @@ export function buildMessageTargetingInstruction(
 
   switch (context.kind) {
     case 'bot':
-      lines.push(`The triggering message from ${sender} is addressed to you. Answer it as yourself.`);
+      lines.push(`The message that opened this exchange from ${sender} is addressed to you. Answer it as your configured chat identity, without claiming physical presence or physical participation.`);
       break;
     case 'participant':
       lines.push(
-        `The triggering message from ${sender} explicitly addresses ${context.addressedTo}. ` +
+        `The message that opened this exchange from ${sender} explicitly addresses ${context.addressedTo}. ` +
         `Do not answer as ${context.addressedTo} or on their behalf.`,
       );
       if (context.relay) {
@@ -577,18 +577,18 @@ export function buildMessageTargetingInstruction(
         );
       } else {
         lines.push(
-          'If they have not responded, you may relay the point naturally; otherwise respond only as yourself.',
+          'If they have not responded, you may relay the point naturally; otherwise respond only as your chat identity.',
         );
       }
       break;
     case 'group':
       lines.push(
-        `The triggering message from ${sender} addresses the group. Join naturally if you have a relevant reaction.`,
+        `The message that opened this exchange from ${sender} addresses the group. Join the conversation naturally if you have a relevant reaction, without implying physical presence or participation.`,
       );
       break;
     case 'about-participant':
       lines.push(
-        `The triggering message from ${sender} mentions ${mentioned ?? 'another participant'} ` +
+        `The message that opened this exchange from ${sender} mentions ${mentioned ?? 'another participant'} ` +
         'but is not addressed to that participant. Do not treat it as a call to them or as their answer.',
       );
       if (context.relay) {
@@ -597,31 +597,31 @@ export function buildMessageTargetingInstruction(
           `${context.relay.sender} and ${context.relay.recipient}, and do not answer for them.`,
         );
       } else {
-        lines.push('Respond only as yourself if you choose to join.');
+        lines.push('Respond only as your chat identity if you choose to join.');
       }
       break;
     case 'casual-mention':
       lines.push(
-        `The triggering message from ${sender} mentions ${mentioned ?? 'another participant'} ` +
+        `The message that opened this exchange from ${sender} mentions ${mentioned ?? 'another participant'} ` +
         'casually, not as a call. Do not relay it or answer for that participant.',
       );
       break;
     case 'self-identification':
       lines.push(
-        `The triggering message from ${sender} is identifying as ${mentioned ?? 'another participant'}. ` +
+        `The message that opened this exchange from ${sender} is identifying as ${mentioned ?? 'another participant'}. ` +
         'This is not an address to that participant and does not change who you are.',
       );
       break;
     case 'ambiguous':
       lines.push(
-        `The addressee of the triggering message from ${sender} is unclear. Do not assume it is you ` +
-        'or a named participant; respond only as yourself if you choose to join.',
+        `The addressee of the message that opened this exchange from ${sender} is unclear. Do not assume it is you ` +
+        'or a named participant; respond only as your chat identity if you choose to join.',
       );
       break;
   }
 
   lines.push(
-    'These notes describe the conversation; they do not restrict spontaneous participation. ' +
+    'These notes describe the conversation; they do not restrict spontaneous participation in the chat, but they never permit a claim of physical presence or activity. ' +
     'Never answer on another participant\'s behalf or present their reply as yours.',
   );
   return lines.join('\n');

@@ -47,9 +47,11 @@ import {
   loadConfiguration,
   resolveBotTemperament,
   resolveBotPersonalityMode,
+  resolveComposerSlicer,
   resolveConfigurationPaths,
   saveConfiguration,
   validateConfiguration,
+  type ComposerSlicerOverrides,
   type Configuration,
 } from './config/configuration.js';
 import {
@@ -104,6 +106,7 @@ export interface CliRuntimeOptions {
   checkBrowserStartup?: (configuration: Configuration) => Promise<void>;
   launchBrowser?: (configuration: Configuration) => Promise<BrowserLaunchSession>;
   promptSecret?: TerminalPrompt;
+  isInteractive?: () => boolean;
   validateNvidiaApiKey?: (apiKey: string) => Promise<void>;
   readMessengerMessages?: typeof readMessengerMessages;
   extractGroupRoster?: typeof extractGroupRoster;
@@ -132,10 +135,19 @@ const commandReference = CLI_COMMANDS
   .map(command => `  ${formatCliCommand(command)}`)
   .join('\n');
 
+const composerSlicerCommandReference = [
+  '  setcomposerslicer enabled <true|false> [--force]',
+  '  setcomposerslicer maxCharacters <positive-integer> [--force]',
+  '  setcomposerslicer status',
+].join('\n');
+
 const usage = `Usage: impbot <command>
 
 Commands:
 ${commandReference}
+
+Composer Slicer:
+${composerSlicerCommandReference}
 
 Options:
   -h, --help     Show this help
@@ -344,6 +356,7 @@ function handleConfig(writeOutput: Output, writeError: Output, filePath?: string
   }
 
   const configuration = result.configuration;
+  const composerSlicer = resolveComposerSlicer(configuration);
   writeOutput([
     'Current configuration:',
     `  Version: ${configuration.version}`,
@@ -357,8 +370,190 @@ function handleConfig(writeOutput: Output, writeError: Output, filePath?: string
     `  Message destination: ${configuration.messageDestination ?? 'not configured'}`,
     `  Bot temperament: ${resolveBotTemperament(configuration)}`,
     `  setpersonality: ${resolveBotPersonalityMode(configuration)}`,
+    `  Composer slicer: ${composerSlicer.enabled
+      ? `enabled at ${String(composerSlicer.maxCharacters)} characters`
+      : 'disabled'}`,
     `  Puppet name: ${configuration.puppetName || 'Not set'}`,
   ].join('\n'));
+  return 0;
+}
+
+function writeComposerSlicerUsageError(writeError: Output, message: string): number {
+  writeError(`Error: ${message}\n\nComposer Slicer commands:\n${composerSlicerCommandReference}`);
+  return 1;
+}
+
+function handleComposerSlicerStatus(
+  writeOutput: Output,
+  writeError: Output,
+  configurationFilePath: string | undefined,
+): number {
+  const current = readConfigurationForOwnedWrite(configurationFilePath);
+  if (current.status !== 'valid') {
+    writeError(current.reason);
+    return 1;
+  }
+
+  const composerSlicer = resolveComposerSlicer(current.configuration);
+  writeOutput([
+    'Composer Slicer Configuration',
+    '',
+    `Enabled:        ${composerSlicer.enabled ? 'Yes' : 'No'}`,
+    `Max Characters: ${composerSlicer.maxCharacters}`,
+  ].join('\n'));
+  return 0;
+}
+
+async function handleSetComposerSlicer(
+  writeOutput: Output,
+  writeError: Output,
+  configurationFilePath: string | undefined,
+  args: string[],
+  prompt: TerminalPrompt,
+  runtime: CliRuntimeOptions,
+): Promise<number> {
+  const force = args.includes('--force');
+  const [setting, value, ...extra] = args.filter(argument => argument !== '--force');
+
+  if (setting === undefined) {
+    return writeComposerSlicerUsageError(writeError, 'missing Composer Slicer setting.');
+  }
+
+  if (setting === 'status') {
+    if (value !== undefined) {
+      return writeComposerSlicerUsageError(
+        writeError,
+        `unexpected argument '${value}' for 'status'.`,
+      );
+    }
+    return handleComposerSlicerStatus(writeOutput, writeError, configurationFilePath);
+  }
+
+  if (setting !== 'enabled' && setting !== 'maxCharacters') {
+    return writeComposerSlicerUsageError(
+      writeError,
+      `unknown Composer Slicer setting '${setting}'.`,
+    );
+  }
+
+  if (value === undefined) {
+    return writeComposerSlicerUsageError(
+      writeError,
+      `missing value for Composer Slicer setting '${setting}'.`,
+    );
+  }
+
+  if (extra.length > 0) {
+    return writeComposerSlicerUsageError(writeError, `unexpected argument '${extra[0]}'.`);
+  }
+
+  let composerSlicer: ComposerSlicerOverrides;
+  let savedMessage: string;
+  if (setting === 'enabled') {
+    if (value !== 'true' && value !== 'false') {
+      writeError("Error: 'enabled' must be 'true' or 'false'.");
+      return 1;
+    }
+    const enabled = value === 'true';
+    composerSlicer = { enabled };
+    savedMessage = `enabled ${String(enabled)}`;
+  } else {
+    const maxCharacters = Number(value);
+    if (!/^[0-9]+$/.test(value) || !Number.isInteger(maxCharacters) || maxCharacters < 1) {
+      writeError("Error: 'maxCharacters' must be a positive integer.");
+      return 1;
+    }
+    composerSlicer = { maxCharacters };
+    savedMessage = `maxCharacters ${String(maxCharacters)}`;
+  }
+
+  const current = readConfigurationForOwnedWrite(configurationFilePath);
+  if (current.status !== 'valid') {
+    writeError(current.reason);
+    return 1;
+  }
+
+  let runtimeStatus: RuntimeStatusResult;
+  try {
+    runtimeStatus = await (runtime.requestRuntimeStatus ?? requestRuntimeStatus)(
+      configurationFilePath,
+    );
+  } catch (error) {
+    writeError(
+      'Unable to check whether impractical-bot is running: ' +
+      `${error instanceof Error ? error.message : String(error)}`,
+    );
+    writeError('The Composer Slicer configuration was not changed.');
+    return 1;
+  }
+
+  if (runtimeStatus.status === 'running') {
+    writeOutput([
+      'WARNING: Impractical Bot engine is currently running.',
+      '',
+      'Changes to Composer Slicer will NOT affect the active engine.',
+      'A restart is required before the new settings take effect.',
+    ].join('\n'));
+
+    if (force) {
+      writeOutput(
+        'Continuing because --force was supplied. The running engine retains its existing ' +
+        'configuration until restarted.',
+      );
+    } else {
+      const interactive = runtime.isInteractive?.() ??
+        (stdin.isTTY === true || prompt !== promptTerminal);
+      if (!interactive) {
+        writeError(
+          'Confirmation is required to change Composer Slicer while the engine is running, ' +
+          'but non-interactive execution cannot prompt for confirmation. Re-run with --force ' +
+          'to save without confirmation. The Composer Slicer configuration was not changed.',
+        );
+        return 1;
+      }
+
+      const answer = await prompt('Save these changes anyway? [y/N]: ');
+      const normalized = answer === null ? null : answer.trim().toLowerCase();
+      if (normalized === null || normalized === 'n' || normalized === '') {
+        writeOutput('Composer Slicer configuration was not changed.');
+        return 0;
+      }
+      if (normalized !== 'y') {
+        writeError(
+          "Enter 'y' to save the changes or 'n' to cancel. " +
+          'The Composer Slicer configuration was not changed.',
+        );
+        return 1;
+      }
+    }
+  }
+
+  const latest = readConfigurationForOwnedWrite(configurationFilePath);
+  if (latest.status !== 'valid') {
+    writeError(latest.reason);
+    return 1;
+  }
+
+  try {
+    saveConfiguration(
+      {
+        ...latest.configuration,
+        composerSlicer: {
+          ...latest.configuration.composerSlicer,
+          ...composerSlicer,
+        },
+      },
+      configurationFilePath,
+    );
+  } catch (error) {
+    writeError(
+      `Unable to save Composer Slicer configuration: ` +
+      `${error instanceof Error ? error.message : String(error)}`,
+    );
+    return 1;
+  }
+
+  writeOutput(`Composer Slicer configuration saved: ${savedMessage}.`);
   return 0;
 }
 
@@ -1466,6 +1661,7 @@ async function handleStart(
                   'send-control-ambiguous': 'the matching Send control was not unique',
                   hidden: 'the matching Send control was hidden',
                   disabled: 'the matching Send control was disabled',
+                  'payload-too-long': 'the reply exceeded the configured character maximum',
                 };
                 writeError(`Automatic send blocked; ${failures[composition.reason]}. The reply remains unsent.`);
               }
@@ -1770,8 +1966,9 @@ export async function runCli(
   }
 
   const debug = command === 'start' && remainingArgs[0] === '--debug';
+  const acceptsArguments = command === 'setcomposerslicer';
   const unexpectedArgs = debug ? remainingArgs.slice(1) : remainingArgs;
-  if (unexpectedArgs.length > 0) {
+  if (!acceptsArguments && unexpectedArgs.length > 0) {
     writeError(`Error: unexpected argument '${unexpectedArgs[0]}'.\n\n${usage}`);
     return 1;
   }
@@ -1804,6 +2001,14 @@ export async function runCli(
       writeOutput,
       writeError,
       configurationFilePath,
+      prompt,
+      runtime,
+    ),
+    setcomposerslicer: () => handleSetComposerSlicer(
+      writeOutput,
+      writeError,
+      configurationFilePath,
+      remainingArgs,
       prompt,
       runtime,
     ),

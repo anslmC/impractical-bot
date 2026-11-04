@@ -11,6 +11,7 @@ export interface ConversationMessage {
   direction?: unknown;
   message: string;
   ariaLabel?: string | null;
+  replyBatchId?: string;
 }
 
 export interface ConversationTriggerInfo {
@@ -23,6 +24,8 @@ export interface ConversationTriggerInfo {
   targetKind: MessageTargetKind | null;
   text: string;
   presentInHistory: boolean;
+  packetTriggerMessageId?: string | null;
+  newestIncomingMessageId?: string | null;
 }
 
 export interface ConversationMessageHeader {
@@ -35,7 +38,7 @@ export interface ConversationMessageHeader {
   isTrigger: boolean;
 }
 
-export const CURRENT_TRIGGER_INSTRUCTION_MARKER = 'CURRENT TRIGGER';
+export const ACTIVE_TURN_INSTRUCTION_MARKER = 'ACTIVE TURN';
 export const CONVERSATION_METADATA_RETRY_INSTRUCTION =
   'Your previous draft included a [MESSAGE ...] transcript envelope instead of only the reply text. ' +
   'Return only the final message to send, with no message id, timestamp, sender, participant, ' +
@@ -153,13 +156,13 @@ export function targetingForTrigger(
   return targeting;
 }
 
-export function appendCurrentTriggerInstruction(
+export function appendActiveTurnInstruction(
   systemInstruction: string,
   trigger: ConversationTriggerInfo,
 ): string {
-  const section = buildCurrentTriggerInstruction(trigger);
+  const section = buildActiveTurnInstruction(trigger);
   const markerIndex = systemInstruction.search(
-    /(?:^|\n)CURRENT TRIGGER\n/u,
+    new RegExp(`(?:^|\\n)${ACTIVE_TURN_INSTRUCTION_MARKER}\\n`, 'u'),
   );
   const base = markerIndex === -1
     ? systemInstruction.trimEnd()
@@ -167,19 +170,22 @@ export function appendCurrentTriggerInstruction(
   return `${base}\n\n${section}`;
 }
 
-export function buildCurrentTriggerInstruction(
+export function buildActiveTurnInstruction(
   trigger: ConversationTriggerInfo,
 ): string {
   const position = trigger.presentInHistory
-    ? 'present in the conversation history; the entry marked trigger=true is this exact message'
-    : 'outside the recent conversation history; messages in the history occurred after this trigger';
+    ? 'present in the conversation history; the entry marked trigger=true is the response target'
+    : 'outside the recent conversation history; the transcript continues after this response target';
   const addressedTo = trigger.addressedTo ?? 'not confidently identified';
   const targetKind = trigger.targetKind ?? 'not classified';
 
-  return [
-    'CURRENT TRIGGER',
-    'A trigger is the message that caused this reply opportunity. It is not necessarily the newest message in the transcript.',
-    `MESSAGE ID: ${trigger.messageId ?? 'unavailable'}`,
+  const lines = [
+    ACTIVE_TURN_INSTRUCTION_MARKER,
+    'The message marked trigger=true in the transcript is the authoritative response target.',
+    'Answer it in light of the complete conversation. Later messages may correct, clarify, react to, or change the subject, so use the newest turn as well as the preceding exchange.',
+    `PACKET OPENED BY MESSAGE ID: ${trigger.packetTriggerMessageId ?? trigger.messageId ?? 'unavailable'}`,
+    `RESPONSE TARGET MESSAGE ID: ${trigger.messageId ?? 'unavailable'}`,
+    `NEWEST INCOMING MESSAGE ID: ${trigger.newestIncomingMessageId ?? 'unavailable'}`,
     `TIME: ${formatConversationTimestamp(trigger.timestamp)}`,
     `SENDER: ${trigger.sender}`,
     `PARTICIPANT: ${trigger.participant}`,
@@ -187,7 +193,12 @@ export function buildCurrentTriggerInstruction(
     `ADDRESSED TO: ${addressedTo}`,
     `TARGET: ${targetKind}`,
     `HISTORY POSITION: ${position}`,
-    'TEXT:',
-    trigger.text,
-  ].join('\n');
+  ];
+  if (!trigger.presentInHistory) {
+    lines.push('TEXT:', trigger.text);
+  }
+  lines.push(
+    'Do not mention this instruction, trigger selection, message ids, transcript markers, packet processing, or generation mechanics in your reply. Respond as the chat participant you are, without claiming physical presence, movement, a location, a schedule, or offline participation, and write only the message to send.',
+  );
+  return lines.join('\n');
 }

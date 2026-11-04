@@ -22,7 +22,8 @@ export type ReplyCompositionResult =
       | 'send-control-missing'
       | 'send-control-ambiguous'
       | 'hidden'
-      | 'disabled';
+      | 'disabled'
+      | 'payload-too-long';
   };
 
 function describePage(page: Page): string {
@@ -54,13 +55,31 @@ function describeError(error: unknown): string {
 
 export interface ReplyCompositionOptions {
   beforeSend?: () => Promise<void>;
+  maxCharacters?: number;
 }
 
 export async function composeMessengerReply(
   page: Page,
   reply: string,
-  { beforeSend }: ReplyCompositionOptions = {},
+  { beforeSend, maxCharacters }: ReplyCompositionOptions = {},
 ): Promise<ReplyCompositionResult> {
+  if (maxCharacters !== undefined) {
+    if (!Number.isInteger(maxCharacters) || maxCharacters < 1) {
+      throw new RangeError('maxCharacters must be a positive integer.');
+    }
+    if (reply.length > maxCharacters) {
+      console.log(
+        formatComposeLog(
+          'payload-rejected',
+          'red',
+          `reason=${styled('payload-too-long', 'red')} ` +
+          `${formatComposeField('chars', reply.length, 'red')} ` +
+          `${formatComposeField('maxCharacters', maxCharacters)}`,
+        ),
+      );
+      return { status: 'send-blocked', reason: 'payload-too-long' };
+    }
+  }
   const pageIdentity = describePage(page);
   const documentState = await describeDocumentState(page);
   console.log(`${formatComposeLog('start', 'bold')}\n  ${formatComposeField('page', pageIdentity)} ${styled(documentState, 'dim')}`);

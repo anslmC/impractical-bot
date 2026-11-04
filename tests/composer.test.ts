@@ -165,3 +165,40 @@ test('automatic sending requires one Thread composer region before looking up it
     assert.equal(mock.sendClicks, 0);
   }
 });
+
+test('an oversized payload is rejected before the composer is filled', async () => {
+  const oversized = createPage();
+  const rejected = await composeMessengerReply(oversized.page, 'x'.repeat(11), {
+    maxCharacters: 10,
+  });
+
+  assert.deepEqual(rejected, { status: 'send-blocked', reason: 'payload-too-long' });
+  assert.equal(oversized.filledText, undefined);
+  assert.equal(oversized.sendClicks, 0);
+
+  const exact = createPage();
+  assert.deepEqual(
+    await composeMessengerReply(exact.page, 'x'.repeat(10), { maxCharacters: 10 }),
+    { status: 'sent' },
+  );
+  assert.equal(exact.filledText, 'x'.repeat(10));
+  assert.equal(exact.sendClicks, 1);
+
+  const unlimited = createPage();
+  assert.deepEqual(
+    await composeMessengerReply(unlimited.page, 'x'.repeat(500)),
+    { status: 'sent' },
+  );
+});
+
+test('a malformed delivery maximum is rejected', async () => {
+  const mock = createPage();
+  for (const maxCharacters of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    await assert.rejects(
+      composeMessengerReply(mock.page, 'Draft', { maxCharacters }),
+      RangeError,
+    );
+  }
+  assert.equal(mock.filledText, undefined);
+  assert.equal(mock.sendClicks, 0);
+});

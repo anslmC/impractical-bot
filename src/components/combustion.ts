@@ -1,5 +1,6 @@
 import type { ConsoleMessage, Page } from 'playwright';
 import {
+  NvidiaExistenceError,
   NvidiaIdentityError,
   generateNvidiaReply,
   type ConversationDiagnostic,
@@ -14,25 +15,34 @@ import {
 import {
   ANTI_ECHO_RETRY_INSTRUCTION,
   AntiEchoSuppressedError,
+  SELF_REPETITION_RETRY_INSTRUCTION,
+  collectRecentAssistantMessages,
   findLatestIncomingMessage,
   generateReplyWithAntiEchoGuard,
   isEchoReply,
+  isSelfRepetitionReply,
+  type AntiEchoRetryReason,
 } from './anti-echo.js';
 import type { BackreadMessage } from './backread.js';
 import {
   composeMessengerReply,
   type ReplyCompositionResult,
 } from './composer.js';
+import { sliceComposerMessage } from './composer-slicer.js';
 import type { Configuration } from '../config/configuration.js';
 import {
   getBotTemperamentCooldownMs,
   getBotTemperamentYesProbability,
   resolveBotTemperament,
   resolveBotPersonalityMode,
+  resolveComposerSlicer,
   type BotTemperament,
 } from '../config/configuration.js';
 import type { ContextMessage, ContextStore } from './context-store.js';
-import { extractConversationMessageBody } from './conversation-context.js';
+import {
+  extractConversationMessageBody,
+  normalizeConversationSender,
+} from './conversation-context.js';
 import {
   extractMessageDetails,
   type MessageDetails,
@@ -53,6 +63,10 @@ import { PacketStaleError, createPacketProcessor } from './packet-processor.js';
 import { createMentionMatcher } from './mention-matcher.js';
 import { createBoundedIdSet } from './bounded-id-set.js';
 import { validateReplyIdentity } from './identity-policy.js';
+import {
+  isExplicitFictionContext,
+  validateReplyExistence,
+} from './existence-policy.js';
 import {
   classifyMessageTargeting,
   isRelayStillNeeded,
@@ -84,6 +98,7 @@ const WAKER_MESSAGE_SELECTOR = '[data-message-id]';
 const MESSAGE_LIMIT = 20;
 const CONTEXT_STORE_CAPACITY = 60;
 const POLL_INTERVAL_MS = 1500;
+const COMPOSER_CHUNK_DELAY_MS = 900;
 const RNG_ROLL_INTERVAL_MS = 7000;
 const RNG_CONTEXT_MESSAGE_LIMIT = 25;
 const PACKET_CONTEXT_MESSAGE_LIMIT = 20;
@@ -108,7 +123,12 @@ function debugBorder(): string {
   return styled('='.repeat(80), 'dim');
 }
 
-type EngineMessage = MessageDetails & { mention?: boolean };
+type EngineMessage = MessageDetails & {
+  mention?: boolean;
+  replyAfterMessageId?: string;
+  replyBatchId?: string;
+  replySentAt?: number;
+};
 type PacketTriggerType = 'rng' | 'mention' | 'unknown';
 type ScheduledPacket = (PacketBuilderPacket | RngPacket) & {
   mentionMessages?: PacketBuilderMessage[];
@@ -122,12 +142,22 @@ interface PendingOutgoingReply extends ContextMessage {
   direction: 'OUTGOING';
   afterMessageId: string | null;
   createdAt: number;
+  replyBatchId?: string;
+}
+
+interface GenerationMessage extends PacketBuilderMessage {
+  replyAfterMessageId?: string;
+  replyBatchId?: string;
+  replySentAt?: number;
 }
 
 interface GenerationContext {
   messages: PacketBuilderMessage[];
   trigger: PacketBuilderMessage | null;
+  targetingTrigger: PacketBuilderMessage | null;
   targetingMessages: PacketBuilderMessage[];
+  restoredOutgoingMessageIds: string[];
+  mergedPendingMessageIds: string[];
 }
 
 interface PacketTiming {
@@ -535,6 +565,7 @@ export async function startCombustion({
   let recomposeSystemInstruction = (): void => {};
   let observerAttached = false;
   let stopRequested = false;
+  let interChunkDelayCancel: (() => void) | undefined;
   let loadListenerAttached = false;
   let destinationChangeInProgress = false;
   let pendingDestination: string | null = null;
@@ -573,7 +604,6 @@ export async function startCombustion({
   const isBotAuthoredMessage = (message: {
     sender?: unknown;
     direction?: unknown;
-    [key: string]: unknown;
   }): boolean => {
     if (message.direction === 'OUTGOING') {
       return true;
@@ -619,9 +649,20 @@ export async function startCombustion({
     }
   };
 
-  const recordPendingOutgoingReply = (message: string): void => {
+  const recordPendingOutgoingReply = (
+    message: string,
+    replyBatchId?: string,
+  ): void => {
     const trimmedMessage = extractConversationMessageBody(message).text.trim();
     if (!trimmedMessage) {
+      return;
+    }
+    const existenceResult = validateReplyExistence(trimmedMessage, { historical: true });
+    if (!existenceResult.valid) {
+      console.log(
+        `${styled('[existence]', 'yellow')} packet=${replyBatchId ?? 'unknown'} ` +
+        `stage=pending-outgoing reason=${existenceResult.reason} action=withheld`,
+      );
       return;
     }
     prunePendingOutgoingReplies();
@@ -632,6 +673,7 @@ export async function startCombustion({
       direction: 'OUTGOING',
       afterMessageId: contextStore.getRecent(1)[0]?.messageId ?? null,
       createdAt: Date.now(),
+      ...(replyBatchId ? { replyBatchId } : {}),
     });
     nextPendingOutgoingReplyId += 1;
     while (pendingOutgoingReplies.length > MAX_PENDING_OUTGOING_REPLIES) {
@@ -640,7 +682,7 @@ export async function startCombustion({
   };
 
   const reconcilePendingOutgoingReplies = (
-    messages: readonly { message: string; sender?: unknown; direction?: unknown }[],
+    messages: readonly EngineMessage[],
   ): void => {
     prunePendingOutgoingReplies();
     for (const message of messages) {
@@ -651,8 +693,18 @@ export async function startCombustion({
       const pendingIndex = pendingOutgoingReplies.findIndex(
         pending => normalizeReplyText(pending.message) === comparable,
       );
-      if (pendingIndex !== -1) {
-        pendingOutgoingReplies.splice(pendingIndex, 1);
+      if (pendingIndex === -1) {
+        continue;
+      }
+      const [pending] = pendingOutgoingReplies.splice(pendingIndex, 1);
+      if (message.replyAfterMessageId === undefined && pending.afterMessageId) {
+        message.replyAfterMessageId = pending.afterMessageId;
+      }
+      if (message.replyBatchId === undefined && pending.replyBatchId) {
+        message.replyBatchId = pending.replyBatchId;
+      }
+      if (message.replySentAt === undefined) {
+        message.replySentAt = pending.createdAt;
       }
     }
   };
@@ -672,9 +724,10 @@ export async function startCombustion({
   const mergePendingOutgoingReplies = (
     context: readonly ContextMessage[],
     pendingReplies: readonly PendingOutgoingReply[],
-  ): ContextMessage[] => {
+    missingAnchorIndex = context.length,
+  ): { messages: ContextMessage[]; mergedPendingMessageIds: string[] } => {
     if (pendingReplies.length === 0) {
-      return [...context];
+      return { messages: [...context], mergedPendingMessageIds: [] };
     }
     const result = [...context];
     const outgoingTexts = new Set(
@@ -682,10 +735,24 @@ export async function startCombustion({
         .filter(message => isBotAuthoredMessage(message))
         .map(message => normalizeReplyText(message.message)),
     );
+    const knownIds = new Set(result.map(message => message.messageId));
     const pendingIds = new Set<string>();
+    const mergedPendingMessageIds: string[] = [];
+    let fallbackOffset = 0;
     for (const pending of pendingReplies) {
+      if (knownIds.has(pending.messageId)) {
+        continue;
+      }
       const pendingText = extractConversationMessageBody(pending.message).text;
       if (!pendingText) {
+        continue;
+      }
+      const pendingExistence = validateReplyExistence(pendingText, { historical: true });
+      if (!pendingExistence.valid) {
+        console.log(
+          `${styled('[existence]', 'yellow')} id=${pending.messageId} ` +
+          `stage=pending-outgoing reason=${pendingExistence.reason} action=withheld`,
+        );
         continue;
       }
       const comparable = normalizeReplyText(pendingText);
@@ -700,24 +767,152 @@ export async function startCombustion({
           message => message.messageId === pending.afterMessageId,
         );
         if (anchorIndex === -1) {
-          continue;
-        }
-        insertionIndex = anchorIndex + 1;
-        while (insertionIndex < result.length &&
-               pendingIds.has(result[insertionIndex].messageId)) {
-          insertionIndex += 1;
+          insertionIndex = Math.min(
+            Math.max(0, missingAnchorIndex) + fallbackOffset,
+            result.length,
+          );
+          fallbackOffset += 1;
+        } else {
+          insertionIndex = anchorIndex + 1;
+          while (insertionIndex < result.length &&
+                 pendingIds.has(result[insertionIndex].messageId)) {
+            insertionIndex += 1;
+          }
         }
       }
-      outgoingTexts.add(comparable);
-      pendingIds.add(pending.messageId);
-      result.splice(insertionIndex, 0, {
+      const mergedMessage: ContextMessage = {
         messageId: pending.messageId,
         message: pendingText,
         sender: pending.sender,
         direction: pending.direction,
-      });
+        replySentAt: pending.createdAt,
+        ...(pending.afterMessageId === null
+          ? {}
+          : { replyAfterMessageId: pending.afterMessageId }),
+        ...(pending.replyBatchId ? { replyBatchId: pending.replyBatchId } : {}),
+      };
+      outgoingTexts.add(comparable);
+      pendingIds.add(pending.messageId);
+      knownIds.add(pending.messageId);
+      mergedPendingMessageIds.push(pending.messageId);
+      result.splice(insertionIndex, 0, mergedMessage);
     }
-    return result;
+    return { messages: result, mergedPendingMessageIds };
+  };
+
+  const restoreLateOutgoingMessages = (
+    messages: readonly ContextMessage[],
+    targetMessageId: string,
+  ): {
+    messages: ContextMessage[];
+    targetIndex: number;
+    restoredOutgoingMessageIds: string[];
+  } => {
+    let targetIndex = messages.findIndex(
+      message => message.messageId === targetMessageId,
+    );
+    if (targetIndex === -1 || targetIndex === messages.length - 1) {
+      return {
+        messages: [...messages],
+        targetIndex,
+        restoredOutgoingMessageIds: [],
+      };
+    }
+
+    const relocated = messages
+      .map((message, index) => ({ message, index }))
+      .filter(({ message, index }) => {
+        if (index <= targetIndex || !isBotAuthoredMessage(message)) {
+          return false;
+        }
+        const metadata = message as GenerationMessage;
+        if (!metadata.replyAfterMessageId) {
+          return false;
+        }
+        const anchorIndex = messages.findIndex(
+          candidate => candidate.messageId === metadata.replyAfterMessageId,
+        );
+        return anchorIndex !== -1 && anchorIndex < targetIndex;
+      });
+    if (relocated.length === 0) {
+      return {
+        messages: [...messages],
+        targetIndex,
+        restoredOutgoingMessageIds: [],
+      };
+    }
+
+    const relocatedIds = new Set(relocated.map(({ message }) => message.messageId));
+    const remaining = messages.filter(message => !relocatedIds.has(message.messageId));
+    const insertedAfterAnchor = new Map<string, number>();
+    const restoredOutgoingMessageIds: string[] = [];
+    for (const { message } of relocated) {
+      const metadata = message as GenerationMessage;
+      const anchorId = metadata.replyAfterMessageId;
+      if (!anchorId) {
+        continue;
+      }
+      const anchorIndex = remaining.findIndex(
+        candidate => candidate.messageId === anchorId,
+      );
+      if (anchorIndex === -1) {
+        remaining.push(message);
+        continue;
+      }
+      const insertedCount = insertedAfterAnchor.get(anchorId) ?? 0;
+      remaining.splice(anchorIndex + 1 + insertedCount, 0, message);
+      insertedAfterAnchor.set(anchorId, insertedCount + 1);
+      restoredOutgoingMessageIds.push(message.messageId);
+    }
+    targetIndex = remaining.findIndex(
+      message => message.messageId === targetMessageId,
+    );
+    return { messages: remaining, targetIndex, restoredOutgoingMessageIds };
+  };
+
+  const resolveResponseTargetId = (
+    packet: ScheduledPacket,
+    isRngPacket: boolean,
+    storedMessages: readonly ContextMessage[],
+    fallbackMessages: readonly PacketBuilderMessage[],
+  ): string | null => {
+    if (isRngPacket) {
+      return latestIncomingMessageId(storedMessages) ??
+        latestIncomingMessageId(fallbackMessages) ??
+        packet.triggerMessageId ??
+        null;
+    }
+
+    const originalTriggerId = packet.triggerMessageId ?? null;
+    const newMessages = packet.newMessages ?? [];
+    const originalTriggerIndex = originalTriggerId === null
+      ? -1
+      : newMessages.findIndex(message => message.messageId === originalTriggerId);
+    const originalTrigger = originalTriggerIndex === -1
+      ? newMessages.find(message => message.mention && message.direction === 'INCOMING') ??
+        storedMessages.find(message => message.messageId === originalTriggerId) ??
+        fallbackMessages.find(message => message.messageId === originalTriggerId)
+      : newMessages[originalTriggerIndex];
+    const originalSender = originalTrigger
+      ? normalizeConversationSender(originalTrigger.sender)
+      : 'UNKNOWN';
+    const candidates = originalTriggerIndex === -1
+      ? newMessages
+      : newMessages.slice(originalTriggerIndex);
+    let latestRelevantId: string | null = null;
+    for (const message of candidates) {
+      if (message.direction !== 'INCOMING' || !message.messageId) {
+        continue;
+      }
+      if (message.mention === true ||
+          (originalSender !== 'UNKNOWN' &&
+           normalizeConversationSender(message.sender) === originalSender)) {
+        latestRelevantId = message.messageId;
+      }
+    }
+    return latestRelevantId ?? originalTriggerId ??
+      latestIncomingMessageId(storedMessages) ??
+      latestIncomingMessageId(fallbackMessages);
   };
 
   const resolveGenerationTrigger = (
@@ -760,52 +955,145 @@ export async function startCombustion({
     prunePendingOutgoingReplies();
     const isRngPacket = activePacketContext?.type === 'rng' ||
       packet.packetId === rngPacketInFlightId;
-    const triggerId = packet.triggerMessageId ?? latestIncomingMessageId(fallbackMessages);
     const storedMessages = contextStore.getRecent(contextStore.getState().maxMessages);
-    const triggerIndex = triggerId === null
-      ? -1
-      : storedMessages.findIndex(message => message.messageId === triggerId);
-    const trigger = resolveGenerationTrigger(
-      triggerId,
+    const targetId = resolveResponseTargetId(
+      packet,
+      isRngPacket,
       storedMessages,
       fallbackMessages,
     );
-    const targetingMessages = triggerIndex === -1
-      ? []
-      : storedMessages.slice(0, triggerIndex) as PacketBuilderMessage[];
-
-    const latestIncomingId = latestIncomingMessageId(storedMessages) ?? triggerId;
-    const endIndex = latestIncomingId === null
+    const targetingTriggerId = isRngPacket
+      ? targetId
+      : packet.triggerMessageId ?? targetId;
+    const trigger = resolveGenerationTrigger(
+      targetId,
+      storedMessages,
+      fallbackMessages,
+    );
+    const targetingTrigger = resolveGenerationTrigger(
+      targetingTriggerId,
+      storedMessages,
+      fallbackMessages,
+    );
+    const storedTargetIndex = targetId === null
       ? -1
-      : storedMessages.findIndex(message => message.messageId === latestIncomingId);
-    if (endIndex === -1) {
-      const fallbackTriggerIndex = trigger
+      : storedMessages.findIndex(message => message.messageId === targetId);
+    const merged = mergePendingOutgoingReplies(
+      storedMessages,
+      pendingOutgoingReplies,
+      storedTargetIndex === -1 ? storedMessages.length : storedTargetIndex,
+    );
+
+    if (storedTargetIndex === -1) {
+      const fallbackTargetIndex = trigger
         ? fallbackMessages.indexOf(trigger)
         : -1;
+      const fallbackMerged = mergePendingOutgoingReplies(
+        fallbackMessages as ContextMessage[],
+        pendingOutgoingReplies,
+        fallbackTargetIndex === -1 ? fallbackMessages.length : fallbackTargetIndex,
+      );
+      const fallbackRestored = targetId === null
+        ? {
+          messages: fallbackMerged.messages,
+          restoredOutgoingMessageIds: [],
+        }
+        : restoreLateOutgoingMessages(fallbackMerged.messages, targetId);
+      const fallbackTargetingIndex = targetingTriggerId === null
+        ? -1
+        : fallbackMerged.messages.findIndex(
+          message => message.messageId === targetingTriggerId,
+        );
       return {
-        messages: mergePendingOutgoingReplies(
-          fallbackMessages as ContextMessage[],
-          pendingOutgoingReplies,
-        ) as PacketBuilderMessage[],
+        messages: fallbackRestored.messages as PacketBuilderMessage[],
         trigger,
-        targetingMessages: fallbackTriggerIndex === -1
+        targetingTrigger,
+        targetingMessages: fallbackTargetingIndex === -1
           ? []
-          : fallbackMessages.slice(0, fallbackTriggerIndex) as PacketBuilderMessage[],
+          : fallbackMerged.messages.slice(
+            0,
+            fallbackTargetingIndex,
+          ) as PacketBuilderMessage[],
+        restoredOutgoingMessageIds: [
+          ...fallbackMerged.mergedPendingMessageIds,
+          ...fallbackRestored.restoredOutgoingMessageIds,
+        ],
+        mergedPendingMessageIds: fallbackMerged.mergedPendingMessageIds,
+      };
+    }
+
+    if (targetId === null) {
+      return {
+        messages: merged.messages as PacketBuilderMessage[],
+        trigger,
+        targetingTrigger,
+        targetingMessages: [],
+        restoredOutgoingMessageIds: merged.mergedPendingMessageIds,
+        mergedPendingMessageIds: merged.mergedPendingMessageIds,
+      };
+    }
+
+    const restored = restoreLateOutgoingMessages(merged.messages, targetId);
+    const conversation = restored.messages;
+    const targetIndex = restored.targetIndex;
+    const targetingIndex = targetingTriggerId === null
+      ? -1
+      : conversation.findIndex(
+        message => message.messageId === targetingTriggerId,
+      );
+    const targetingMessages = targetingIndex === -1
+      ? []
+      : conversation.slice(0, targetingIndex) as PacketBuilderMessage[];
+
+    if (targetIndex === -1) {
+      return {
+        messages: conversation as PacketBuilderMessage[],
+        trigger,
+        targetingTrigger,
+        targetingMessages,
+        restoredOutgoingMessageIds: [
+          ...merged.mergedPendingMessageIds,
+          ...restored.restoredOutgoingMessageIds,
+        ],
+        mergedPendingMessageIds: merged.mergedPendingMessageIds,
       };
     }
 
     const windowSize = isRngPacket
       ? RNG_CONTEXT_MESSAGE_LIMIT
       : PACKET_CONTEXT_MESSAGE_LIMIT + 1;
-    const startIndex = Math.max(0, endIndex - windowSize + 1);
-    const windowMessages = storedMessages.slice(startIndex, endIndex + 1);
+    const latestIncomingId = latestIncomingMessageId(conversation);
+    const windowEndIndex = latestIncomingId === null
+      ? targetIndex
+      : conversation.findIndex(
+        message => message.messageId === latestIncomingId,
+      );
+    const resolvedWindowEndIndex = windowEndIndex === -1 ? targetIndex : windowEndIndex;
+    let startIndex = Math.max(0, resolvedWindowEndIndex - windowSize + 1);
+    if (targetIndex !== -1 && targetIndex < startIndex) {
+      startIndex = targetIndex;
+    }
+    const windowMessages = conversation.slice(startIndex, resolvedWindowEndIndex + 1);
+    const restoredOutgoingMessageIds = [
+      ...merged.mergedPendingMessageIds,
+      ...restored.restoredOutgoingMessageIds,
+    ];
+    if (startIndex > 0) {
+      for (let index = startIndex - 1; index >= 0; index -= 1) {
+        if (isBotAuthoredMessage(conversation[index])) {
+          windowMessages.unshift(conversation[index]);
+          restoredOutgoingMessageIds.push(conversation[index].messageId);
+          break;
+        }
+      }
+    }
     return {
-      messages: mergePendingOutgoingReplies(
-        windowMessages,
-        pendingOutgoingReplies,
-      ) as PacketBuilderMessage[],
+      messages: windowMessages as PacketBuilderMessage[],
       trigger,
+      targetingTrigger,
       targetingMessages,
+      restoredOutgoingMessageIds,
+      mergedPendingMessageIds: merged.mergedPendingMessageIds,
     };
   };
 
@@ -908,12 +1196,28 @@ export async function startCombustion({
     }
     startRngCooldown();
   };
+  const waitForInterChunkDelay = (): Promise<void> => new Promise(resolve => {
+    if (stopRequested || pauseGate.isCancelled()) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      interChunkDelayCancel = undefined;
+      resolve();
+    }, COMPOSER_CHUNK_DELAY_MS);
+    interChunkDelayCancel = () => {
+      clearTimeout(timer);
+      interChunkDelayCancel = undefined;
+      resolve();
+    };
+  });
   const requestStop = (): void => {
     if (stopRequested) {
       return;
     }
     stopRequested = true;
     pauseGate.cancel();
+    interChunkDelayCancel?.();
     clearTimeout(idleTimer);
     pollDelayResolve?.();
     wakeSignal.resolve();
@@ -1805,30 +2109,42 @@ export async function startCombustion({
         );
         const messages = generation.messages;
         const latestIncoming = findLatestIncomingMessage(messages);
-        const triggerMessage = (generation.trigger ?? latestIncoming) as
+        const responseTarget = (generation.trigger ?? latestIncoming) as
+          PacketBuilderMessage | null;
+        const targetingTrigger = (generation.targetingTrigger ?? responseTarget) as
           PacketBuilderMessage | null;
         const targetingAwareness = buildParticipantAwareness({
           bot: identity,
           roster: groupRoster,
-          messages: triggerMessage
-            ? [...generation.targetingMessages, triggerMessage]
+          messages: targetingTrigger
+            ? [...generation.targetingMessages, targetingTrigger]
             : generation.targetingMessages,
         });
         const participantAwareness = buildParticipantAwareness({
           bot: identity,
           roster: groupRoster,
-          messages: triggerMessage && !messages.includes(triggerMessage)
-            ? [...messages, triggerMessage]
-            : messages,
+          messages: [
+            ...messages,
+            ...(responseTarget && !messages.includes(responseTarget)
+              ? [responseTarget]
+              : []),
+            ...(targetingTrigger && !messages.includes(targetingTrigger) &&
+                targetingTrigger !== responseTarget
+              ? [targetingTrigger]
+              : []),
+          ],
         });
         const participantNames = participantAwareness.participantNames;
-        let targeting: MessageTargetingContext | null = triggerMessage
+        let targeting: MessageTargetingContext | null = targetingTrigger
           ? classifyMessageTargeting({
-            message: triggerMessage,
+            message: targetingTrigger,
             awareness: targetingAwareness,
             recentMessages: generation.targetingMessages,
           })
           : null;
+        const recentAssistantReplies = collectRecentAssistantMessages(
+          messages as readonly EngineMessage[],
+        );
         let effectiveRelay = targeting?.relay ?? null;
         let relayKey: string | null = null;
         if (effectiveRelay) {
@@ -1848,18 +2164,36 @@ export async function startCombustion({
         activeRelay = effectiveRelay && relayKey
           ? { directive: effectiveRelay, key: relayKey }
           : null;
-        const requestReply = async (retry: boolean): Promise<string> => {
+        const requestReply = async (
+          retry: boolean,
+          reason?: AntiEchoRetryReason | 'multiple',
+        ): Promise<string> => {
+          const retryInstructions: string[] = [];
+          if (!retry || reason === 'repeat-echo' || reason === 'multiple' ||
+              reason === undefined) {
+            retryInstructions.push(ANTI_ECHO_RETRY_INSTRUCTION);
+          }
+          if (reason === 'repeat-self' || reason === 'multiple') {
+            retryInstructions.push(SELF_REPETITION_RETRY_INSTRUCTION);
+          }
           const reply = await generateNvidiaReply(
             requestApiKey,
             messages as unknown as readonly BackreadMessage[],
             {
               systemInstruction: retry
-                ? appendRetryInstruction(systemInstruction, ANTI_ECHO_RETRY_INSTRUCTION)
+                ? appendRetryInstruction(systemInstruction, ...retryInstructions)
                 : systemInstruction,
               identity,
               roster: groupRoster,
               targeting: targeting ?? undefined,
-              trigger: triggerMessage,
+              trigger: targetingTrigger,
+              responseTarget,
+              requestDiagnostics: {
+                packetId: packet.packetId ?? activePacketContext?.packetId ?? 'unknown',
+                packetType: activePacketContext?.type ?? 'unknown',
+                restoredOutgoingMessageIds: generation.restoredOutgoingMessageIds,
+                mergedPendingMessageIds: generation.mergedPendingMessageIds,
+              },
               onDiagnostic: reportTranscriptDiagnostic,
             },
           );
@@ -1882,6 +2216,35 @@ export async function startCombustion({
               `${JSON.stringify(removedPrefix)}`,
             );
           }
+          const deliveryExistence = validateReplyExistence(normalizedReply, {
+            trigger: responseTarget
+              ? {
+                messageId: responseTarget.messageId,
+                text: responseTarget.message,
+              }
+              : null,
+            fiction: isExplicitFictionContext(
+              messages
+                .filter(message => message.direction === 'INCOMING')
+                .slice(-6)
+                .map(message => message.message),
+            ),
+          });
+          if (!deliveryExistence.valid) {
+            const suppression = activePacketContext ?? {
+              packetId: packet.packetId ?? 'unknown',
+              type: 'unknown' as const,
+            };
+            console.log(
+              `${styled('[existence]', 'yellow')} packet=${styled(suppression.packetId, 'bold')} ` +
+              `type=${suppression.type} stage=delivery reason=${deliveryExistence.reason} ` +
+              `messageId=${responseTarget?.messageId ?? 'unknown'} action=suppressed`,
+            );
+            throw new NvidiaExistenceError(
+              deliveryExistence.reason,
+              'The reply claimed or accepted physical-world participation during delivery. The reply was not sent.',
+            );
+          }
           const postNormalizationIdentity = validateReplyIdentity(normalizedReply, {
             name: configuration.puppetName ?? '',
             aliases,
@@ -1897,9 +2260,18 @@ export async function startCombustion({
         };
         try {
           const outcome = await generateReplyWithAntiEchoGuard({
-            generate: attempt => requestReply(attempt.retry),
-            isEcho: reply => latestIncoming !== null &&
-              isEchoReply(reply, latestIncoming.message, { participantNames }),
+            generate: attempt => requestReply(attempt.retry, attempt.reason),
+            isEcho: reply =>
+              (latestIncoming !== null &&
+               isEchoReply(reply, latestIncoming.message, { participantNames })) ||
+              (responseTarget !== null &&
+               responseTarget !== latestIncoming &&
+               isEchoReply(reply, responseTarget.message, { participantNames })),
+            isRepeat: reply => isSelfRepetitionReply(
+              reply,
+              recentAssistantReplies,
+              { participantNames },
+            ),
             log: message => console.log(`${styled('[reply]', 'cyan')} ${message}`),
           });
           if (outcome.status === 'suppressed') {
@@ -1907,15 +2279,19 @@ export async function startCombustion({
               packetId: 'unknown',
               type: 'unknown' as const,
             };
+            const repeatedSelf = outcome.reason === 'repeat-self';
             console.log(
               `${styled('[reply]', 'cyan')} anti-echo suppression: ` +
               `packet=${styled(suppression.packetId, 'bold')} type=${suppression.type} ` +
-              `messageId=${latestIncoming?.messageId ?? 'unknown'} ` +
-              `retry=echoed attempts=${outcome.attempts} action=suppressed`,
+              `messageId=${responseTarget?.messageId ?? latestIncoming?.messageId ?? 'unknown'} ` +
+              `retry=${repeatedSelf ? 'repeated-self' : 'echoed'} ` +
+              `attempts=${outcome.attempts} action=suppressed`,
             );
             throw new AntiEchoSuppressedError(
-              'Suppressed a reply that repeated the latest incoming message ' +
-              `(id=${latestIncoming?.messageId ?? 'unknown'}).`,
+              repeatedSelf
+                ? 'Suppressed a reply that repeated an earlier reply in this conversation.'
+                : 'Suppressed a reply that repeated the latest incoming message ' +
+                  `(id=${latestIncoming?.messageId ?? 'unknown'}).`,
             );
           }
           return outcome.reply;
@@ -1927,15 +2303,100 @@ export async function startCombustion({
       },
       composeReply: async (packetPage, reply, options) => {
         const startedAt = performance.now();
+        const slicer = resolveComposerSlicer(configuration);
+        const extractedReply = extractConversationMessageBody(reply).text;
+        const deliverable = extractedReply.length > 0 ? extractedReply : reply;
+        const chunks = slicer.enabled
+          ? sliceComposerMessage(deliverable, slicer.maxCharacters)
+          : [deliverable];
+        const batchId = activePacketContext?.packetId ?? 'unknown';
+        const batchLabel = `batch=${styled(batchId, 'bold')}`;
+        let delivered = 0;
+        console.log(
+          `${styled('[compose]', 'cyan')} slicer ` +
+          `${styled('enabled=', 'dim')}${styled(String(slicer.enabled), 'bold')} ` +
+          `${styled('maxCharacters=', 'dim')}${styled(String(slicer.maxCharacters), 'bold')} ` +
+          `${styled('originalChars=', 'dim')}${styled(String(deliverable.length), 'bold')} ` +
+          `${styled('chunks=', 'dim')}${styled(String(chunks.length), 'bold')}`,
+        );
+        if (slicer.enabled) {
+          const oversized = chunks.find(chunk => chunk.length > slicer.maxCharacters);
+          if (oversized !== undefined || chunks.join('') !== deliverable) {
+            console.log(
+              `${styled('[compose]', 'cyan')} ${batchLabel} ` +
+              `status=${styled('slice-invalid', 'red')} ` +
+              `maxCharacters=${String(slicer.maxCharacters)} ` +
+              `chars=${String(oversized?.length ?? deliverable.length)}`,
+            );
+            throw new Error(
+              'Composer slicing produced a chunk that violates the configured maximum.',
+            );
+          }
+        }
+        const logBatch = (outcome: string): void => {
+          console.log(
+            `${styled('[compose]', 'cyan')} ${batchLabel} ` +
+            `status=${styled(outcome, outcome === 'complete' ? 'green' : 'yellow')} ` +
+            `delivered=${String(delivered)}/${String(chunks.length)}`,
+          );
+        };
         try {
-          const composition = await composeMessengerReply(packetPage, reply, options);
-          if (composition.status === 'sent') {
-            recordPendingOutgoingReply(reply);
-            if (activeRelay && relayWasDelivered(reply, activeRelay.directive)) {
-              relayedCallKeys.add(activeRelay.key);
+          for (const [index, chunk] of chunks.entries()) {
+            if (chunks.length > 1) {
+              console.log(
+                `${styled('[compose]', 'cyan')} ${batchLabel} ` +
+                `chunk=${styled(`${String(index + 1)}/${String(chunks.length)}`, 'bold')} ` +
+                `${styled('chars=', 'dim')}${styled(String(chunk.length), 'bold')}`,
+              );
+            }
+            const composition = await composeMessengerReply(
+              packetPage,
+              chunk,
+              {
+                ...(index === 0 ? options : {}),
+                ...(slicer.enabled ? { maxCharacters: slicer.maxCharacters } : {}),
+              },
+            );
+            if (composition.status !== 'sent') {
+              if (chunks.length > 1) {
+                console.log(
+                  `${styled('[compose]', 'cyan')} ${batchLabel} ` +
+                  `chunk=${String(index + 1)}/${String(chunks.length)} ` +
+                  `delivery=${styled(String(composition.status), 'yellow')}` +
+                  (composition.reason ? ` reason=${String(composition.reason)}` : ''),
+                );
+                logBatch('partial');
+              }
+              return composition;
+            }
+            recordPendingOutgoingReply(chunk, batchId);
+            delivered += 1;
+            if (chunks.length > 1) {
+              console.log(
+                `${styled('[compose]', 'cyan')} ${batchLabel} ` +
+                `chunk=${String(index + 1)}/${String(chunks.length)} ` +
+                `delivery=${styled('sent', 'green')}`,
+              );
+            }
+            if (index + 1 < chunks.length) {
+              await waitForInterChunkDelay();
+              if (stopRequested || pauseGate.isCancelled()) {
+                throw new Error('Composer delivery was cancelled during the inter-chunk delay.');
+              }
             }
           }
-          return composition;
+          if (chunks.length > 1) {
+            logBatch('complete');
+          }
+          if (activeRelay && relayWasDelivered(reply, activeRelay.directive)) {
+            relayedCallKeys.add(activeRelay.key);
+          }
+          return { status: 'sent' };
+        } catch (error) {
+          if (!stopRequested && chunks.length > 1 && delivered > 0) {
+            logBatch('failed');
+          }
+          throw error;
         } finally {
           if (activePacketTiming) {
             activePacketTiming.composeMs = performance.now() - startedAt;

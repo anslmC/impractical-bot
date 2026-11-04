@@ -12,12 +12,14 @@ import { test, type TestContext } from 'node:test';
 import {
   BOT_TEMPERAMENT_COOLDOWNS_MS,
   BOT_TEMPERAMENT_YES_PROBABILITIES,
+  DEFAULT_COMPOSER_SLICER,
   MAX_PERSONALITY_INSTRUCTION_CHARS,
   getBotTemperamentCooldownMs,
   getBotTemperamentYesProbability,
   isBotPersonalityMode,
   loadConfiguration,
   resolveBotPersonalityMode,
+  resolveComposerSlicer,
   resolveConfigurationPaths,
   saveConfiguration,
   validateConfiguration,
@@ -37,6 +39,7 @@ const validConfiguration: Configuration = {
   puppetName: 'Test Puppet',
   botTemperament: 'balanced',
   botPersonality: 'default',
+  composerSlicer: { enabled: true, maxCharacters: 500 },
 };
 
 function createTemporaryConfigPath(context: TestContext): string {
@@ -424,6 +427,126 @@ test('a custom personality instruction persists with newlines and reloads intact
   const text = readFileSync(filePath, 'utf8');
   assert.ok(text.includes('botPersonality'));
   assert.ok(text.includes('customPersonalityInstruction'));
+});
+
+test('composer slicer settings resolve from defaults and persist only when configured', context => {
+  const legacyConfiguration: Record<string, unknown> = { ...validConfiguration };
+  delete legacyConfiguration.composerSlicer;
+
+  const validated = validateConfiguration(legacyConfiguration);
+  assert.equal(validated.composerSlicer, undefined, 'defaults are not baked into the configuration');
+  assert.deepEqual(DEFAULT_COMPOSER_SLICER, { enabled: true, maxCharacters: 200 });
+  assert.deepEqual(resolveComposerSlicer(validated), { enabled: true, maxCharacters: 200 });
+
+  const filePath = createTemporaryConfigPath(context);
+  writeFileSync(filePath, JSON.stringify(legacyConfiguration));
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.equal(loaded.configuration.composerSlicer, undefined);
+    assert.deepEqual(resolveComposerSlicer(loaded.configuration), {
+      enabled: true,
+      maxCharacters: 200,
+    });
+  }
+
+  saveConfiguration(validated, filePath);
+  assert.equal(
+    readFileSync(filePath, 'utf8').includes('composerSlicer'),
+    false,
+    'saving settings never freezes the current slicer defaults into the file',
+  );
+
+  const configured = validateConfiguration({
+    ...validConfiguration,
+    composerSlicer: { enabled: false, maxCharacters: 250 },
+  });
+  assert.deepEqual(configured.composerSlicer, { enabled: false, maxCharacters: 250 });
+  assert.deepEqual(resolveComposerSlicer(configured), { enabled: false, maxCharacters: 250 });
+
+  const maximumOnly = validateConfiguration({
+    ...validConfiguration,
+    composerSlicer: { maxCharacters: 10 },
+  });
+  assert.deepEqual(resolveComposerSlicer(maximumOnly), {
+    enabled: true,
+    maxCharacters: 10,
+  });
+
+  const enabledOnly = validateConfiguration({
+    ...validConfiguration,
+    composerSlicer: { enabled: false },
+  });
+  assert.deepEqual(resolveComposerSlicer(enabledOnly), {
+    enabled: false,
+    maxCharacters: 200,
+  });
+
+  saveConfiguration(configured, filePath);
+  const reloaded = loadConfiguration(filePath);
+  assert.equal(reloaded.status, 'valid');
+  if (reloaded.status === 'valid') {
+    assert.deepEqual(reloaded.configuration.composerSlicer, { enabled: false, maxCharacters: 250 });
+    assert.deepEqual(resolveComposerSlicer(reloaded.configuration), {
+      enabled: false,
+      maxCharacters: 250,
+    });
+  }
+});
+
+test('composer slicer defaults never overwrite explicit saved values', context => {
+  const filePath = createTemporaryConfigPath(context);
+  const explicit = validateConfiguration({
+    ...validConfiguration,
+    composerSlicer: { enabled: true, maxCharacters: 750 },
+  });
+  saveConfiguration(explicit, filePath);
+
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status !== 'valid') {
+    return;
+  }
+  assert.deepEqual(loaded.configuration.composerSlicer, { enabled: true, maxCharacters: 750 });
+  assert.deepEqual(resolveComposerSlicer(loaded.configuration), {
+    enabled: true,
+    maxCharacters: 750,
+  });
+
+  saveConfiguration({ ...loaded.configuration, puppetName: 'Renamed Puppet' }, filePath);
+  const resaved = loadConfiguration(filePath);
+  assert.equal(resaved.status, 'valid');
+  if (resaved.status === 'valid') {
+    assert.equal(resaved.configuration.puppetName, 'Renamed Puppet');
+    assert.deepEqual(resaved.configuration.composerSlicer, { enabled: true, maxCharacters: 750 });
+    assert.deepEqual(resolveComposerSlicer(resaved.configuration), {
+      enabled: true,
+      maxCharacters: 750,
+    });
+  }
+});
+
+test('composer slicer settings reject invalid values and unknown fields', () => {
+  for (const composerSlicer of [null, 'enabled', [], { enabled: 'yes' }, { enabled: true, unexpected: 1 }]) {
+    assert.throws(() => validateConfiguration({ ...validConfiguration, composerSlicer }));
+  }
+  assert.throws(
+    () => validateConfiguration({ ...validConfiguration, composerSlicer: { enabled: 'yes' } }),
+    /composerSlicer\.enabled must be a boolean/,
+  );
+  for (const maxCharacters of [0, -5, 1.5, '500', null, true]) {
+    assert.throws(
+      () => validateConfiguration({
+        ...validConfiguration,
+        composerSlicer: { enabled: true, maxCharacters },
+      }),
+      /composerSlicer\.maxCharacters must be a positive integer/,
+    );
+  }
+  assert.throws(
+    () => validateConfiguration({ ...validConfiguration, composerSlicer: { unexpected: true } }),
+    /composerSlicer contains unsupported field 'unexpected'/,
+  );
 });
 
 test('custom personality instructions reject control characters and oversized text', () => {

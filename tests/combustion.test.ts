@@ -10,11 +10,11 @@ import {
   composeProductionSystemInstruction,
   ENGLISH_ONLY_INSTRUCTION,
 } from '../src/components/personality.js';
-import type { Configuration } from '../src/config/configuration.js';
+import { DEFAULT_COMPOSER_SLICER, type Configuration } from '../src/config/configuration.js';
 import type { GroupRoster } from '../src/browser/group-roster.js';
 import * as nvidiaModule from '../src/ai/nvidia.js';
 import * as composerModule from '../src/components/composer.js';
-import { ANTI_ECHO_RETRY_INSTRUCTION } from '../src/components/anti-echo.js';
+import { ANTI_ECHO_RETRY_INSTRUCTION, SELF_REPETITION_RETRY_INSTRUCTION } from '../src/components/anti-echo.js';
 
 const MESSAGE_SELECTOR =
   '[data-scope="messages_table"][aria-roledescription="message"][data-message-id]';
@@ -4576,6 +4576,970 @@ test('a mention reply targets the original trigger while keeping the later burst
     assert.equal(generated[0].targeting?.messageId, 'trigger-1');
     assert.equal(generated[0].targeting?.kind, 'bot');
     assert.equal(generated[0].targeting?.addressedTo, null);
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('a long reply is delivered as consecutive bubbles from one generation', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+
+  const reply = 'First, the engine reads the conversation and decides that this answer ' +
+    'needs room to breathe. Second, it normalizes the reply before any delivery step so ' +
+    'nothing is lost along the way. Third, the sliced bubbles arrive in order as one ' +
+    'logical response.';
+  const generatedRequests: Array<readonly {
+    messageId: string;
+    message: string;
+    direction: string;
+  }[]> = [];
+  const composeCalls: string[] = [];
+  const composeEvents: string[] = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    generatedRequests.push(messages as typeof generatedRequests[number]);
+    return reply;
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async (_page, text) => {
+    composeCalls.push(text);
+    composeEvents.push(`start-${String(composeCalls.length)}`);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    composeEvents.push(`end-${String(composeCalls.length)}`);
+    return { status: 'sent' };
+  };
+
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flushEngine();
+    let previousCalls = composeCalls.length;
+    while (previousCalls > 0) {
+      context.mock.timers.tick(900);
+      await flushEngine();
+      if (composeCalls.length === previousCalls) {
+        break;
+      }
+      previousCalls = composeCalls.length;
+    }
+  };
+
+  const { page, inject } = createInjectedMessengerPage();
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page,
+    contextStore,
+    configuration: {
+      ...configuration,
+      composerSlicer: { enabled: true, maxCharacters: 200 },
+    },
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'sliced-1', sender: 'Alex', message: '@Bot explain the pipeline' }]);
+    await advancePoll();
+    await advancePoll();
+
+    assert.equal(generatedRequests.length, 1, 'one generation produces the whole batch');
+    assert.ok(composeCalls.length > 1, 'the long reply is divided into several bubbles');
+    assert.equal(composeCalls.join(''), reply, 'the bubbles reproduce the reply exactly');
+    assert.ok(
+      composeCalls.every(chunk => chunk.length <= 200),
+      'no bubble exceeds the configured maximum',
+    );
+    assert.deepEqual(
+      composeEvents,
+      composeCalls.flatMap((_, index) => [
+        `start-${String(index + 1)}`,
+        `end-${String(index + 1)}`,
+      ]),
+      'each bubble is awaited before the next one is sent',
+    );
+    const firstBatch = [...composeCalls];
+
+    inject([{ messageId: 'sliced-2', sender: 'Alex', message: '@Bot one more thing' }]);
+    await advancePoll();
+    await advancePoll();
+
+    assert.equal(generatedRequests.length, 2, 'the batch never triggers another completion');
+    const pending = generatedRequests[1]
+      .filter(message => message.messageId.startsWith('pending-outgoing-'))
+      .map(message => message.message);
+    assert.deepEqual(
+      pending,
+      firstBatch.map(chunk => chunk.trim()),
+      'every delivered bubble is its own pending outgoing reply in order',
+    );
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('sliced bubbles are spaced by 900ms with no delay after the last bubble', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  const originalLog = console.log;
+  Math.random = () => 0.99;
+  const logs: string[] = [];
+  console.log = (...values: unknown[]) => {
+    logs.push(values.map(String).join(' '));
+  };
+
+  const reply = 'First bubble. Second bubble.';
+  const composeCalls: string[] = [];
+  const composeTimes: number[] = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (): Promise<string> => reply;
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async (_page, text) => {
+    composeCalls.push(text);
+    composeTimes.push(Date.now());
+    return { status: 'sent' };
+  };
+
+  const { page, inject } = createInjectedMessengerPage();
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration: {
+      ...configuration,
+      composerSlicer: { enabled: true, maxCharacters: 20 },
+    },
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'timing-1', sender: 'Alex', message: '@Bot explain the timing' }]);
+    for (let poll = 0; poll < 6 && composeCalls.length === 0; poll += 1) {
+      context.mock.timers.tick(1_500);
+      await flushEngine();
+    }
+
+    assert.equal(composeCalls.length, 1, 'the first bubble is sent immediately');
+    assert.equal(composeTimes[0], Date.now(), 'the first bubble does not wait');
+
+    context.mock.timers.tick(899);
+    await flushEngine();
+    assert.equal(composeCalls.length, 1, 'the second bubble waits for the full delay');
+
+    context.mock.timers.tick(1);
+    await flushEngine();
+    assert.equal(composeCalls.length, 2, 'the second bubble arrives after 900ms');
+    assert.equal(composeTimes[1] - composeTimes[0], 900, 'bubbles are spaced by 900ms');
+    assert.ok(
+      logs.some(line => line.includes('status=complete') && line.includes('delivered=2/2')),
+      'the batch completes without waiting after the last bubble',
+    );
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    console.log = originalLog;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('stopping during the inter-bubble delay prevents the next bubble', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+
+  const reply = 'First bubble. Second bubble.';
+  const composeCalls: string[] = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (): Promise<string> => reply;
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async (_page, text) => {
+    composeCalls.push(text);
+    return { status: 'sent' };
+  };
+
+  const { page, inject } = createInjectedMessengerPage();
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration: {
+      ...configuration,
+      composerSlicer: { enabled: true, maxCharacters: 20 },
+    },
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'cancel-1', sender: 'Alex', message: '@Bot explain the timing' }]);
+    for (let poll = 0; poll < 6 && composeCalls.length === 0; poll += 1) {
+      context.mock.timers.tick(1_500);
+      await flushEngine();
+    }
+    assert.equal(composeCalls.length, 1);
+
+    await controller.stop();
+    assert.equal(composeCalls.length, 1, 'no bubble is sent after cancellation');
+
+    context.mock.timers.tick(900);
+    await flushEngine();
+    assert.equal(composeCalls.length, 1, 'the cancelled delay cannot resume');
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('pausing during the inter-bubble delay keeps the active batch moving', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+
+  const reply = 'First bubble. Second bubble.';
+  const composeCalls: string[] = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (): Promise<string> => reply;
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async (_page, text) => {
+    composeCalls.push(text);
+    return { status: 'sent' };
+  };
+
+  const { page, inject } = createInjectedMessengerPage();
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration: {
+      ...configuration,
+      composerSlicer: { enabled: true, maxCharacters: 20 },
+    },
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'pause-1', sender: 'Alex', message: '@Bot explain the timing' }]);
+    for (let poll = 0; poll < 6 && composeCalls.length === 0; poll += 1) {
+      context.mock.timers.tick(1_500);
+      await flushEngine();
+    }
+    assert.equal(composeCalls.length, 1);
+
+    await controller.pause();
+    context.mock.timers.tick(900);
+    await flushEngine();
+    assert.equal(composeCalls.length, 2, 'the active batch finishes while polling is paused');
+    await controller.resume();
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('a short reply keeps the single-message delivery path', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+
+  const reply = 'short reply';
+  const composeCalls: string[] = [];
+  const generatedRequests: Array<readonly { messageId: string; message: string }[]> = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    generatedRequests.push(messages as readonly { messageId: string; message: string }[]);
+    return reply;
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async (_page, text) => {
+    composeCalls.push(text);
+    return { status: 'sent' };
+  };
+
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flushEngine();
+  };
+
+  const { page, inject } = createInjectedMessengerPage();
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'short-1', sender: 'Alex', message: '@Bot first question' }]);
+    await advancePoll();
+    await advancePoll();
+
+    assert.equal(generatedRequests.length, 1);
+    assert.deepEqual(composeCalls, [reply], 'the reply uses exactly one send');
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('a blocked bubble stops the batch without resending delivered bubbles', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+
+  const reply = 'First bubble of the batch needs its own message. ' +
+    'Second bubble carries part of the answer. Third bubble finishes the thought.';
+  const generatedRequests: Array<readonly {
+    messageId: string;
+    message: string;
+    direction: string;
+  }[]> = [];
+  const composeCalls: string[] = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    generatedRequests.push(messages as typeof generatedRequests[number]);
+    return reply;
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async (_page, text) => {
+    composeCalls.push(text);
+    if (composeCalls.length === 2) {
+      return { status: 'send-blocked', reason: 'disabled' };
+    }
+    return { status: 'sent' };
+  };
+
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flushEngine();
+    let previousCalls = composeCalls.length;
+    while (previousCalls > 0) {
+      context.mock.timers.tick(900);
+      await flushEngine();
+      if (composeCalls.length === previousCalls) {
+        break;
+      }
+      previousCalls = composeCalls.length;
+    }
+  };
+
+  const { page, inject } = createInjectedMessengerPage();
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page,
+    contextStore,
+    configuration: {
+      ...configuration,
+      composerSlicer: { enabled: true, maxCharacters: 55 },
+    },
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'partial-1', sender: 'Alex', message: '@Bot explain the pipeline' }]);
+    await advancePoll();
+    await advancePoll();
+
+    assert.equal(generatedRequests.length, 1);
+    assert.equal(composeCalls.length, 2, 'the batch stops at the blocked bubble');
+    assert.equal(composeCalls.join(''), reply.slice(0, composeCalls.join('').length));
+    await advancePoll();
+    await advancePoll();
+    assert.equal(composeCalls.length, 2, 'delivered bubbles are never resent');
+
+    inject([{ messageId: 'partial-2', sender: 'Alex', message: '@Bot one more thing' }]);
+    await advancePoll();
+    await advancePoll();
+
+    assert.equal(generatedRequests.length, 2);
+    const pending = generatedRequests[1]
+      .filter(message => message.messageId.startsWith('pending-outgoing-'))
+      .map(message => message.message);
+    assert.deepEqual(
+      pending,
+      [composeCalls[0].trim()],
+      'only the delivered bubble is recorded as pending outgoing',
+    );
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('an RNG reply is sliced through the same delivery path', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0;
+
+  const reply = 'An unrequested reply can also be long enough to need more than one bubble. ' +
+    'It still belongs to a single RNG packet and a single generation.';
+  const composeCalls: string[] = [];
+  const generatedRequests: Array<readonly { messageId: string; message: string }[]> = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    generatedRequests.push(messages as readonly { messageId: string; message: string }[]);
+    return reply;
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async (_page, text) => {
+    composeCalls.push(text);
+    return { status: 'sent' };
+  };
+
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flushEngine();
+    let previousCalls = composeCalls.length;
+    while (previousCalls > 0) {
+      context.mock.timers.tick(900);
+      await flushEngine();
+      if (composeCalls.length === previousCalls) {
+        break;
+      }
+      previousCalls = composeCalls.length;
+    }
+  };
+
+  const { page } = createInjectedMessengerPage();
+  const contextStore = createContextStore();
+  contextStore.add([
+    { messageId: 'rng-1', message: 'anyone around?', sender: 'Alex' },
+    { messageId: 'rng-2', message: 'yeah, working on the paper', sender: 'Blair' },
+  ].map(message => ({ ...message, direction: 'INCOMING' })));
+  const controller = await startCombustion({
+    page,
+    contextStore,
+    configuration: {
+      ...configuration,
+      composerSlicer: { enabled: true, maxCharacters: 70 },
+    },
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    for (let poll = 0; poll < 4; poll += 1) {
+      await advancePoll();
+    }
+
+    assert.equal(generatedRequests.length, 1, 'the RNG packet generates once');
+    assert.ok(composeCalls.length > 1, 'the RNG reply is divided into several bubbles');
+    assert.equal(composeCalls.join(''), reply);
+    assert.ok(composeCalls.every(chunk => chunk.length <= 70));
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('a 291 character reply honours a configured ten character maximum', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+
+  const reply = ('One long generated response must arrive as several consecutive bubbles. ')
+    .repeat(5)
+    .slice(0, 291);
+  assert.equal(reply.length, 291);
+  const composeCalls: string[] = [];
+  const composeLimits: Array<number | undefined> = [];
+  const generatedRequests: Array<readonly { messageId: string; message: string }[]> = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    generatedRequests.push(messages as readonly { messageId: string; message: string }[]);
+    return reply;
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async (_page, text, options) => {
+    composeCalls.push(text);
+    composeLimits.push(options?.maxCharacters);
+    return { status: 'sent' };
+  };
+
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flushEngine();
+    let previousCalls = composeCalls.length;
+    while (previousCalls > 0) {
+      context.mock.timers.tick(900);
+      await flushEngine();
+      if (composeCalls.length === previousCalls) {
+        break;
+      }
+      previousCalls = composeCalls.length;
+    }
+  };
+
+  const { page, inject } = createInjectedMessengerPage();
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration: {
+      ...configuration,
+      composerSlicer: { enabled: true, maxCharacters: 10 },
+    },
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'limit-1', sender: 'Alex', message: '@Bot explain everything' }]);
+    await advancePoll();
+    await advancePoll();
+
+    assert.equal(generatedRequests.length, 1, 'the batch comes from exactly one generation');
+    assert.ok(composeCalls.length >= 29, 'the reply is divided at the ten character maximum');
+    assert.ok(
+      composeCalls.every(chunk => chunk.length > 0 && chunk.length <= 10),
+      'no composer invocation receives more than ten characters',
+    );
+    assert.ok(composeLimits.every(limit => limit === 10));
+    assert.equal(composeCalls.join(''), reply, 'the bubbles reproduce the reply exactly');
+    const firstBatch = [...composeCalls];
+
+    inject([{ messageId: 'limit-2', sender: 'Alex', message: '@Bot one more thing' }]);
+    await advancePoll();
+    await advancePoll();
+
+    assert.equal(generatedRequests.length, 2, 'the batch never triggers another completion');
+    const pending = generatedRequests[1]
+      .filter(message => message.messageId.startsWith('pending-outgoing-'))
+      .map(message => message.message);
+    assert.deepEqual(
+      pending,
+      firstBatch.slice(-8).map(chunk => chunk.trim()),
+      'delivered bubbles are pending outgoing replies in order',
+    );
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('a configuration without slicer settings uses the default maximum', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+
+  const reply = ('A default configuration must still slice a long generated response so that ' +
+    'no Messenger bubble grows unreadable. ').repeat(10).slice(0, 1001);
+  assert.equal(reply.length, 1001);
+  const composeCalls: string[] = [];
+  const composeLimits: Array<number | undefined> = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (): Promise<string> => reply;
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async (_page, text, options) => {
+    composeCalls.push(text);
+    composeLimits.push(options?.maxCharacters);
+    return { status: 'sent' };
+  };
+
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flushEngine();
+    let previousCalls = composeCalls.length;
+    while (previousCalls > 0) {
+      context.mock.timers.tick(900);
+      await flushEngine();
+      if (composeCalls.length === previousCalls) {
+        break;
+      }
+      previousCalls = composeCalls.length;
+    }
+  };
+
+  const { page, inject } = createInjectedMessengerPage();
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'default-1', sender: 'Alex', message: '@Bot explain the defaults' }]);
+    await advancePoll();
+    await advancePoll();
+
+    assert.ok(composeCalls.length > 1, 'the default maximum slices the reply');
+    assert.ok(
+      composeCalls.every(chunk => chunk.length <= DEFAULT_COMPOSER_SLICER.maxCharacters),
+      'the default maximum is enforced on every bubble',
+    );
+    assert.ok(
+      composeLimits.every(limit => limit === DEFAULT_COMPOSER_SLICER.maxCharacters),
+      'the slicer and the delivery boundary share the same resolved maximum',
+    );
+    assert.equal(composeCalls.join(''), reply);
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('disabled slicing keeps the original single-message behaviour', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+
+  const reply = ('Disabled slicing must keep the original delivery path intact even when ' +
+    'the reply is long enough to be divided. ').repeat(3).trim();
+  assert.ok(reply.length > 10);
+  const composeCalls: string[] = [];
+  const composeLimits: Array<number | undefined> = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (): Promise<string> => reply;
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async (_page, text, options) => {
+    composeCalls.push(text);
+    composeLimits.push(options?.maxCharacters);
+    return { status: 'sent' };
+  };
+
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flushEngine();
+  };
+
+  const { page, inject } = createInjectedMessengerPage();
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration: {
+      ...configuration,
+      composerSlicer: { enabled: false, maxCharacters: 10 },
+    },
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'disabled-1', sender: 'Alex', message: '@Bot keep it whole' }]);
+    await advancePoll();
+    await advancePoll();
+
+    assert.deepEqual(composeCalls, [reply], 'the reply uses exactly one send');
+    assert.deepEqual(composeLimits, [undefined], 'no limit is enforced while slicing is off');
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('a late-rendered reply is restored ahead of the newest trigger and a duplicate draft is retried', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  const originalReply = 'Sorry, I guess I kept talking in riddles about pacing and form.';
+  const replacement = 'You are Alex, and we can talk about whatever you want.';
+  const requests: Array<{
+    systemInstruction?: string;
+    messages: readonly { messageId: string; message: string }[];
+    trigger?: { messageId?: string };
+    responseTarget?: { messageId?: string };
+  }> = [];
+  const composeCalls: string[] = [];
+  let generateCall = 0;
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+    options,
+  ): Promise<string> => {
+    requests.push({
+      systemInstruction: options.systemInstruction,
+      messages: messages as readonly { messageId: string; message: string }[],
+      trigger: options.trigger ?? undefined,
+      responseTarget: options.responseTarget ?? undefined,
+    });
+    generateCall += 1;
+    if (generateCall === 1) {
+      return originalReply;
+    }
+    if (generateCall === 2) {
+      return originalReply;
+    }
+    return replacement;
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async (_page, text) => {
+    composeCalls.push(text);
+    return { status: 'sent' };
+  };
+
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flushEngine();
+  };
+
+  const { page, inject } = createInjectedMessengerPage();
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'first-1', sender: 'Alex', message: '@Bot first question' }]);
+    await advancePoll();
+    await advancePoll();
+    assert.equal(composeCalls.length, 1);
+
+    inject([{ messageId: 'second-1', sender: 'Alex', message: '@Bot second question' }]);
+    await advancePoll();
+
+    inject([
+      { messageId: 'second-2', sender: 'Alex', message: 'its too stale, who am i' },
+      { messageId: 'rendered-1', sender: 'You', message: originalReply },
+    ]);
+    await advancePoll();
+    await advancePoll();
+
+    assert.ok(requests.length >= 3, 'the duplicate draft is retried once');
+    const followUp = requests[1];
+    const followUpIds = followUp.messages.map(message => message.messageId);
+    const restoredIndex = followUpIds.indexOf('rendered-1');
+    const triggerIndex = followUpIds.indexOf('second-2');
+    assert.ok(restoredIndex >= 0, 'the late-rendered reply reaches generation');
+    assert.ok(triggerIndex >= 0, 'the latest relevant incoming message reaches generation');
+    assert.ok(
+      restoredIndex < triggerIndex,
+      'the late-rendered reply is restored before the message it contextualizes',
+    );
+    assert.equal(
+      followUp.messages.filter(message => message.messageId === 'rendered-1').length,
+      1,
+      'the restored reply is not duplicated',
+    );
+    assert.equal(followUp.trigger?.messageId, 'second-1');
+    assert.equal(followUp.responseTarget?.messageId, 'second-2');
+
+    const retry = requests[2];
+    const retryIds = retry.messages.map(message => message.messageId);
+    assert.ok(retryIds.includes('rendered-1'), 'the retry keeps recent assistant history');
+    assert.ok(retryIds.includes('second-2'), 'the retry keeps the latest user message');
+    assert.match(String(retry.systemInstruction), /already said in this conversation/);
+    assert.ok(String(retry.systemInstruction).includes(SELF_REPETITION_RETRY_INSTRUCTION));
+    assert.deepEqual(composeCalls, [originalReply, replacement]);
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('a violating reply is suppressed before composition and never becomes pending outgoing', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  const composeCalls: string[] = [];
+  const generatedRequests: Array<readonly { messageId: string; message: string }[]> = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    generatedRequests.push(messages as readonly { messageId: string; message: string }[]);
+    return 'gotta warm up first.';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async (_page, text) => {
+    composeCalls.push(text);
+    return { status: 'sent' };
+  };
+
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flushEngine();
+  };
+
+  const { page, inject } = createInjectedMessengerPage();
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'outside-1', sender: 'Alex', message: '@Bot let us go outside' }]);
+    await advancePoll();
+    await advancePoll();
+
+    assert.ok(generatedRequests.length >= 1, 'the packet reaches generation');
+    assert.deepEqual(composeCalls, [], 'the violating reply never reaches the composer');
+    assert.equal(
+      contextStore.getRecent(10).some(message => message.message.includes('warm up')),
+      false,
+      'the violating reply is not recorded as pending outgoing',
+    );
   } finally {
     await controller.stop();
     Math.random = originalRandom;

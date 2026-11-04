@@ -2,10 +2,13 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   ANTI_ECHO_RETRY_INSTRUCTION,
+  SELF_REPETITION_RETRY_INSTRUCTION,
   collectParticipantNames,
+  collectRecentAssistantMessages,
   findLatestIncomingMessage,
   generateReplyWithAntiEchoGuard,
   isEchoReply,
+  isSelfRepetitionReply,
   normalizeForEchoComparison,
 } from '../src/components/anti-echo.js';
 import {
@@ -242,4 +245,107 @@ test('the retry instruction is explicit about not echoing the incoming message',
   assert.match(ANTI_ECHO_RETRY_INSTRUCTION, /repeated the incoming message/);
   assert.match(ANTI_ECHO_RETRY_INSTRUCTION, /Do not copy, quote, restate, translate, or continue/);
   assert.match(ANTI_ECHO_RETRY_INSTRUCTION, /do not prepend a participant name/);
+});
+
+test('self-repetition detection uses recent logical replies and ignores harmless punctuation changes', () => {
+  const recent = collectRecentAssistantMessages([
+    { message: 'older reply', direction: 'OUTGOING', messageId: 'out-1' },
+    { message: 'first chunk of the last reply', direction: 'OUTGOING', messageId: 'out-2', replyBatchId: 'batch-a' },
+    { message: 'second chunk of the last reply', direction: 'OUTGOING', messageId: 'out-3', replyBatchId: 'batch-a' },
+    { message: 'another incoming', direction: 'INCOMING', messageId: 'in-1' },
+  ]);
+
+  assert.deepEqual(recent.map(message => message.messageId), ['out-3', 'out-2', 'out-1']);
+  assert.equal(
+    isSelfRepetitionReply(
+      'Sorry,  I guess I kept talking in riddles about pacing and form!',
+      ['sorry i guess i kept talking in riddles about pacing and form'],
+    ),
+    true,
+  );
+  assert.equal(
+    isSelfRepetitionReply(
+      'That sounds like a good plan; tell me what story you want next.',
+      ['Sorry, I guess I kept talking in riddles about pacing and form.'],
+    ),
+    false,
+    'sharing a phrase or subject is not a repetition',
+  );
+  assert.equal(
+    isSelfRepetitionReply('yes', ['yes']),
+    false,
+    'short conversational acknowledgements are not meaningful duplicates',
+  );
+  assert.match(SELF_REPETITION_RETRY_INSTRUCTION, /already said in this conversation/);
+});
+
+test('short exact and near-duplicate self-repetitions are detected without suppressing natural reactions', () => {
+  assert.equal(isSelfRepetitionReply('What part?', ['what part']), true);
+  assert.equal(
+    isSelfRepetitionReply(
+      'I keep telling you the same thing about the pacing and the form.',
+      ['I keep telling you the same thing about the pacing and form.'],
+    ),
+    true,
+    'a one-word difference in a long reply is a near-duplicate',
+  );
+  assert.equal(isSelfRepetitionReply('yeah', ['yeah']), false);
+  assert.equal(isSelfRepetitionReply('sounds good', ['sounds good']), false);
+  assert.equal(
+    isSelfRepetitionReply(
+      'The blue plan still works if we move the meeting.',
+      ['I would rather try the red option on Friday.'],
+    ),
+    false,
+    'a genuinely different sentence with shared words is not a duplicate',
+  );
+});
+
+test('near-echoes with small additions are detected while real answers remain valid', () => {
+  assert.equal(
+    isEchoReply('can you hear me right now', 'can you hear me'),
+    true,
+    'a small trailing addition does not hide an echo',
+  );
+  assert.equal(
+    isEchoReply('dude who are you exactly', 'dude who are you'),
+    true,
+    'a small trailing addition does not hide an echo',
+  );
+  assert.equal(
+    isEchoReply("Yeah, I'm here.", 'Are you there?'),
+    false,
+    'a real answer is not a near-echo',
+  );
+  assert.equal(
+    isEchoReply('Nothing much, just working.', 'what are you doing today?'),
+    false,
+    'an unrelated reply is not a near-echo',
+  );
+});
+
+test('a repeated assistant reply is retried once with a self-repetition instruction and then suppressed', async () => {
+  const attempts: Array<{ retry: boolean; reason?: string }> = [];
+  const logs: string[] = [];
+  const repeated = 'Sorry, I guess I kept talking in riddles about pacing and form.';
+  const outcome = await generateReplyWithAntiEchoGuard({
+    generate: async attempt => {
+      attempts.push(attempt);
+      return repeated;
+    },
+    isEcho: () => false,
+    isRepeat: reply => isSelfRepetitionReply(reply, [repeated]),
+    log: message => logs.push(message),
+  });
+
+  assert.deepEqual(attempts, [
+    { retry: false },
+    { retry: true, reason: 'repeat-self' },
+  ]);
+  assert.deepEqual(outcome, {
+    status: 'suppressed',
+    reason: 'repeat-self',
+    attempts: 2,
+  });
+  assert.ok(logs.some(line => line.includes('self-repetition instruction')));
 });

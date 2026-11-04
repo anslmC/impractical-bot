@@ -85,6 +85,7 @@ const existingConfiguration: Configuration = {
   messageDestination: 'https://www.facebook.com/messages',
   botTemperament: 'balanced',
   botPersonality: 'default',
+  composerSlicer: { enabled: true, maxCharacters: 500 },
 };
 
 test('browser profile paths use stable browser-specific names', () => {
