@@ -181,8 +181,10 @@ export function buildActiveTurnInstruction(
 
   const lines = [
     ACTIVE_TURN_INSTRUCTION_MARKER,
-    'The message marked trigger=true in the transcript is the authoritative response target.',
-    'Answer it in light of the complete conversation. Later messages may correct, clarify, react to, or change the subject, so use the newest turn as well as the preceding exchange.',
+    'The message marked trigger=true in the transcript is the response target.',
+    'The newest incoming message establishes the active topic when it is a newer direct turn or a clear change of subject; answer that topic instead of returning to an older mention or unanswered question.',
+    'Older unanswered questions are background context, not outstanding requests. Do not revive an older topic merely because its answer is missing from the visible history.',
+    'An older response target remains authoritative only when no newer incoming message has superseded it. Use the complete conversation, but let the newest incoming turn determine what is current.',
     `PACKET OPENED BY MESSAGE ID: ${trigger.packetTriggerMessageId ?? trigger.messageId ?? 'unavailable'}`,
     `RESPONSE TARGET MESSAGE ID: ${trigger.messageId ?? 'unavailable'}`,
     `NEWEST INCOMING MESSAGE ID: ${trigger.newestIncomingMessageId ?? 'unavailable'}`,

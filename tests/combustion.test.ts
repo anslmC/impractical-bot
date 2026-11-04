@@ -796,7 +796,7 @@ test('Personality changes at runtime apply to replies and keep the configured id
       systemInstruction: options.systemInstruction,
       messages: messages as readonly { message: string }[],
     });
-    return 'mocked reply';
+    return `mocked reply ${String(capturedRequests.length)}`;
   };
 
   const flush = (): Promise<void> => new Promise(resolve => setImmediate(resolve));
@@ -1006,7 +1006,7 @@ test('a burst is fully observed and a follow-up mention is still answered during
   ): Promise<string> => {
     void apiKey;
     generatedRequests.push(messages as readonly { messageId: string; message: string }[]);
-    return 'mocked reply';
+    return `mocked reply ${String(generatedRequests.length)}`;
   };
   (composerModule as unknown as {
     composeMessengerReply: typeof composerModule.composeMessengerReply;
@@ -2287,7 +2287,7 @@ test('a new incoming message after an RNG reply still gets its own opportunity',
     messages: readonly unknown[],
   ): Promise<string> => {
     generatedRequests.push(messages as readonly { messageId: string; message: string }[]);
-    return 'mocked reply';
+    return `mocked reply ${String(generatedRequests.length)}`;
   };
   (composerModule as unknown as {
     composeMessengerReply: typeof composerModule.composeMessengerReply;
@@ -2315,8 +2315,8 @@ test('a new incoming message after an RNG reply still gets its own opportunity',
     assert.equal(generatedRequests.length, 1);
 
     inject([
-      { messageId: '7522124487334215680', sender: 'You', message: 'mocked reply' },
-      { messageId: 'mid.$gAAW_bot-reply-1', sender: 'You', message: 'mocked reply', ariaLabel: null },
+      { messageId: '7522124487334215680', sender: 'You', message: 'mocked reply 1' },
+      { messageId: 'mid.$gAAW_bot-reply-1', sender: 'You', message: 'mocked reply 1', ariaLabel: null },
       { messageId: 'mid.$chat-2', sender: 'Blair', message: 'a genuinely new message' },
     ]);
     for (let poll = 0; poll < 16; poll += 1) {
@@ -2472,7 +2472,7 @@ test('one reply rendered under two ids becomes one Context Store message and one
     messages: readonly unknown[],
   ): Promise<string> => {
     generatedRequests.push(messages as typeof generatedRequests[number]);
-    return 'mocked reply';
+    return `mocked reply ${String(generatedRequests.length)}`;
   };
   (composerModule as unknown as {
     composeMessengerReply: typeof composerModule.composeMessengerReply;
@@ -2578,7 +2578,7 @@ test('non-adjacent duplicate reply ids merge without suppressing a genuine repea
     messages: readonly unknown[],
   ): Promise<string> => {
     generatedRequests.push(messages as typeof generatedRequests[number]);
-    return 'mocked reply';
+    return `mocked reply ${String(generatedRequests.length)}`;
   };
   (composerModule as unknown as {
     composeMessengerReply: typeof composerModule.composeMessengerReply;
@@ -2673,7 +2673,7 @@ test('an alternate reply id observed on a later poll does not create duplicate w
     messages: readonly unknown[],
   ): Promise<string> => {
     generatedRequests.push(messages as typeof generatedRequests[number]);
-    return 'mocked reply';
+    return `mocked reply ${String(generatedRequests.length)}`;
   };
   (composerModule as unknown as {
     composeMessengerReply: typeof composerModule.composeMessengerReply;
@@ -2844,7 +2844,7 @@ test('a bare-name mention opens a mention packet when the RNG path is unavailabl
     messages: readonly unknown[],
   ): Promise<string> => {
     generatedRequests.push(messages as readonly { messageId: string; message: string }[]);
-    return 'mocked reply';
+    return `mocked reply ${String(generatedRequests.length)}`;
   };
   (composerModule as unknown as {
     composeMessengerReply: typeof composerModule.composeMessengerReply;
@@ -3510,7 +3510,7 @@ test('an RNG cooldown that expires is noticed on the next poll, not the next cad
     generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
   }).generateNvidiaReply = async () => {
     replies.push('reply');
-    return 'mocked reply';
+    return `mocked reply ${String(replies.length)}`;
   };
   (composerModule as unknown as {
     composeMessengerReply: typeof composerModule.composeMessengerReply;
@@ -4146,6 +4146,54 @@ test('legitimate short replies from both trigger paths are still sent', async co
   }
 });
 
+test('an exact short repeat after an intervening incoming message is retried', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  const harness = installAntiEchoPipelineMocks([
+    'whatever.',
+    'Whatever.',
+    'Here.',
+  ]);
+  const { page, inject } = createInjectedMessengerPage();
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'repeat-short-1', sender: 'Alex', message: '@Bot what?' }]);
+    for (let poll = 0; poll < 3; poll += 1) {
+      context.mock.timers.tick(3_000);
+      await flushEngine();
+    }
+    assert.deepEqual(harness.composedReplies, ['whatever.']);
+
+    inject([{ messageId: 'repeat-short-2', sender: 'Alex', message: '@Bot are you there?' }]);
+    for (let poll = 0; poll < 3; poll += 1) {
+      context.mock.timers.tick(3_000);
+      await flushEngine();
+    }
+
+    assert.equal(harness.generateRequests.length, 3, 'the repeated short reply is retried once');
+    assert.deepEqual(harness.composedReplies, ['whatever.', 'Here.']);
+    assert.ok(
+      String(harness.generateRequests[2].systemInstruction)
+        .includes(SELF_REPETITION_RETRY_INSTRUCTION),
+      'the retry uses the existing self-repetition instruction',
+    );
+  } finally {
+    await controller.stop();
+    harness.restore();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+  }
+});
+
 test('participant speaker labels never reach the composer from either trigger path', async context => {
   context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
   const originalRandom = Math.random;
@@ -4232,6 +4280,59 @@ test('a reply that echoes with a speaker label is still retried and suppressed',
     await controller.stop();
     harness.restore();
     Math.random = originalRandom;
+    context.mock.timers.reset();
+  }
+});
+
+test('normalization diagnostics report the actual removed suffix and final accepted result', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  const originalLog = console.log;
+  const logs: string[] = [];
+  Math.random = () => 0.99;
+  console.log = (...values: unknown[]) => {
+    logs.push(values.map(String).join(' '));
+  };
+  const harness = installAntiEchoPipelineMocks(['whatever. what about you?']);
+  const { page, inject } = createInjectedMessengerPage();
+  const controller = await startCombustion({
+    page,
+    contextStore: createContextStore(),
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'normalize-1', sender: 'Alex', message: '@Bot what?' }]);
+    for (let poll = 0; poll < 3; poll += 1) {
+      context.mock.timers.tick(3_000);
+      await flushEngine();
+    }
+
+    assert.deepEqual(harness.composedReplies, ['whatever.']);
+    const trailingQuestion = logs.find(line =>
+      line.startsWith('[generation] ') &&
+      line.includes('stage=normalization') &&
+      line.includes('step=trailing-questions'));
+    assert.ok(trailingQuestion);
+    assert.match(trailingQuestion, /outcome=changed/u);
+    assert.match(trailingQuestion, /removedPrefix="" removedSuffix=" what about you\?"/u);
+    assert.match(trailingQuestion, /preview="whatever\."/u);
+
+    const final = logs.find(line =>
+      line.startsWith('[generation] ') &&
+      line.includes('stage=final'));
+    assert.ok(final);
+    assert.match(final, /attempt=first outcome=accepted reason=none/u);
+    assert.match(final, /guard=accepted/u);
+    assert.match(final, /preview="whatever\."/u);
+  } finally {
+    await controller.stop();
+    harness.restore();
+    Math.random = originalRandom;
+    console.log = originalLog;
     context.mock.timers.reset();
   }
 });
@@ -4614,7 +4715,7 @@ test('a long reply is delivered as consecutive bubbles from one generation', asy
     messages: readonly unknown[],
   ): Promise<string> => {
     generatedRequests.push(messages as typeof generatedRequests[number]);
-    return reply;
+    return generatedRequests.length === 1 ? reply : 'A different short reply.';
   };
   (composerModule as unknown as {
     composeMessengerReply: typeof composerModule.composeMessengerReply;
@@ -4631,7 +4732,7 @@ test('a long reply is delivered as consecutive bubbles from one generation', asy
     await flushEngine();
     let previousCalls = composeCalls.length;
     while (previousCalls > 0) {
-      context.mock.timers.tick(900);
+      context.mock.timers.tick(1000);
       await flushEngine();
       if (composeCalls.length === previousCalls) {
         break;
@@ -4702,7 +4803,7 @@ test('a long reply is delivered as consecutive bubbles from one generation', asy
   }
 });
 
-test('sliced bubbles are spaced by 900ms with no delay after the last bubble', async context => {
+test('sliced bubbles are spaced by 1000ms with no delay after the last bubble', async context => {
   context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
   const originalRandom = Math.random;
   const originalLog = console.log;
@@ -4751,14 +4852,14 @@ test('sliced bubbles are spaced by 900ms with no delay after the last bubble', a
     assert.equal(composeCalls.length, 1, 'the first bubble is sent immediately');
     assert.equal(composeTimes[0], Date.now(), 'the first bubble does not wait');
 
-    context.mock.timers.tick(899);
+    context.mock.timers.tick(999);
     await flushEngine();
     assert.equal(composeCalls.length, 1, 'the second bubble waits for the full delay');
 
     context.mock.timers.tick(1);
     await flushEngine();
-    assert.equal(composeCalls.length, 2, 'the second bubble arrives after 900ms');
-    assert.equal(composeTimes[1] - composeTimes[0], 900, 'bubbles are spaced by 900ms');
+    assert.equal(composeCalls.length, 2, 'the second bubble arrives after 1000ms');
+    assert.equal(composeTimes[1] - composeTimes[0], 1000, 'bubbles are spaced by 1000ms');
     assert.ok(
       logs.some(line => line.includes('status=complete') && line.includes('delivered=2/2')),
       'the batch completes without waiting after the last bubble',
@@ -4820,7 +4921,7 @@ test('stopping during the inter-bubble delay prevents the next bubble', async co
     await controller.stop();
     assert.equal(composeCalls.length, 1, 'no bubble is sent after cancellation');
 
-    context.mock.timers.tick(900);
+    context.mock.timers.tick(1000);
     await flushEngine();
     assert.equal(composeCalls.length, 1, 'the cancelled delay cannot resume');
   } finally {
@@ -4877,7 +4978,7 @@ test('pausing during the inter-bubble delay keeps the active batch moving', asyn
     assert.equal(composeCalls.length, 1);
 
     await controller.pause();
-    context.mock.timers.tick(900);
+    context.mock.timers.tick(1000);
     await flushEngine();
     assert.equal(composeCalls.length, 2, 'the active batch finishes while polling is paused');
     await controller.resume();
@@ -4995,7 +5096,7 @@ test('a blocked bubble stops the batch without resending delivered bubbles', asy
     await flushEngine();
     let previousCalls = composeCalls.length;
     while (previousCalls > 0) {
-      context.mock.timers.tick(900);
+      context.mock.timers.tick(1000);
       await flushEngine();
       if (composeCalls.length === previousCalls) {
         break;
@@ -5088,7 +5189,7 @@ test('an RNG reply is sliced through the same delivery path', async context => {
     await flushEngine();
     let previousCalls = composeCalls.length;
     while (previousCalls > 0) {
-      context.mock.timers.tick(900);
+      context.mock.timers.tick(1000);
       await flushEngine();
       if (composeCalls.length === previousCalls) {
         break;
@@ -5173,7 +5274,7 @@ test('a 291 character reply honours a configured ten character maximum', async c
     await flushEngine();
     let previousCalls = composeCalls.length;
     while (previousCalls > 0) {
-      context.mock.timers.tick(900);
+      context.mock.timers.tick(1000);
       await flushEngine();
       if (composeCalls.length === previousCalls) {
         break;
@@ -5264,7 +5365,7 @@ test('a configuration without slicer settings uses the default maximum', async c
     await flushEngine();
     let previousCalls = composeCalls.length;
     while (previousCalls > 0) {
-      context.mock.timers.tick(900);
+      context.mock.timers.tick(1000);
       await flushEngine();
       if (composeCalls.length === previousCalls) {
         break;

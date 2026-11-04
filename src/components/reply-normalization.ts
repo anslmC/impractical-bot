@@ -119,10 +119,26 @@ export function stripSelfIdentifyingPrefix(
   return reply;
 }
 
-const FILLER_QUESTION =
-  /^(?:so\s+|and\s+|but\s+)?(?:what(?:'s| is) (?:up|good(?: lately)?|new)|what about you|how about you|how(?:'s| is) your day(?: going)?|anything new(?: going on)?(?:,? or just checking in)?|anything else|just checking in|what(?:'s| is) on your mind|anything exciting happen(?:ing)?|what are you up to|how are you(?: doing)?|what have you been up to)\??$/iu;
-const FILLER_QUESTION_SOURCE =
-  "(?:so\\s+|and\\s+|but\\s+)?(?:what(?:'s| is) (?:up|good(?: lately)?|new)|what about you|how about you|how(?:'s| is) your day(?: going)?|anything new(?: going on)?(?:,? or just checking in)?|anything else|just checking in|what(?:'s| is) on your mind|anything exciting happen(?:ing)?|what are you up to|how are you(?: doing)?|what have you been up to)";
+const RECIPROCAL_QUESTION_SOURCE =
+  "(?:so\\s+|and\\s+|but\\s+)?(?:you|yourself|what about (?:you|yourself)|how about (?:you|yourself)|what(?:'s| is) (?:up|good(?: lately)?|new)|how(?:'s| is) your day(?: going)?|anything new(?: going on)?(?:,? or just checking in)?|anything else|just checking in|what(?:'s| is) on your mind|anything exciting happen(?:ing)?|what are you up to|how are you(?: doing)?|what have you been up to)";
+const GENERIC_ENGAGEMENT_QUESTION_SOURCE =
+  "(?:so\\s+|and\\s+|but\\s+)?(?:anything (?:interesting|fun|exciting)(?: (?:going on|happening))?|what (?:did|do) you have in mind)";
+const RECIPROCAL_QUESTION = new RegExp(`^(?:${RECIPROCAL_QUESTION_SOURCE})$`, 'iu');
+const GENERIC_ENGAGEMENT_QUESTION = new RegExp(
+  `^(?:${GENERIC_ENGAGEMENT_QUESTION_SOURCE})$`,
+  'iu',
+);
+const FOLLOW_UP_SETUP =
+  /\b(?:we (?:could|can|should)|let'?s|maybe|how about|why not|i (?:could|can|would)|i(?:'m| am) (?:free|available|busy)|you (?:could|can|might|should)|suggest(?:ion)?|recommend(?:ation)?)\b/iu;
+
+function shouldStripTrailingQuestion(question: string, preceding: string): boolean {
+  const withoutTerminalPunctuation = question.replace(/[.!?]+$/u, '').trim();
+  if (RECIPROCAL_QUESTION.test(withoutTerminalPunctuation)) {
+    return true;
+  }
+  return GENERIC_ENGAGEMENT_QUESTION.test(withoutTerminalPunctuation) &&
+    !FOLLOW_UP_SETUP.test(preceding);
+}
 
 export function stripGenericTrailingQuestions(reply: string): string {
   const trimmedReply = reply.trim();
@@ -132,17 +148,21 @@ export function stripGenericTrailingQuestions(reply: string): string {
 
   const segments = trimmedReply.split(/(?<=[.!?])\s+/u);
   const lastSegment = segments.at(-1) ?? '';
-  const withoutTerminalPunctuation = lastSegment.replace(/[.!?]+$/u, '').trim();
-  if (FILLER_QUESTION.test(withoutTerminalPunctuation) && segments.length > 1) {
-    return segments.slice(0, -1).join(' ').trimEnd();
+  const precedingSegments = segments.slice(0, -1).join(' ');
+  if (segments.length > 1 && shouldStripTrailingQuestion(lastSegment, precedingSegments)) {
+    return precedingSegments.trimEnd();
   }
 
-  const commaFiller = new RegExp(
-    '^(.*?)[,;]\\s*' + FILLER_QUESTION_SOURCE + '[.!?]*\\s*$',
+  const commaQuestion = new RegExp(
+    '^(.*?)[,;]\\s*((?:' +
+      RECIPROCAL_QUESTION_SOURCE +
+      '|' +
+      GENERIC_ENGAGEMENT_QUESTION_SOURCE +
+      '))[.!?]*\\s*$',
     'iu',
   );
-  const match = commaFiller.exec(trimmedReply);
-  if (match && match[1].trim()) {
+  const match = commaQuestion.exec(trimmedReply);
+  if (match && match[1].trim() && shouldStripTrailingQuestion(match[2], match[1])) {
     return match[1].trimEnd();
   }
   return reply;

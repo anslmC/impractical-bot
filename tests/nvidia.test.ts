@@ -59,6 +59,29 @@ function generateTestReply(
   });
 }
 
+async function captureRequest(
+  messages: Parameters<typeof generateNvidiaReply>[1],
+  options: Partial<Parameters<typeof generateNvidiaReply>[2]> = {},
+): Promise<{ systemInstruction: string; turns: Array<{ role: string; content: string }> }> {
+  let body: { messages: Array<{ role: string; content: string }> } | undefined;
+
+  await generateNvidiaReply('nvapi-test-key', messages, {
+    systemInstruction: 'Production instruction.',
+    identity: { name: 'Yukinon' },
+    ...options,
+    fetch: async (_input, init) => {
+      body = JSON.parse(String(init?.body)) as typeof body;
+      return successfulCompletion('ok');
+    },
+  });
+
+  assert.ok(body);
+  return {
+    systemInstruction: body.messages[0].content,
+    turns: body.messages.slice(1),
+  };
+}
+
 function messengerMessage(
   id: string,
   sender: string,
@@ -2100,6 +2123,187 @@ test('the selected response target keeps later messages in the request without d
   assert.match(systemInstruction, /PACKET OPENED BY MESSAGE ID: in-1/u);
   assert.match(systemInstruction, /RESPONSE TARGET MESSAGE ID: in-2/u);
   assert.match(systemInstruction, /NEWEST INCOMING MESSAGE ID: in-3/u);
+  assert.match(systemInstruction, /The newest incoming message establishes the active topic/u);
+  assert.match(
+    systemInstruction,
+    /An older response target remains authoritative only when no newer incoming message has superseded it/u,
+  );
+});
+
+test('the newest incoming topic outranks an older unanswered identity question', async () => {
+  const identityQuestion = messengerMessage(
+    'in-1',
+    'Alex',
+    'INCOMING',
+    '@Yukinon who are you?',
+  );
+  const identityAnswer = messengerMessage(
+    'out-1',
+    'You',
+    'OUTGOING',
+    'I am Yukinon.',
+  );
+  const bikeTopic = messengerMessage(
+    'in-2',
+    'Blair',
+    'INCOMING',
+    'I rode my bike home in the rain.',
+  );
+  const justAsking = messengerMessage(
+    'in-3',
+    'Alex',
+    'INCOMING',
+    'im just asking',
+  );
+
+  const withAnswer = await captureRequest(
+    [identityQuestion, identityAnswer, bikeTopic, justAsking],
+    { trigger: identityQuestion, responseTarget: identityQuestion },
+  );
+  assert.match(
+    withAnswer.systemInstruction,
+    /Older unanswered questions are background context, not outstanding requests/u,
+  );
+  assert.match(
+    withAnswer.systemInstruction,
+    /Do not revive an older topic merely because its answer is missing/u,
+  );
+  assert.match(withAnswer.systemInstruction, /RESPONSE TARGET MESSAGE ID: in-1/u);
+  assert.match(withAnswer.systemInstruction, /NEWEST INCOMING MESSAGE ID: in-3/u);
+
+  const withoutAnswer = await captureRequest(
+    [identityQuestion, bikeTopic, justAsking],
+    { trigger: identityQuestion, responseTarget: identityQuestion },
+  );
+  assert.match(
+    withoutAnswer.systemInstruction,
+    /Older unanswered questions are background context, not outstanding requests/u,
+  );
+  assert.match(
+    withoutAnswer.systemInstruction,
+    /NEWEST INCOMING MESSAGE ID: in-3/u,
+  );
+});
+
+test('an older response target stays active when no newer incoming message supersedes it', async () => {
+  const question = messengerMessage(
+    'in-1',
+    'Alex',
+    'INCOMING',
+    '@Yukinon what do you think?',
+  );
+  const { systemInstruction, turns } = await captureRequest(
+    [question],
+    { trigger: question, responseTarget: question },
+  );
+
+  assert.equal(turns.length, 1);
+  assert.match(turns[0].content, /trigger=true/u);
+  assert.match(systemInstruction, /RESPONSE TARGET MESSAGE ID: in-1/u);
+  assert.match(systemInstruction, /NEWEST INCOMING MESSAGE ID: in-1/u);
+  assert.match(
+    systemInstruction,
+    /An older response target remains authoritative only when no newer incoming message has superseded it/u,
+  );
+});
+
+test('generation diagnostics expose raw drafts, retries, validation reasons, and the accepted attempt', async () => {
+  const logs: string[] = [];
+  const originalLog = console.log;
+  let call = 0;
+  console.log = (...values: unknown[]) => {
+    logs.push(values.map(String).join(' '));
+  };
+
+  try {
+    const reply = await generateNvidiaReply('nvapi-test-key', [
+      messengerMessage('in-1', 'Alex', 'INCOMING', 'are you there?'),
+    ], {
+      systemInstruction: 'Production instruction.',
+      identity: { name: 'Yukinon' },
+      requestDiagnostics: {
+        packetId: 'packet-gen',
+        packetType: 'mention',
+      },
+      fetch: async () => {
+        call += 1;
+        return call === 1
+          ? successfulCompletion("Hear you? Opo,\ntalo na ako sa'yo.")
+          : successfulCompletion('I am here.');
+      },
+    });
+
+    assert.equal(reply, 'I am here.');
+  } finally {
+    console.log = originalLog;
+  }
+
+  const generationLogs = logs.filter(line => line.startsWith('[generation] '));
+  const firstRaw = generationLogs.find(line =>
+    line.includes('stage=raw attempt=first'));
+  const firstValidation = generationLogs.find(line =>
+    line.includes('stage=validation attempt=first'));
+  const retryRaw = generationLogs.find(line =>
+    line.includes('stage=raw attempt=retry'));
+  const retryValidation = generationLogs.find(line =>
+    line.includes('stage=validation attempt=retry'));
+  const accepted = generationLogs.find(line =>
+    line.includes('stage=accepted'));
+
+  assert.ok(firstRaw);
+  assert.match(firstRaw, /packet=packet-gen type=mention/u);
+  assert.match(firstRaw, /trigger=in-1 target=in-1/u);
+  assert.match(firstRaw, /hash=[a-f0-9]{12}/u);
+  assert.match(firstRaw, /preview="Hear you\? Opo,\\ntalo na ako/u);
+  assert.match(firstValidation ?? '', /outcome=retry reason=language:non-english/u);
+  assert.ok(retryRaw);
+  assert.match(retryRaw, /preview="I am here\."/u);
+  assert.match(retryValidation ?? '', /outcome=accepted reason=none/u);
+  assert.match(accepted ?? '', /stage=accepted attempt=retry/u);
+  assert.match(accepted ?? '', /outcome=accepted reason=none/u);
+  assert.equal(
+    generationLogs.some(line => line.includes('stage=accepted attempt=first')),
+    false,
+    'the rejected first draft is not reported as accepted',
+  );
+  assert.ok(
+    generationLogs.every(line => line.length < 400),
+    'diagnostic previews remain bounded',
+  );
+});
+
+test('a first draft accepted immediately is reported as the accepted first attempt', async () => {
+  const logs: string[] = [];
+  const originalLog = console.log;
+  console.log = (...values: unknown[]) => {
+    logs.push(values.map(String).join(' '));
+  };
+
+  try {
+    await generateNvidiaReply('nvapi-test-key', [
+      messengerMessage('in-1', 'Alex', 'INCOMING', 'how are you?'),
+    ], {
+      systemInstruction: 'Production instruction.',
+      identity: { name: 'Yukinon' },
+      requestDiagnostics: {
+        packetId: 'packet-first',
+        packetType: 'rng',
+      },
+      fetch: async () => successfulCompletion('Doing well.'),
+    });
+  } finally {
+    console.log = originalLog;
+  }
+
+  assert.ok(logs.some(line =>
+    line.includes('stage=validation attempt=first outcome=accepted reason=none')));
+  assert.ok(logs.some(line =>
+    line.includes('stage=accepted attempt=first outcome=accepted reason=none')));
+  assert.equal(
+    logs.some(line => line.includes('stage=raw attempt=retry')),
+    false,
+    'no retry output is reported when the first draft is accepted',
+  );
 });
 
 test('request diagnostics log the resolved trigger, bounded turn previews, and history restoration', async () => {

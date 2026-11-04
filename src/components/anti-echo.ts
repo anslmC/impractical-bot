@@ -182,27 +182,96 @@ export function isEchoReply(
   return false;
 }
 
+export interface SelfRepetitionOptions extends EchoNormalizationOptions {
+  history?: readonly AntiEchoMessage[];
+}
+
+interface AssistantReplyGroup {
+  text: string;
+  hasFollowingIncoming: boolean;
+}
+
+function collectRecentAssistantReplyGroups(
+  messages: readonly AntiEchoMessage[],
+  limit = 3,
+): AssistantReplyGroup[] {
+  const groups: Array<{ texts: string[]; lastIndex: number }> = [];
+  const groupByBatch = new Map<string, number>();
+  const seenMessageIds = new Set<string>();
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (message?.direction !== 'OUTGOING' ||
+        typeof message.message !== 'string' ||
+        message.message.trim().length === 0) {
+      continue;
+    }
+    if (typeof message.messageId === 'string' && message.messageId.trim()) {
+      if (seenMessageIds.has(message.messageId)) {
+        continue;
+      }
+      seenMessageIds.add(message.messageId);
+    }
+    const batchId = typeof message.replyBatchId === 'string' &&
+      message.replyBatchId.trim().length > 0
+      ? message.replyBatchId
+      : null;
+    let groupIndex = batchId === null ? undefined : groupByBatch.get(batchId);
+    if (groupIndex === undefined) {
+      groupIndex = groups.length;
+      groups.push({ texts: [], lastIndex: index });
+      if (batchId !== null) {
+        groupByBatch.set(batchId, groupIndex);
+      }
+    }
+    const group = groups[groupIndex];
+    group.texts.push(message.message);
+    group.lastIndex = index;
+  }
+  return groups.slice(-limit).map(group => ({
+    text: group.texts.join(''),
+    hasFollowingIncoming: messages.slice(group.lastIndex + 1).some(message =>
+      message?.direction === 'INCOMING' &&
+      typeof message.message === 'string' &&
+      message.message.trim().length > 0),
+  }));
+}
+
 export function isSelfRepetitionReply(
   reply: string,
   recentReplies: readonly (string | AntiEchoMessage)[],
-  options: EchoNormalizationOptions = {},
+  options: SelfRepetitionOptions = {},
 ): boolean {
   const normalizedReply = normalizeForEchoComparison(reply, options);
-  const replyTokens = tokenizeNormalized(normalizedReply);
-  if (replyTokens.length < 2) {
+  if (!normalizedReply) {
     return false;
   }
   if (COMMON_SHORT_REPLY_PHRASES.has(normalizedReply)) {
     return false;
   }
-  return recentReplies.some(candidate => {
-    const text = typeof candidate === 'string' ? candidate : candidate.message;
-    const normalizedCandidate = normalizeForEchoComparison(text, options);
+  const replyTokens = tokenizeNormalized(normalizedReply);
+  const candidates: Array<{ text: string; historyGroup: boolean }> =
+    options.history === undefined
+      ? recentReplies.map(candidate => ({
+        text: typeof candidate === 'string' ? candidate : candidate.message,
+        historyGroup: false,
+      }))
+      : collectRecentAssistantReplyGroups(options.history).map(group => ({
+        text: group.text,
+        historyGroup: group.hasFollowingIncoming,
+      }));
+  return candidates.some(candidate => {
+    const normalizedCandidate = normalizeForEchoComparison(candidate.text, options);
     if (!normalizedCandidate) {
       return false;
     }
     if (normalizedCandidate === normalizedReply) {
-      return replyTokens.length >= 3 || reply.trim().endsWith('?');
+      if (candidate.historyGroup) {
+        return true;
+      }
+      if (options.history === undefined &&
+          (replyTokens.length >= 3 || reply.trim().endsWith('?'))) {
+        return true;
+      }
     }
     const candidateTokens = tokenizeNormalized(normalizedCandidate);
     return replyTokens.length >= 4 &&
@@ -218,6 +287,7 @@ export function collectRecentAssistantMessages(
 ): AntiEchoMessage[] {
   const collected: AntiEchoMessage[] = [];
   const seenBatches = new Set<string>();
+  const seenMessageIds = new Set<string>();
   let groups = 0;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
@@ -225,6 +295,12 @@ export function collectRecentAssistantMessages(
         typeof message.message !== 'string' ||
         message.message.trim().length === 0) {
       continue;
+    }
+    if (typeof message.messageId === 'string' && message.messageId.trim()) {
+      if (seenMessageIds.has(message.messageId)) {
+        continue;
+      }
+      seenMessageIds.add(message.messageId);
     }
     const batchId = typeof message.replyBatchId === 'string' &&
       message.replyBatchId.trim().length > 0

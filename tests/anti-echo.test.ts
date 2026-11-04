@@ -301,6 +301,81 @@ test('short exact and near-duplicate self-repetitions are detected without suppr
   );
 });
 
+test('a short exact reply is repeated only when an incoming message intervenes', () => {
+  const withInterveningIncoming = [
+    { message: 'whatever.', direction: 'OUTGOING', messageId: 'out-1' },
+    { message: 'are you still there?', direction: 'INCOMING', messageId: 'in-1' },
+    { message: 'what do you think?', direction: 'INCOMING', messageId: 'in-2' },
+  ];
+  const withoutInterveningIncoming = [
+    { message: 'whatever.', direction: 'OUTGOING', messageId: 'out-1' },
+  ];
+
+  assert.equal(
+    isSelfRepetitionReply('  Whatever.  ', [], { history: withInterveningIncoming }),
+    true,
+    'case and whitespace differences do not hide the repeat',
+  );
+  assert.equal(
+    isSelfRepetitionReply('whatever.', [], { history: withoutInterveningIncoming }),
+    false,
+    'another observation of the same turn is not a repeated reply',
+  );
+  assert.equal(
+    isSelfRepetitionReply('whatever.', ['whatever.']),
+    false,
+    'the legacy fallback keeps acknowledging short messages as non-repetitions',
+  );
+  assert.equal(
+    isSelfRepetitionReply('sounds good', [], {
+      history: [
+        { message: 'sounds good', direction: 'OUTGOING', messageId: 'out-1' },
+        { message: 'want to study?', direction: 'INCOMING', messageId: 'in-1' },
+      ],
+    }),
+    false,
+    'the legitimate short-reply allowlist is preserved',
+  );
+});
+
+test('composer batches are compared as one logical reply, not separate bubbles', () => {
+  const history = [
+    {
+      message: 'whatever.',
+      direction: 'OUTGOING',
+      messageId: 'out-1',
+      replyBatchId: 'batch-a',
+    },
+    {
+      message: 'Tell me more.',
+      direction: 'OUTGOING',
+      messageId: 'out-2',
+      replyBatchId: 'batch-a',
+    },
+    {
+      message: 'are you still there?',
+      direction: 'INCOMING',
+      messageId: 'in-1',
+    },
+  ];
+
+  assert.equal(
+    isSelfRepetitionReply('whatever.', [], { history }),
+    false,
+    'the first sliced bubble is not treated as the whole earlier reply',
+  );
+});
+
+test('duplicate observations of the same outgoing message are collected once', () => {
+  const recent = collectRecentAssistantMessages([
+    { message: 'first reply', direction: 'OUTGOING', messageId: 'out-1' },
+    { message: 'first reply', direction: 'OUTGOING', messageId: 'out-1' },
+    { message: 'second reply', direction: 'OUTGOING', messageId: 'out-2' },
+  ]);
+
+  assert.deepEqual(recent.map(message => message.messageId), ['out-2', 'out-1']);
+});
+
 test('near-echoes with small additions are detected while real answers remain valid', () => {
   assert.equal(
     isEchoReply('can you hear me right now', 'can you hear me'),

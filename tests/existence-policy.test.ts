@@ -20,6 +20,7 @@ test('classifies physical invitations, whereabouts, offline activity, and schedu
   assert.equal(classifyExistenceTrigger('What are you doing today?'), 'offline-activity-query');
   assert.equal(classifyExistenceTrigger("What's your schedule?"), 'schedule-query');
   assert.equal(classifyExistenceTrigger('That meme is wild'), 'none');
+  assert.equal(classifyExistenceTrigger('btw do you know how to ride a bike?'), 'none');
 });
 
 test('rejects explicit and implicit physical participation', () => {
@@ -40,6 +41,37 @@ test('rejects explicit and implicit physical participation', () => {
   for (const [reply, trigger] of cases) {
     const result = validate(reply, trigger);
     assert.equal(result.valid, false, `expected rejection: ${reply}`);
+  }
+});
+
+test('rejects concise first-person past physical experiences', () => {
+  const cases = [
+    'I was walking home in the rain.',
+    'I was driving to work.',
+    'I walked home in the rain.',
+    'I rode my bike home in the rain.',
+    'I had to wade through knee-deep water.',
+    'I got completely drenched.',
+  ];
+
+  for (const reply of cases) {
+    const result = validate(reply, 'What did you do today?');
+    assert.equal(result.valid, false, `expected rejection: ${reply}`);
+  }
+});
+
+test('accepts non-physical past-tense statements', () => {
+  const cases = [
+    'I was joking.',
+    'I was thinking about it.',
+    'I was in the chat.',
+    'I got it.',
+    'I ran out of time.',
+  ];
+
+  for (const reply of cases) {
+    const result = validate(reply, 'What did you do today?');
+    assert.equal(result.valid, true, `expected acceptance: ${reply}`);
   }
 });
 

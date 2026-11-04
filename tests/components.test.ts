@@ -1256,6 +1256,8 @@ test('conversation policy avoids repetition and answers the current topic', () =
     behavioral,
     /respond to the actual latest relevant message instead of restarting the conversation/,
   );
+  assert.match(behavioral, /newest incoming message defines the active topic/);
+  assert.match(behavioral, /older unanswered questions are background context/);
   assert.doesNotMatch(getDefaultPersonalityInstruction(), /do not repeat a reply you already sent/);
 });
 
@@ -1360,6 +1362,12 @@ test('bot identity follows a new subject instead of continuing an old argument',
   assert.match(identity, /do not comment on how often you have been asked/);
   assert.match(identity, /Do not resend an answer you already gave/);
   assert.match(identity, /when the user asks you to repeat something, repeat the requested text/);
+  assert.match(identity, /newest incoming message establishes the active topic/);
+  assert.match(identity, /older unanswered questions are background context, not requests to return to/);
+  assert.match(
+    identity,
+    /earlier mention or response target remains relevant only when a newer incoming message has not superseded it/,
+  );
 });
 
 test('the composed system prompt carries the no-argument rules into production', () => {
@@ -1703,6 +1711,30 @@ test('production prompt defaults to ending a complete turn without a follow-up q
   assert.match(composed, /Ask only when you genuinely need information, clarification, or a decision/u);
   assert.ok(composed.indexOf('Deadpan.') < composed.indexOf(initiative));
   assert.ok(composed.indexOf('roughly 3–12 words') < composed.indexOf(initiative));
+});
+
+test('production prompt forbids obligatory reciprocal questions and allows standalone statements', () => {
+  const composed = composeTestPrompt('custom', 'Deadpan.');
+
+  assert.match(
+    composed,
+    /A question from someone does not obligate you to ask a question back/u,
+  );
+  assert.match(
+    composed,
+    /answering a question is often a complete conversational contribution/u,
+  );
+  assert.match(
+    composed,
+    /a remark, reaction, opinion, joke, or teasing response can stand alone/u,
+  );
+  assert.match(composed, /do not append a question merely to keep the conversation alive/u);
+  assert.match(composed, /Do not routinely redirect attention back to the sender/u);
+  assert.match(composed, /participate in the conversation rather than interviewing its participants/u);
+  assert.match(composed, /genuine contextual curiosity/u);
+  assert.match(composed, /be comfortable ending a response with a statement/u);
+  assert.match(composed, /"And you\?", "What about you\?", "How about you\?"/u);
+  assert.match(composed, /"Anything interesting\?", or "What did you have in mind\?"/u);
 });
 
 test('memory and initiative instructions are appended once and stay idempotent', () => {

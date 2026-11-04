@@ -81,6 +81,12 @@ import {
   stripParticipantSpeakerLabel,
   stripSelfIdentifyingPrefix,
 } from './reply-normalization.js';
+import {
+  boundedDiagnosticPreview,
+  describeTextChange,
+  formatGenerationDiagnostic,
+  type GenerationDiagnosticInput,
+} from './reply-diagnostics.js';
 import { createPacketScheduler } from './packet-scheduler.js';
 import { createPauseGate } from './pause-gate.js';
 import {
@@ -98,7 +104,7 @@ const WAKER_MESSAGE_SELECTOR = '[data-message-id]';
 const MESSAGE_LIMIT = 20;
 const CONTEXT_STORE_CAPACITY = 60;
 const POLL_INTERVAL_MS = 1500;
-const COMPOSER_CHUNK_DELAY_MS = 900;
+const COMPOSER_CHUNK_DELAY_MS = 1000;
 const RNG_ROLL_INTERVAL_MS = 7000;
 const RNG_CONTEXT_MESSAGE_LIMIT = 25;
 const PACKET_CONTEXT_MESSAGE_LIMIT = 20;
@@ -2145,6 +2151,48 @@ export async function startCombustion({
         const recentAssistantReplies = collectRecentAssistantMessages(
           messages as readonly EngineMessage[],
         );
+        const generationPacketId =
+          packet.packetId ?? activePacketContext?.packetId ?? 'unknown';
+        const generationPacketType = activePacketContext?.type ?? 'unknown';
+        const generationTriggerId =
+          targetingTrigger?.messageId ?? generation.trigger?.messageId ?? null;
+        const generationTargetId = responseTarget?.messageId ?? null;
+        const logGeneration = (
+          diagnostic: Omit<
+            GenerationDiagnosticInput,
+            'packetId' | 'packetType' | 'triggerId' | 'targetId'
+          >,
+        ): void => {
+          console.log(formatGenerationDiagnostic({
+            ...diagnostic,
+            packetId: generationPacketId,
+            packetType: generationPacketType,
+            triggerId: generationTriggerId,
+            targetId: generationTargetId,
+          }));
+        };
+        const logNormalizationStage = (
+          step: string,
+          before: string,
+          after: string,
+          attempt: string,
+          fields: readonly string[] = [],
+        ): void => {
+          const change = describeTextChange(before, after);
+          logGeneration({
+            stage: 'normalization',
+            attempt,
+            text: after,
+            previousText: before,
+            outcome: before === after ? 'unchanged' : 'changed',
+            fields: [
+              `step=${step}`,
+              `removedPrefix=${boundedDiagnosticPreview(change.removedPrefix, 80)}`,
+              `removedSuffix=${boundedDiagnosticPreview(change.removedSuffix, 80)}`,
+              ...fields,
+            ],
+          });
+        };
         let effectiveRelay = targeting?.relay ?? null;
         let relayKey: string | null = null;
         if (effectiveRelay) {
@@ -2197,25 +2245,46 @@ export async function startCombustion({
               onDiagnostic: reportTranscriptDiagnostic,
             },
           );
+          const attempt = retry ? 'retry' : 'first';
+          const withoutSelfIdentifyingPrefix = stripSelfIdentifyingPrefix(
+            reply,
+            identity,
+            messages,
+          );
+          logNormalizationStage(
+            'self-identifying-prefix',
+            reply,
+            withoutSelfIdentifyingPrefix,
+            attempt,
+          );
           const withoutSpeakerLabel = stripParticipantSpeakerLabel(
-            stripSelfIdentifyingPrefix(reply, identity, messages),
+            withoutSelfIdentifyingPrefix,
             participantNames,
             messages,
+          );
+          logNormalizationStage(
+            'speaker-label',
+            withoutSelfIdentifyingPrefix,
+            withoutSpeakerLabel,
+            attempt,
           );
           const withoutLeadingMention = effectiveRelay
             ? withoutSpeakerLabel
             : stripLeadingParticipantMentions(withoutSpeakerLabel, participantNames, messages);
+          logNormalizationStage(
+            'leading-mention',
+            withoutSpeakerLabel,
+            withoutLeadingMention,
+            attempt,
+            effectiveRelay ? ['skipped=relay'] : [],
+          );
           const normalizedReply = stripGenericTrailingQuestions(withoutLeadingMention);
-          if (normalizedReply !== reply) {
-            const trimmedReply = reply.trim();
-            const removedPrefix = trimmedReply
-              .slice(0, Math.max(0, trimmedReply.length - normalizedReply.length))
-              .trim();
-            console.log(
-              `${styled('[reply]', 'cyan')} removed speaker label: ` +
-              `${JSON.stringify(removedPrefix)}`,
-            );
-          }
+          logNormalizationStage(
+            'trailing-questions',
+            withoutLeadingMention,
+            normalizedReply,
+            attempt,
+          );
           const deliveryExistence = validateReplyExistence(normalizedReply, {
             trigger: responseTarget
               ? {
@@ -2270,7 +2339,10 @@ export async function startCombustion({
             isRepeat: reply => isSelfRepetitionReply(
               reply,
               recentAssistantReplies,
-              { participantNames },
+              {
+                participantNames,
+                history: messages as readonly EngineMessage[],
+              },
             ),
             log: message => console.log(`${styled('[reply]', 'cyan')} ${message}`),
           });
@@ -2294,6 +2366,14 @@ export async function startCombustion({
                   `(id=${latestIncoming?.messageId ?? 'unknown'}).`,
             );
           }
+          logGeneration({
+            stage: 'final',
+            attempt: outcome.attempts === 1 ? 'first' : 'retry',
+            text: outcome.reply,
+            outcome: 'accepted',
+            reason: 'none',
+            fields: ['guard=accepted'],
+          });
           return outcome.reply;
         } finally {
           if (activePacketTiming) {

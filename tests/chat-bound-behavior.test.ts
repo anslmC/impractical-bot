@@ -86,6 +86,39 @@ test('the exact Let us go outside failure is rejected and the compliant retry is
   );
 });
 
+test('a past-tense physical experience is rejected and the compliant retry is returned', async () => {
+  const { reply, requests } = await generate(
+    [messengerMessage('in-1', 'Alex', 'INCOMING', 'What did you do today?')],
+    [
+      'I walked home in the rain.',
+      'Nothing much, just hanging out here in the chat.',
+    ],
+  );
+
+  assert.equal(reply, 'Nothing much, just hanging out here in the chat.');
+  assert.equal(requests.length, 2, 'exactly one retry is made');
+  assert.ok(
+    requests[1].messages[0].content.includes(EXISTENCE_RETRY_INSTRUCTION),
+    'the retry carries the existence correction',
+  );
+});
+
+test('past-tense physical experience in assistant history is withheld', async () => {
+  const { requests } = await generate(
+    [
+      messengerMessage('in-0', 'Alex', 'INCOMING', 'How was the weather?'),
+      messengerMessage('out-1', 'You', 'OUTGOING', 'I got completely drenched.'),
+      messengerMessage('in-2', 'Alex', 'INCOMING', 'Are you around?'),
+    ],
+    ['I am here in the chat.'],
+  );
+  const transcript = requests[0].messages
+    .map(message => message.content)
+    .join('\n');
+
+  assert.doesNotMatch(transcript, /completely drenched/);
+});
+
 test('two violating drafts are suppressed with NvidiaExistenceError', async () => {
   await assert.rejects(
     generate(

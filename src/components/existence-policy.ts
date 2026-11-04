@@ -112,6 +112,12 @@ const FICTION_MARKER =
 const FIRST_PERSON_MOVEMENT =
   /\b(?:i(?:'m|’m|\s+am)|i(?:'ll|’ll|\s+will)|i(?:'ve|’ve|\s+have)|i(?:'d|’d|\s+would)|im)\b(?:\s+(?:just|already|now|still|actually|always|usually|often|probably|definitely|certainly|maybe|might|about\s+to|going\s+to|gonna|will|can|could|should|would|was|were|had|need\s+to|have\s+to|got\s+to|gotta)){0,2}\s+(?:leav(?:e|ing)|left|head(?:ed|ing)?\s+(?:out|over|there)|go(?:ing)?\s+(?:out|outside|there|over)|go(?:ing)?\s+to\s+(?:the|a|an|my|your|work|school|st[oa]re|gym|park|house|apartment|office|bar|club|restaurant|mall)|com(?:e|ing)\s+(?:over|out|here|by|through|along|with|to\s+(?:the|a|an|my|your))|arriv(?:e|ing)|meet(?:ing)?\s+(?:you|him|her|them|up|at|there|outside)|visit(?:ing)?|travel(?:ing)?|driv(?:e|ing)\s+(?:to|over|there|home|you|him|her|them)|walk(?:ing)?\s+(?:to|over|there|outside|home)|swing\s+by|drop\s+by|stop\s+by|pull\s+up|link\s+up|be\s+there|be\s+outside|be\s+home|be\s+at\s+(?:home|work|the|my))\b/iu;
 
+const FIRST_PERSON_PAST_PHYSICAL_ACTIVITY =
+  /\bi\s+(?:(?:was|were)\s+(?:just\s+|still\s+|already\s+|actually\s+)?(?:walking|running|jogging|hiking|swimming|cycling|biking|riding|driving|traveling|travelling|wading|climbing|crawling|shoveling|shovelling|digging|carrying|pushing|pulling|lifting)|(?:walked|ran|jogged|hiked|swam|cycled|biked|rode|drove|waded|climbed|crawled|shoveled|shovelled|dug|carried|pushed|pulled|lifted|jumped|fell|traveled|travelled)|had\s+to\s+(?:walk|run|jog|hike|swim|cycle|bike|ride|drive|wade|climb|crawl|shovel|dig|carry|push|pull|lift|travel))\s+(?:home|outside|inside|upstairs|downstairs|there|back|here|to\s+(?:(?:the|a|an|my|your)\s+)?(?:work|school|store|gym|park|office|house|apartment|bar|club|restaurant|mall|car|bike|bus|train|home)|through|across|along|around|down|up|in\s+the\s+(?:rain|snow|mud|water|cold|heat|dark)|on\s+(?:the|a|my|your)\s+(?:way|trail|road|sidewalk|street|path|beach)|(?:for\s+)?(?:\d+|a|an|several|two|three|four|five)\s+(?:miles?|kilometers?|kilometres?|hours?|minutes?)|my\s+(?:dog|bike|car)|the\s+(?:dog|bike|car|bus|train))\b/iu;
+
+const FIRST_PERSON_PAST_PHYSICAL_RESULT =
+  /\bi\s+(?:got|ended\s+up)\s+(?:completely\s+|totally\s+|so\s+|really\s+|pretty\s+|very\s+|absolutely\s+|kind\s+of\s+)?(?:drenched|soaked|wet|muddy|filthy|sunburned|sunburnt|rained\s+on|caught\s+in\s+the\s+(?:rain|snow|storm))\b/iu;
+
 const FIRST_PERSON_LOCATION =
   /\b(?:i(?:'m|’m|\s+am)?|i\s+was|i\s+were|i(?:'ll|’ll|\s+will)\s+be|i(?:'ve|’ve|\s+have)\s+been|im)\b(?:\s+(?:just|already|still|actually|always|usually|often|probably|definitely|certainly|maybe|might)){0,2}\s+(?:at\s+(?:home|work|the\s+(?:store|office|gym|restaurant|bar|club|park|mall|house|apartment)|my\s+(?:place|house|apartment))|in\s+(?:my\s+(?:room|car|house|apartment)|the\s+(?:store|office|gym|restaurant|bar|club|park|mall))|outside|inside|home|upstairs|downstairs|out\s+front)\b/iu;
 
@@ -310,6 +316,8 @@ export function validateReplyExistence(
     reason: ExistenceViolationReason;
   }> = [
     { pattern: FIRST_PERSON_MOVEMENT, reason: 'physical-movement-claim' },
+    { pattern: FIRST_PERSON_PAST_PHYSICAL_ACTIVITY, reason: 'physical-movement-claim' },
+    { pattern: FIRST_PERSON_PAST_PHYSICAL_RESULT, reason: 'physical-presence-claim' },
     { pattern: IMPLIED_MOVEMENT, reason: 'physical-movement-claim' },
     { pattern: FIRST_PERSON_LOCATION, reason: 'location-claim' },
     { pattern: EXPLICIT_SCHEDULE, reason: 'schedule-claim' },

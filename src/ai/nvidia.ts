@@ -66,6 +66,10 @@ import {
 } from '../components/participant-awareness.js';
 import { stripParticipantSpeakerLabel } from '../components/reply-normalization.js';
 import {
+  formatGenerationDiagnostic,
+  type GenerationDiagnosticInput,
+} from '../components/reply-diagnostics.js';
+import {
   EXISTENCE_RETRY_INSTRUCTION,
   isExplicitFictionContext,
   validateReplyExistence,
@@ -884,6 +888,23 @@ export async function generateNvidiaReply(
   const resolvedPacketTriggerId = resolvedPacketTrigger
     ? resolveConversationMessageId(resolvedPacketTrigger)
     : null;
+  const logGeneration = (
+    diagnostic: Omit<
+      GenerationDiagnosticInput,
+      'packetId' | 'packetType' | 'triggerId' | 'targetId'
+    >,
+  ): void => {
+    if (!options.requestDiagnostics) {
+      return;
+    }
+    console.log(formatGenerationDiagnostic({
+      ...diagnostic,
+      packetId: options.requestDiagnostics.packetId,
+      packetType: options.requestDiagnostics.packetType,
+      triggerId: resolvedPacketTriggerId,
+      targetId: resolvedResponseTargetId,
+    }));
+  };
 
   const responseTargetIndex = resolvedResponseTargetId === null
     ? -1
@@ -1025,6 +1046,7 @@ export async function generateNvidiaReply(
     ),
   );
   const firstReply = await requestCompletion(systemInstruction);
+  logGeneration({ stage: 'raw', attempt: 'first', text: firstReply });
   const firstLanguageValid = isEnglishOnlyReply(firstReply);
   const firstEmojiFree = !containsEmoji(firstReply);
   const firstMetadataFree = !extractConversationMessageBody(firstReply).hadEnvelope;
@@ -1034,6 +1056,32 @@ export async function generateNvidiaReply(
   const firstExistenceResult = validateReplyExistence(firstReply, {
     trigger: existenceTrigger,
     fiction: existenceFiction,
+  });
+  const firstReasons: string[] = [];
+  if (!firstLanguageValid) {
+    firstReasons.push('language:non-english');
+  }
+  if (!firstEmojiFree) {
+    firstReasons.push('emoji');
+  }
+  if (!firstMetadataFree) {
+    firstReasons.push('metadata');
+  }
+  if (firstInternalNarration) {
+    firstReasons.push('internal-narration');
+  }
+  if (!firstIdentityResult.valid) {
+    firstReasons.push(`identity:${firstIdentityResult.reason}`);
+  }
+  if (!firstExistenceResult.valid) {
+    firstReasons.push(`existence:${firstExistenceResult.reason}`);
+  }
+  logGeneration({
+    stage: 'validation',
+    attempt: 'first',
+    text: firstReply,
+    outcome: firstReasons.length === 0 ? 'accepted' : 'retry',
+    reason: firstReasons.join(','),
   });
   if (!firstExistenceResult.valid) {
     logExistenceDiagnostic(
@@ -1051,6 +1099,13 @@ export async function generateNvidiaReply(
   if (firstLanguageValid && firstEmojiFree && firstMetadataFree &&
       !firstInternalNarration && firstIdentityResult.valid &&
       firstExistenceResult.valid) {
+    logGeneration({
+      stage: 'accepted',
+      attempt: 'first',
+      text: firstReply,
+      outcome: 'accepted',
+      reason: 'none',
+    });
     return firstReply;
   }
 
@@ -1076,9 +1131,42 @@ export async function generateNvidiaReply(
   const retryReply = await requestCompletion(
     appendRetryInstruction(systemInstruction, ...retryInstructions),
   );
+  logGeneration({ stage: 'raw', attempt: 'retry', text: retryReply });
   const retryExistenceResult = validateReplyExistence(retryReply, {
     trigger: existenceTrigger,
     fiction: existenceFiction,
+  });
+  const retryIdentityResult = validateReplyIdentity(retryReply, identityContext);
+  const retryLanguageValid = isEnglishOnlyReply(retryReply);
+  const retryEmojiFree = !containsEmoji(retryReply);
+  const retryMetadataFree = !extractConversationMessageBody(retryReply).hadEnvelope;
+  const retryInternalNarration = retryMetadataFree &&
+    isInternalNarrationReply(retryReply);
+  const retryReasons: string[] = [];
+  if (!retryExistenceResult.valid) {
+    retryReasons.push(`existence:${retryExistenceResult.reason}`);
+  }
+  if (!retryIdentityResult.valid) {
+    retryReasons.push(`identity:${retryIdentityResult.reason}`);
+  }
+  if (!retryLanguageValid) {
+    retryReasons.push('language:non-english');
+  }
+  if (!retryEmojiFree) {
+    retryReasons.push('emoji');
+  }
+  if (!retryMetadataFree) {
+    retryReasons.push('metadata');
+  }
+  if (retryInternalNarration) {
+    retryReasons.push('internal-narration');
+  }
+  logGeneration({
+    stage: 'validation',
+    attempt: 'retry',
+    text: retryReply,
+    outcome: retryReasons.length === 0 ? 'accepted' : 'suppressed',
+    reason: retryReasons.join(','),
   });
   if (!retryExistenceResult.valid) {
     logExistenceDiagnostic(
@@ -1109,36 +1197,42 @@ export async function generateNvidiaReply(
       },
     );
   }
-  const retryIdentityResult = validateReplyIdentity(retryReply, identityContext);
   if (!retryIdentityResult.valid) {
     throw new NvidiaIdentityError(
       retryIdentityResult.reason,
       'NVIDIA repeatedly returned a reply with an invalid identity. The reply was not sent.',
     );
   }
-  if (!isEnglishOnlyReply(retryReply)) {
+  if (!retryLanguageValid) {
     throw new NvidiaRequestError(
       'service',
       'NVIDIA repeatedly returned a non-English reply. The reply was not sent.',
     );
   }
-  if (containsEmoji(retryReply)) {
+  if (!retryEmojiFree) {
     throw new NvidiaRequestError(
       'service',
       'NVIDIA repeatedly returned a reply containing an emoji. The reply was not sent.',
     );
   }
-  if (extractConversationMessageBody(retryReply).hadEnvelope) {
+  if (!retryMetadataFree) {
     throw new NvidiaRequestError(
       'service',
       'NVIDIA repeatedly returned a reply containing conversation metadata. The reply was not sent.',
     );
   }
-  if (isInternalNarrationReply(retryReply)) {
+  if (retryInternalNarration) {
     throw new NvidiaRequestError(
       'service',
       'NVIDIA repeatedly returned a reply that discussed internal generation details. The reply was not sent.',
     );
   }
+  logGeneration({
+    stage: 'accepted',
+    attempt: 'retry',
+    text: retryReply,
+    outcome: 'accepted',
+    reason: 'none',
+  });
   return retryReply;
 }

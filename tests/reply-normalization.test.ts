@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { generateAliases } from '../src/components/alias-engine.js';
 import {
+  stripGenericTrailingQuestions,
   stripLeadingParticipantMentions,
   stripParticipantSpeakerLabel,
   stripSelfIdentifyingPrefix,
@@ -19,6 +20,58 @@ function incoming(message: string): ReplyContextMessage {
 function outgoing(message: string): ReplyContextMessage {
   return { message, direction: 'OUTGOING' };
 }
+
+test('habitual reciprocal question endings are removed while the answer stays intact', () => {
+  const cases = [
+    ["I'm fine, thanks for asking. And you?", "I'm fine, thanks for asking."],
+    ['Nothing weird happening on my end. You?', 'Nothing weird happening on my end.'],
+    [
+      "Watch a movie. Read a book. I've been stuck inside all day. You?",
+      "Watch a movie. Read a book. I've been stuck inside all day.",
+    ],
+    ["Haha. I'm bored too. What did you have in mind?", "Haha. I'm bored too."],
+    ["I'm bored. Anything interesting?", "I'm bored."],
+    ["I'm bored. Anything fun happening?", "I'm bored."],
+    ['That is fair. How about you?', 'That is fair.'],
+    ['Same. What about you?', 'Same.'],
+    ["I'm fine, and you?", "I'm fine"],
+    ["I'm bored too, what did you have in mind?", "I'm bored too"],
+  ];
+
+  for (const [reply, expected] of cases) {
+    assert.equal(stripGenericTrailingQuestions(reply), expected, reply);
+  }
+});
+
+test('standalone statements are never rewritten by trailing question cleanup', () => {
+  for (const reply of [
+    "I'm fine. Just a little tired.",
+    'Find something better to do than bother me.',
+    "Then we're both suffering.",
+    'At least someone appreciates my humor.',
+    'Same.',
+    'You?',
+    'And you?',
+    'Anything interesting?',
+  ]) {
+    assert.equal(stripGenericTrailingQuestions(reply), reply, reply);
+  }
+});
+
+test('meaningful, game, and clarification questions survive trailing cleanup', () => {
+  for (const reply of [
+    'I can meet at 7. What time works for you?',
+    'I do not understand. What do you mean?',
+    'Knock knock. Who is there?',
+    'Want to play a game? Truth or dare?',
+    'We could watch a movie. What did you have in mind?',
+    'We could watch a movie. Anything interesting?',
+    "I'm free tonight. What did you have in mind?",
+    'The movie starts at eight. Which showing do you want?',
+  ]) {
+    assert.equal(stripGenericTrailingQuestions(reply), reply, reply);
+  }
+});
 
 test('an ordinary reply loses its leading alias but keeps the rest intact', () => {
   const reply = '@PleaseGetout Daily Oh, nice? That\'s it? I expected more from you.';
