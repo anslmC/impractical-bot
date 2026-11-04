@@ -1552,6 +1552,127 @@ test('an outgoing presentation with an unusable label reconciles its pending rep
   }
 });
 
+test('an UNKNOWN reply observation is discarded and its corrected metadata reconciles the pending reply', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0.99;
+  const generatedRequests: Array<readonly {
+    messageId: string;
+    message: string;
+    sender?: string;
+    direction?: string;
+  }[]> = [];
+  const generatedReplies = ['first reply', 'second reply', 'third reply'];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    generatedRequests.push(messages as typeof generatedRequests[number]);
+    return generatedReplies.shift() ?? 'ok';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => ({ status: 'sent' });
+
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flushEngine();
+  };
+
+  const { page, inject, replace } = createInjectedMessengerPage();
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'turn-1', sender: 'Alex', message: '@Bot first question' }]);
+    await advancePoll();
+    await advancePoll();
+    assert.equal(generatedRequests.length, 1);
+
+    inject([
+      {
+        messageId: 'reply-1',
+        sender: 'UNKNOWN',
+        message: 'first reply',
+        ariaLabel: null,
+        textWithoutSenderHeading: 'first reply',
+      },
+      { messageId: 'turn-2', sender: 'Alex', message: '@Bot second question' },
+    ]);
+    await advancePoll();
+    await advancePoll();
+
+    assert.equal(generatedRequests.length, 2);
+    const secondRequest = generatedRequests[1];
+    assert.equal(
+      secondRequest.some(message => message.messageId === 'reply-1'),
+      false,
+      'the UNKNOWN observation never enters the request',
+    );
+    const pendingFirstReply = secondRequest.find(message =>
+      message.messageId.startsWith('pending-outgoing-') &&
+      message.message === 'first reply'
+    );
+    assert.equal(pendingFirstReply?.direction, 'OUTGOING');
+    assert.equal(
+      secondRequest.some(message =>
+        message.message === 'first reply' && message.direction === 'UNKNOWN'
+      ),
+      false,
+      'the UNKNOWN observation is never presented as a user turn',
+    );
+
+    replace([
+      { messageId: 'turn-1', sender: 'Alex', message: '@Bot first question' },
+      { messageId: 'reply-1', sender: 'You', message: 'first reply' },
+      { messageId: 'turn-2', sender: 'Alex', message: '@Bot second question' },
+      { messageId: 'turn-3', sender: 'Alex', message: '@Bot third question' },
+    ]);
+    await advancePoll();
+    await advancePoll();
+
+    assert.equal(generatedRequests.length, 3);
+    const thirdRequest = generatedRequests[2];
+    const correctedCopies = thirdRequest.filter(message => message.message === 'first reply');
+    assert.equal(correctedCopies.length, 1);
+    assert.equal(correctedCopies[0].messageId, 'reply-1');
+    assert.equal(correctedCopies[0].direction, 'OUTGOING');
+    assert.equal(
+      thirdRequest.some(message =>
+        message.messageId.startsWith('pending-outgoing-') &&
+        message.message === 'first reply'
+      ),
+      false,
+      'the pending copy is removed after the metadata correction',
+    );
+    const stored = contextStore.getRecent(20)
+      .find(message => message.messageId === 'reply-1');
+    assert.equal(stored?.direction, 'OUTGOING');
+    assert.equal(stored?.sender, 'You');
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
 test('mention packets keep a twenty-message topic window before the trigger', async context => {
   context.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
   const originalRandom = Math.random;
@@ -1801,6 +1922,77 @@ test('RNG packets keep a twenty-five-message topic window without a separate tri
       ],
       'the twenty-five-message window keeps the newest context and drops only the oldest messages',
     );
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('RNG packets discard UNKNOWN observations and keep valid incoming context', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  Math.random = () => 0;
+  const generatedRequests: Array<readonly {
+    messageId: string;
+    message: string;
+    direction?: string;
+  }[]> = [];
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (
+    _apiKey: string,
+    messages: readonly unknown[],
+  ): Promise<string> => {
+    generatedRequests.push(messages as typeof generatedRequests[number]);
+    return 'mocked reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => ({ status: 'sent' });
+
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flushEngine();
+  };
+
+  const { page, inject } = createInjectedMessengerPage();
+  inject([{ messageId: 'rng-keep', sender: 'Alex', message: 'hello there' }]);
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{
+      messageId: 'rng-unknown',
+      sender: 'UNKNOWN',
+      message: 'discard this',
+      ariaLabel: null,
+      textWithoutSenderHeading: 'discard this',
+    }]);
+    for (let poll = 0; poll < 4; poll += 1) {
+      await advancePoll();
+    }
+
+    assert.equal(generatedRequests.length, 1);
+    const request = generatedRequests[0];
+    assert.ok(request.some(message => message.messageId === 'rng-keep'));
+    assert.equal(request.some(message => message.messageId === 'rng-unknown'), false);
+    assert.equal(contextStore.getState().messageIds.includes('rng-unknown'), false);
   } finally {
     await controller.stop();
     Math.random = originalRandom;

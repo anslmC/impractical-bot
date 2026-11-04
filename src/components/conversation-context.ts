@@ -69,6 +69,10 @@ export function normalizeConversationDirection(
     : 'UNKNOWN';
 }
 
+export function isUnknownConversationDirection(value: unknown): boolean {
+  return typeof value === 'string' && value.trim().toUpperCase() === 'UNKNOWN';
+}
+
 export function normalizeConversationSender(value: unknown): string {
   if (typeof value !== 'string') {
     return 'UNKNOWN';

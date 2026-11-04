@@ -507,6 +507,10 @@ function prepareConversationMessages(
     if (!content) {
       continue;
     }
+    const direction = normalizeConversationDirection(raw.direction);
+    if (direction === 'UNKNOWN') {
+      continue;
+    }
     const messageId = resolveConversationMessageId(raw);
     if (messageId !== null) {
       if (seenMessageIds.has(messageId)) {
@@ -514,7 +518,6 @@ function prepareConversationMessages(
       }
       seenMessageIds.add(messageId);
     }
-    const direction = normalizeConversationDirection(raw.direction);
     const sender = normalizeConversationSender(raw.sender);
     const senderIsBot = sender !== 'UNKNOWN' &&
       ownNames.has(normalizeIdentityValue(sender));

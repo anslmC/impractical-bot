@@ -298,15 +298,6 @@ test('reply generation sends known-direction messages in order and extracts trim
     {
       role: 'user',
       content: serializedMessage(
-        'unknown-1',
-        'UNKNOWN',
-        'UNKNOWN',
-        'Do not include this.',
-      ),
-    },
-    {
-      role: 'user',
-      content: serializedMessage(
         'incoming-2',
         'Blair',
         'INCOMING',
@@ -322,6 +313,7 @@ test('reply generation sends known-direction messages in order and extracts trim
   assert.doesNotMatch(body.messages[0].content, /CURRENT TRIGGER/);
   assert.match(body.messages[0].content, /DIRECTION: INCOMING/);
   assert.doesNotMatch(body.messages[0].content, /HISTORY POSITION: outside/);
+  assert.doesNotMatch(JSON.stringify(body.messages), /Do not include this/);
 });
 
 test('a trigger outside the transcript is described without being duplicated', async () => {
@@ -1367,6 +1359,39 @@ test('reply generation rejects when no known-direction non-empty context is avai
     /No usable Messenger messages/,
   );
   assert.equal(fetchCalls, 0);
+});
+
+test('an UNKNOWN duplicate does not shadow a known observation with the same id', async () => {
+  let requestedOptions: RequestInit | undefined;
+
+  await generateTestReply('nvapi-test-key', [
+    messengerMessage('same-1', 'UNKNOWN', 'UNKNOWN', 'same text'),
+    messengerMessage('same-1', 'You', 'OUTGOING', 'same text'),
+    messengerMessage('in-1', 'Alex', 'INCOMING', 'hello'),
+  ], {
+    fetch: async (_input, init) => {
+      requestedOptions = init;
+      return successfulCompletion('ok');
+    },
+  });
+
+  const body = JSON.parse(String(requestedOptions?.body));
+  assert.deepEqual(body.messages.slice(1), [
+    {
+      role: 'assistant',
+      content: 'same text',
+    },
+    {
+      role: 'user',
+      content: serializedMessage(
+        'in-1',
+        'Alex',
+        'INCOMING',
+        'hello',
+        { trigger: true },
+      ),
+    },
+  ]);
 });
 
 test('reply generation rejects empty output and malformed responses', async () => {

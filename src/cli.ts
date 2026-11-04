@@ -70,6 +70,7 @@ import {
   type CombustionController,
 } from './components/combustion.js';
 import { createContextStore } from './components/context-store.js';
+import { isUnknownConversationDirection } from './components/conversation-context.js';
 import {
   readMessengerMessages,
   type BackreadResult,
@@ -1601,13 +1602,16 @@ async function handleStart(
           throw new Error('Unable to read Messenger messages.');
         }
         const contextStore = (runtime.createContextStore ?? createContextStore)();
+        const retainedBackreadMessages = backread.messages.filter(
+          message => !isUnknownConversationDirection(message.direction),
+        );
         try {
-          contextStore.add(backread.messages.map(({ id, ...message }) => ({
+          contextStore.add(retainedBackreadMessages.map(({ id, ...message }) => ({
             ...message,
             messageId: id,
           })));
           const seededMessageIds = new Set(contextStore.getState().messageIds);
-          if (backread.messages.some(message => !seededMessageIds.has(message.id))) {
+          if (retainedBackreadMessages.some(message => !seededMessageIds.has(message.id))) {
             throw new Error('One or more Backread messages were not retained.');
           }
         } catch {

@@ -1,3 +1,5 @@
+import { isUnknownConversationDirection } from './conversation-context.js';
+
 export interface ContextMessage {
   messageId: string;
   message: string;
@@ -42,16 +44,29 @@ export function createContextStore({ maxMessages = 60 }: { maxMessages?: number 
         throw new TypeError('messages must be an array.');
       }
 
-      const validatedMessages = incomingMessages.map(message => {
-        validateMessage(message);
-        return message;
-      });
+      const validatedMessages = incomingMessages
+        .map(message => {
+          validateMessage(message);
+          return message;
+        })
+        .filter(message => !isUnknownConversationDirection(message.direction));
 
       for (const message of validatedMessages) {
         const existing = messagesById.get(message.messageId);
         if (existing) {
-          if (existing.message !== message.message) {
+          const textChanged = existing.message !== message.message;
+          const senderChanged = message.sender !== undefined &&
+            existing.sender !== message.sender;
+          const directionChanged = message.direction !== undefined &&
+            existing.direction !== message.direction;
+          if (textChanged || senderChanged || directionChanged) {
             const updatedMessage = cloneMessage(message);
+            if (updatedMessage.sender === undefined && existing.sender !== undefined) {
+              updatedMessage.sender = existing.sender;
+            }
+            if (updatedMessage.direction === undefined && existing.direction !== undefined) {
+              updatedMessage.direction = existing.direction;
+            }
             const existingIndex = messages.indexOf(existing);
             if (existingIndex !== -1) {
               messages[existingIndex] = updatedMessage;

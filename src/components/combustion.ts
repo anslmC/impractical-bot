@@ -41,6 +41,7 @@ import {
 import type { ContextMessage, ContextStore } from './context-store.js';
 import {
   extractConversationMessageBody,
+  isUnknownConversationDirection,
   normalizeConversationSender,
 } from './conversation-context.js';
 import {
@@ -222,6 +223,12 @@ export interface DestinationChangeOptions {
   persist?: (destination: string) => void | Promise<void>;
 }
 
+interface ObservedMessageState {
+  message: string;
+  sender: string;
+  direction: string;
+}
+
 interface ConversationRuntimeSnapshot {
   destination?: string;
   roster?: GroupRoster;
@@ -229,7 +236,7 @@ interface ConversationRuntimeSnapshot {
   seenMessageIds: string[];
   answeredIncomingMessageIds: string[];
   detectedAtByMessageId: Array<[string, number]>;
-  observedTextByMessageId: Array<[string, string]>;
+  observedMessageStateByMessageId: Array<[string, ObservedMessageState]>;
   packetBuilderState?: PacketBuilderState;
 }
 
@@ -418,7 +425,9 @@ function appendContextMessages(
   packetBuilderState: PacketBuilderState | undefined,
   packetAwaitingSubmission = false,
 ): void {
-  const validMessages = incomingMessages.filter(message => message.messageId);
+  const validMessages = incomingMessages.filter(message =>
+    message.messageId && !isUnknownConversationDirection(message.direction)
+  );
   if (validMessages.length === 0) {
     return;
   }
@@ -611,6 +620,9 @@ export async function startCombustion({
     sender?: unknown;
     direction?: unknown;
   }): boolean => {
+    if (isUnknownConversationDirection(message.direction)) {
+      return false;
+    }
     if (message.direction === 'OUTGOING') {
       return true;
     }
@@ -961,12 +973,17 @@ export async function startCombustion({
     prunePendingOutgoingReplies();
     const isRngPacket = activePacketContext?.type === 'rng' ||
       packet.packetId === rngPacketInFlightId;
-    const storedMessages = contextStore.getRecent(contextStore.getState().maxMessages);
+    const storedMessages = contextStore
+      .getRecent(contextStore.getState().maxMessages)
+      .filter(message => !isUnknownConversationDirection(message.direction));
+    const knownFallbackMessages = fallbackMessages.filter(
+      message => !isUnknownConversationDirection(message.direction),
+    );
     const targetId = resolveResponseTargetId(
       packet,
       isRngPacket,
       storedMessages,
-      fallbackMessages,
+      knownFallbackMessages,
     );
     const targetingTriggerId = isRngPacket
       ? targetId
@@ -974,12 +991,12 @@ export async function startCombustion({
     const trigger = resolveGenerationTrigger(
       targetId,
       storedMessages,
-      fallbackMessages,
+      knownFallbackMessages,
     );
     const targetingTrigger = resolveGenerationTrigger(
       targetingTriggerId,
       storedMessages,
-      fallbackMessages,
+      knownFallbackMessages,
     );
     const storedTargetIndex = targetId === null
       ? -1
@@ -992,12 +1009,14 @@ export async function startCombustion({
 
     if (storedTargetIndex === -1) {
       const fallbackTargetIndex = trigger
-        ? fallbackMessages.indexOf(trigger)
+        ? knownFallbackMessages.indexOf(trigger)
         : -1;
       const fallbackMerged = mergePendingOutgoingReplies(
-        fallbackMessages as ContextMessage[],
+        knownFallbackMessages as ContextMessage[],
         pendingOutgoingReplies,
-        fallbackTargetIndex === -1 ? fallbackMessages.length : fallbackTargetIndex,
+        fallbackTargetIndex === -1
+          ? knownFallbackMessages.length
+          : fallbackTargetIndex,
       );
       const fallbackRestored = targetId === null
         ? {
@@ -1150,7 +1169,7 @@ export async function startCombustion({
     }
   };
   const detectedAtByMessageId = new Map<string, number>();
-  const observedTextByMessageId = new Map<string, string>();
+  const observedMessageStateByMessageId = new Map<string, ObservedMessageState>();
   const packetTimings = new WeakMap<object, PacketTiming>();
   let activePacketTiming: PacketTiming | undefined;
   let activePacketContext: { packetId: string; type: PacketTriggerType } | null = null;
@@ -1575,15 +1594,25 @@ export async function startCombustion({
           break;
         }
         const observedAt = performance.now();
+        const changedMessagesById = new Map<string, MessageDetails>();
+        for (const message of [
+          ...readResult.editedMessages,
+          ...readResult.metadataChangedMessages,
+        ]) {
+          changedMessagesById.set(message.messageId, message);
+        }
+        const changedMessages = [...changedMessagesById.values()];
         if (readResult.editedMessages.length > 0) {
           console.log(
             `  ${styled('[edit]', 'cyan')} detected ` +
             `${readResult.editedMessages.length} edited message(s): ` +
             `${readResult.editedMessages.map(message => message.messageId).join(', ')}`,
           );
+        }
+        if (changedMessages.length > 0) {
           appendContextMessages(
             contextStore,
-            readResult.editedMessages,
+            changedMessages,
             packetScheduler,
             packetBuilderState,
           );
@@ -1592,7 +1621,9 @@ export async function startCombustion({
         for (const message of messages) {
           if (message.messageId && !seenMessageIds.has(message.messageId)) {
             seenMessageIds.add(message.messageId);
-            newMessages.push(message);
+            if (!isUnknownConversationDirection(message.direction)) {
+              newMessages.push(message);
+            }
             detectedAtByMessageId.set(message.messageId, observedAt);
             if (detectedAtByMessageId.size > MESSAGE_HISTORY_LIMIT) {
               const oldestMessageId = detectedAtByMessageId.keys().next().value;
@@ -1602,7 +1633,7 @@ export async function startCombustion({
             }
           }
         }
-        reconcilePendingOutgoingReplies(newMessages);
+        reconcilePendingOutgoingReplies([...newMessages, ...changedMessages]);
 
         const newMessagesWithMentions = newMessages.map(message => ({
           ...message,
@@ -1738,6 +1769,7 @@ export async function startCombustion({
   const readLatestMessages = async (): Promise<{
     messages: MessageDetails[];
     editedMessages: MessageDetails[];
+    metadataChangedMessages: MessageDetails[];
   }> => {
     const elements = await messageLocator.evaluateAll((items, limit) =>
       items.slice(-limit).map(element => {
@@ -1755,25 +1787,41 @@ export async function startCombustion({
     const reconciled = messageIdentity.reconcile(elements.map(extractMessageDetails));
     reportMergedDuplicates(reconciled.duplicates);
     const editedMessages: MessageDetails[] = [];
+    const metadataChangedMessages: MessageDetails[] = [];
     for (const message of reconciled.messages) {
       if (!message.messageId) {
         continue;
       }
-      const previousText = observedTextByMessageId.get(message.messageId);
-      if (previousText === undefined) {
-        observedTextByMessageId.set(message.messageId, message.message);
-        if (observedTextByMessageId.size > MESSAGE_HISTORY_LIMIT) {
-          const oldestMessageId = observedTextByMessageId.keys().next().value;
+      const previous = observedMessageStateByMessageId.get(message.messageId);
+      const current: ObservedMessageState = {
+        message: message.message,
+        sender: message.sender,
+        direction: message.direction,
+      };
+      if (previous === undefined) {
+        observedMessageStateByMessageId.set(message.messageId, current);
+        if (observedMessageStateByMessageId.size > MESSAGE_HISTORY_LIMIT) {
+          const oldestMessageId = observedMessageStateByMessageId.keys().next().value;
           if (oldestMessageId !== undefined) {
-            observedTextByMessageId.delete(oldestMessageId);
+            observedMessageStateByMessageId.delete(oldestMessageId);
           }
         }
-      } else if (previousText !== message.message) {
-        observedTextByMessageId.set(message.messageId, message.message);
+        continue;
+      }
+      const textChanged = previous.message !== current.message;
+      const metadataChanged = previous.sender !== current.sender ||
+        previous.direction !== current.direction;
+      if (textChanged) {
         editedMessages.push(message);
       }
+      if (metadataChanged) {
+        metadataChangedMessages.push(message);
+      }
+      if (textChanged || metadataChanged) {
+        observedMessageStateByMessageId.set(message.messageId, current);
+      }
     }
-    return { messages: reconciled.messages, editedMessages };
+    return { messages: reconciled.messages, editedMessages, metadataChangedMessages };
   };
   const seenMessageIds = createBoundedIdSet(MESSAGE_HISTORY_LIMIT);
 
@@ -1792,10 +1840,13 @@ export async function startCombustion({
         seenMessageIds.add(message.messageId);
       }
     }
-    appendContextMessages(contextStore, baseline, packetScheduler, packetBuilderState);
+    const knownBaseline = baseline.filter(
+      message => !isUnknownConversationDirection(message.direction),
+    );
+    appendContextMessages(contextStore, knownBaseline, packetScheduler, packetBuilderState);
     packetBuilderState = buildPacketTurn({
       newMessages: [],
-      recentContext: baseline
+      recentContext: knownBaseline
         .filter(message => message.messageId)
         .map(message => ({
           ...message,
@@ -1820,7 +1871,7 @@ export async function startCombustion({
     seenMessageIds: seenMessageIds.values(),
     answeredIncomingMessageIds: [...answeredIncomingMessageIds],
     detectedAtByMessageId: [...detectedAtByMessageId.entries()],
-    observedTextByMessageId: [...observedTextByMessageId.entries()],
+    observedMessageStateByMessageId: [...observedMessageStateByMessageId.entries()],
     packetBuilderState: packetBuilderState ? structuredClone(packetBuilderState) : undefined,
   });
 
@@ -1844,9 +1895,9 @@ export async function startCombustion({
     for (const [messageId, detectedAt] of snapshot.detectedAtByMessageId) {
       detectedAtByMessageId.set(messageId, detectedAt);
     }
-    observedTextByMessageId.clear();
-    for (const [messageId, text] of snapshot.observedTextByMessageId) {
-      observedTextByMessageId.set(messageId, text);
+    observedMessageStateByMessageId.clear();
+    for (const [messageId, state] of snapshot.observedMessageStateByMessageId) {
+      observedMessageStateByMessageId.set(messageId, state);
     }
     packetBuilderState = snapshot.packetBuilderState
       ? structuredClone(snapshot.packetBuilderState)
@@ -1995,7 +2046,7 @@ export async function startCombustion({
         await attachWakerObserver();
         messageIdentity.clear();
         detectedAtByMessageId.clear();
-        observedTextByMessageId.clear();
+        observedMessageStateByMessageId.clear();
         baseline = (await readLatestMessages()).messages;
         refreshedRoster = await extractRefreshedGroupRoster();
       } catch (error) {
@@ -2558,10 +2609,13 @@ export async function startCombustion({
       `${styled(String(seenMessageIds.size), 'bold')} unique message IDs.`,
     );
     packetBuilderState = createPacketBuilderState();
-    appendContextMessages(contextStore, baseline, packetScheduler, packetBuilderState);
+    const knownBaseline = baseline.filter(
+      message => !isUnknownConversationDirection(message.direction),
+    );
+    appendContextMessages(contextStore, knownBaseline, packetScheduler, packetBuilderState);
     packetBuilderState = buildPacketTurn({
       newMessages: [],
-      recentContext: baseline
+      recentContext: knownBaseline
         .filter(message => message.messageId)
         .map(message => ({
           ...message,

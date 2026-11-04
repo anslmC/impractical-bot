@@ -334,14 +334,6 @@ test('start prepares the destination, remains alive after readiness, and closes 
           },
           ariaLabel: 'At October 18, 2026, 1:15 PM, You: hello',
         },
-        {
-          messageId: 'message-2',
-          message: '',
-          sender: 'UNKNOWN',
-          direction: 'UNKNOWN',
-          timestamp: { original: 'Friday 19:35', normalized: null, resolved: false },
-          ariaLabel: null,
-        },
       ]);
       events.push('combustion-started');
       events.push('context-store-verified');
@@ -408,7 +400,7 @@ test('start prepares the destination, remains alive after readiness, and closes 
     'WARNING: Browser is minimized. Backread may collect fewer messages than expected.',
     '\n[BACKREAD] Reading historical Messenger messages.',
     '\n[BACKREAD] Retrieved 2 messages; expected 30.',
-    '\n[CONTEXT] Historical context seeded: 2 messages.',
+    '\n[CONTEXT] Historical context seeded: 1 messages.',
     `\n[READY] Engine ready at ${validConfiguration.messageDestination}.`,
     'Shutdown requested; disconnecting Playwright.',
   ]);

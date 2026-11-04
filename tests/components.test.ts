@@ -154,6 +154,97 @@ test('context store retains Backread sender and direction metadata when seeded',
   }]);
 });
 
+test('context store discards UNKNOWN direction without discarding unknown senders', () => {
+  const store = createContextStore();
+  store.add([
+    {
+      messageId: 'unknown-1',
+      message: 'discard this',
+      sender: 'UNKNOWN',
+      direction: 'UNKNOWN',
+    },
+    {
+      messageId: 'incoming-1',
+      message: 'keep this incoming message',
+      sender: 'UNKNOWN',
+      direction: 'INCOMING',
+    },
+    {
+      messageId: 'outgoing-1',
+      message: 'keep this outgoing message',
+      sender: 'You',
+      direction: 'OUTGOING',
+    },
+    {
+      messageId: 'known-1',
+      message: 'keep known metadata',
+      sender: 'Alex',
+      direction: 'INCOMING',
+    },
+  ]);
+  store.add([{
+    messageId: 'known-1',
+    message: 'keep known metadata',
+    sender: 'UNKNOWN',
+    direction: 'UNKNOWN',
+  }]);
+
+  assert.deepEqual(store.getState().messageIds, [
+    'incoming-1',
+    'outgoing-1',
+    'known-1',
+  ]);
+  assert.deepEqual(store.getRecent(3), [
+    {
+      messageId: 'incoming-1',
+      message: 'keep this incoming message',
+      sender: 'UNKNOWN',
+      direction: 'INCOMING',
+    },
+    {
+      messageId: 'outgoing-1',
+      message: 'keep this outgoing message',
+      sender: 'You',
+      direction: 'OUTGOING',
+    },
+    {
+      messageId: 'known-1',
+      message: 'keep known metadata',
+      sender: 'Alex',
+      direction: 'INCOMING',
+    },
+  ]);
+});
+
+test('context store refreshes sender and direction when the same text is re-observed', () => {
+  const store = createContextStore();
+  store.add([{
+    messageId: 'm-1',
+    message: 'same visible text',
+    sender: 'UNKNOWN',
+    direction: 'INCOMING',
+  }]);
+  store.add([{
+    messageId: 'm-1',
+    message: 'same visible text',
+    sender: 'You',
+    direction: 'OUTGOING',
+  }]);
+  store.add([{
+    messageId: 'm-1',
+    message: 'same visible text',
+    sender: 'You',
+  }]);
+
+  assert.equal(store.getState().size, 1);
+  assert.deepEqual(store.getRecent(1), [{
+    messageId: 'm-1',
+    message: 'same visible text',
+    sender: 'You',
+    direction: 'OUTGOING',
+  }]);
+});
+
 test('context store clear removes all retained conversation state', () => {
   const store = createContextStore();
   store.add([
@@ -245,9 +336,73 @@ test('packet builder opens a mention packet only for INCOMING messages', () => {
     assert.equal(result.pendingPacket, null);
     assert.deepEqual(
       result.state.observedMessages.map(message => message.messageId),
-      [`not-a-trigger-${direction}`],
+      direction === 'UNKNOWN' ? [] : [`not-a-trigger-${direction}`],
     );
   }
+});
+
+test('packet builder discards direct UNKNOWN input at its boundary', () => {
+  const result = buildPacketTurn({
+    newMessages: [{
+      messageId: 'unknown-new',
+      message: '@Bot help',
+      mention: true,
+      sender: 'UNKNOWN',
+      direction: 'UNKNOWN',
+    }],
+    recentContext: [{
+      messageId: 'unknown-context',
+      message: 'discard this context',
+      direction: 'UNKNOWN',
+    }],
+  });
+
+  assert.equal(result.packet, null);
+  assert.equal(result.pendingPacket, null);
+  assert.deepEqual(result.state.observedMessages, []);
+});
+
+test('packet builder preserves valid INCOMING and OUTGOING packet turns', () => {
+  const result = buildPacketTurn({
+    newMessages: [
+      {
+        messageId: 'in-1',
+        message: '@Bot help',
+        mention: true,
+        direction: 'INCOMING',
+      },
+      {
+        messageId: 'out-1',
+        message: '@Bot help',
+        mention: true,
+        direction: 'OUTGOING',
+      },
+    ],
+    recentContext: [{
+      messageId: 'context-out-1',
+      message: 'Earlier reply',
+      direction: 'OUTGOING',
+    }],
+  });
+
+  assert.equal(result.packet, null);
+  assert.equal(result.pendingPacket?.triggerMessageId, 'in-1');
+  assert.deepEqual(
+    result.pendingPacket?.newMessages.map(message => message.messageId),
+    ['in-1', 'out-1'],
+  );
+  assert.deepEqual(
+    result.pendingPacket?.mentionMessages.map(message => message.messageId),
+    ['in-1'],
+  );
+  assert.deepEqual(
+    result.pendingPacket?.contextMessages.map(message => message.messageId),
+    ['context-out-1'],
+  );
+  assert.deepEqual(
+    result.state.observedMessages.map(message => message.messageId),
+    ['in-1', 'out-1', 'context-out-1'],
+  );
 });
 
 test('packet builder ignores every supported alias format on outgoing messages', () => {

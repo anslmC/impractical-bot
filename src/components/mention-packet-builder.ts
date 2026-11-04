@@ -1,3 +1,5 @@
+import { isUnknownConversationDirection } from './conversation-context.js';
+
 const OBSERVED_MESSAGE_LIMIT = 200;
 
 export interface PacketBuilderMessage {
@@ -109,6 +111,9 @@ export function buildPacketTurn({
 
   for (const rawMessage of newMessages) {
     const message = normalizeMessage(rawMessage);
+    if (isUnknownConversationDirection(message.direction)) {
+      continue;
+    }
     const inBatch = messagesById.get(message.messageId);
     if (inBatch) {
       syncObservedMessage(inBatch, message);
@@ -130,6 +135,9 @@ export function buildPacketTurn({
   const contextById = new Map();
   for (const rawMessage of recentContext) {
     const message = normalizeMessage(rawMessage);
+    if (isUnknownConversationDirection(message.direction)) {
+      continue;
+    }
     const inContext = contextById.get(message.messageId);
     if (inContext) {
       contextById.delete(message.messageId);
