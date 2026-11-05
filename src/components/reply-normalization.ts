@@ -119,24 +119,63 @@ export function stripSelfIdentifyingPrefix(
   return reply;
 }
 
-const RECIPROCAL_QUESTION_SOURCE =
-  "(?:so\\s+|and\\s+|but\\s+)?(?:you|yourself|what about (?:you|yourself)|how about (?:you|yourself)|what(?:'s| is) (?:up|good(?: lately)?|new)|how(?:'s| is) your day(?: going)?|anything new(?: going on)?(?:,? or just checking in)?|anything else|just checking in|what(?:'s| is) on your mind|anything exciting happen(?:ing)?|what are you up to|how are you(?: doing)?|what have you been up to)";
-const GENERIC_ENGAGEMENT_QUESTION_SOURCE =
-  "(?:so\\s+|and\\s+|but\\s+)?(?:anything (?:interesting|fun|exciting)(?: (?:going on|happening))?|what (?:did|do) you have in mind)";
-const RECIPROCAL_QUESTION = new RegExp(`^(?:${RECIPROCAL_QUESTION_SOURCE})$`, 'iu');
-const GENERIC_ENGAGEMENT_QUESTION = new RegExp(
-  `^(?:${GENERIC_ENGAGEMENT_QUESTION_SOURCE})$`,
-  'iu',
-);
+const RECIPROCAL_QUESTION_PATTERNS = [
+  /^(?:you|yourself)$/u,
+  /^what about (?:you|yourself)$/u,
+  /^how about (?:you|yourself)$/u,
+  /^what(?:'s| is) (?:up|good(?: lately)?|new)(?: with you)?$/u,
+  /^how(?:'s| is) your day(?: (?:going|been))?$/u,
+  /^anything new(?: going on)?(?: with you)?$/u,
+  /^anything else$/u,
+  /^just checking in$/u,
+  /^what(?:'s| is) on your mind$/u,
+  /^anything exciting happen(?:ing)?$/u,
+  /^how are you(?: doing)?$/u,
+  /^how(?:'s| is) it going$/u,
+  /^how(?:'s| is) everything$/u,
+  /^how have you been$/u,
+];
+const GENERIC_ENGAGEMENT_QUESTION_PATTERNS = [
+  /^anything (?:interesting|fun|exciting)(?: (?:going on|happening|planned))?$/u,
+  /^(?:any )?plans(?: (?:for )?(?:tonight|today|tomorrow|later|this weekend))?$/u,
+  /^(?:you )?(?:got|have) (?:any )?plans(?: (?:for )?(?:tonight|today|tomorrow|later|this weekend))?$/u,
+  /^(?:you )?(?:doing|up to) anything(?: (?:later|tonight|today|tomorrow|this weekend))?$/u,
+  /^what (?:did|do) you have in mind$/u,
+  /^what do you think$/u,
+  /^what are you (?:doing|up to)(?: (?:later|tonight|today|tomorrow|this weekend))?$/u,
+  /^what have you been (?:doing|up to)$/u,
+  /^what(?:'ve| have) you been up to$/u,
+  /^anything specific on your mind$/u,
+  /^anything on your mind$/u,
+  /^anything you want to talk about$/u,
+  /^(?:want to )?talk about it$/u,
+];
 const FOLLOW_UP_SETUP =
-  /\b(?:we (?:could|can|should)|let'?s|maybe|how about|why not|i (?:could|can|would)|i(?:'m| am) (?:free|available|busy)|you (?:could|can|might|should)|suggest(?:ion)?|recommend(?:ation)?)\b/iu;
+  /\b(?:we (?:could|can|should)|let'?s|maybe|how about|why not|i (?:could|can|would) (?:meet|come|watch|play|go|join|try|be there|bring|stay|leave|start|finish|check|help|do (?:that|this|it))|i would rather|i(?:'m| am) (?:free|available|busy)|you (?:could|can|might|should)|suggest(?:ion)?|recommend(?:ation)?|you (?:seem|look|sound)|are you (?:okay|ok|alright)|what(?:'s| is) wrong|you(?:'re| are) (?:quiet|upset|down)|is everything (?:okay|ok|alright)|i(?:'m| am) sorry|that(?:'s| sounds| seems) (?:rough|hard|tough|awful|terrible))\b/iu;
+const LEADING_QUESTION_FILLER =
+  /^(?:(?:so|and|but|or|then|anyway|also|actually|honestly|though|tho|well|okay|ok|alright|hey|hi|hello)[,\s]+)+/u;
+const TRAILING_QUESTION_FILLER =
+  /(?:[,\s]+(?:or just (?:catching up|passing time|checking in)|though|tho|then|lol|haha|rn|right now|these days|today|tonight|this morning|this afternoon|this evening))+$/u;
+
+function normalizeTrailingQuestion(question: string): string {
+  let normalized = question.replace(/[.!?]+$/u, '').trim().toLowerCase();
+  let previous = '';
+  while (normalized !== previous) {
+    previous = normalized;
+    normalized = normalized
+      .replace(LEADING_QUESTION_FILLER, '')
+      .replace(TRAILING_QUESTION_FILLER, '')
+      .trim();
+  }
+  return normalized;
+}
 
 function shouldStripTrailingQuestion(question: string, preceding: string): boolean {
-  const withoutTerminalPunctuation = question.replace(/[.!?]+$/u, '').trim();
-  if (RECIPROCAL_QUESTION.test(withoutTerminalPunctuation)) {
+  const normalized = normalizeTrailingQuestion(question);
+  if (RECIPROCAL_QUESTION_PATTERNS.some((pattern) => pattern.test(normalized))) {
     return true;
   }
-  return GENERIC_ENGAGEMENT_QUESTION.test(withoutTerminalPunctuation) &&
+  return GENERIC_ENGAGEMENT_QUESTION_PATTERNS.some((pattern) => pattern.test(normalized)) &&
     !FOLLOW_UP_SETUP.test(preceding);
 }
 
@@ -153,17 +192,10 @@ export function stripGenericTrailingQuestions(reply: string): string {
     return precedingSegments.trimEnd();
   }
 
-  const commaQuestion = new RegExp(
-    '^(.*?)[,;]\\s*((?:' +
-      RECIPROCAL_QUESTION_SOURCE +
-      '|' +
-      GENERIC_ENGAGEMENT_QUESTION_SOURCE +
-      '))[.!?]*\\s*$',
-    'iu',
-  );
-  const match = commaQuestion.exec(trimmedReply);
-  if (match && match[1].trim() && shouldStripTrailingQuestion(match[2], match[1])) {
-    return match[1].trimEnd();
+  const commaMatch = /^(.*)[,;]\s*([^,;]+)$/u.exec(trimmedReply);
+  if (commaMatch && commaMatch[1].trim() &&
+      shouldStripTrailingQuestion(commaMatch[2], commaMatch[1])) {
+    return commaMatch[1].trimEnd();
   }
   return reply;
 }

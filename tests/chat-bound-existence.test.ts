@@ -186,7 +186,7 @@ test('default and custom prompts each include the policy once and keep their voi
       'the chat-bound policy appears exactly once',
     );
   }
-  assert.match(defaultComposed, /natural, conversational Messenger participant/);
+  assert.match(defaultComposed, /You're a laid-back, witty friend/);
   assert.match(customComposed, /Deadpan, observant, and quietly mischievous\./);
   assert.ok(
     customComposed.indexOf(CHAT_BOUND_EXISTENCE_INSTRUCTION) <

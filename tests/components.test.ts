@@ -1175,7 +1175,8 @@ test('production prompt keeps the active reply instruction and the shared constr
   const instruction = composeTestPrompt();
 
   assert.match(instruction, /You are Ada/);
-  assert.match(instruction, /natural, conversational Messenger participant/);
+  assert.match(instruction, /You're a laid-back, witty friend/);
+  assert.match(instruction, /Let conversations breathe/);
   assert.match(instruction, /roughly 3–12 words/);
   assert.match(instruction, /Return only the reply text/);
   assert.match(instruction, /This reply is a proposal until the application sends it/);
@@ -1219,15 +1220,31 @@ test('custom personality stays in its layer while production keeps the request-f
   assert.match(production, /Sarcastic, deadpan, and blunt\./);
 });
 
-test('default personality mode keeps the default instruction unchanged', () => {
-  assert.equal(
-    getPersonalityInstruction('default'),
-    getDefaultPersonalityInstruction(),
+test('default personality mode keeps the new default instruction unchanged', () => {
+  const defaultVoice = getDefaultPersonalityInstruction();
+
+  assert.equal(getPersonalityInstruction('default'), defaultVoice);
+  assert.equal(getPersonalityInstruction('default', 'ignored custom text'), defaultVoice);
+  assert.match(defaultVoice, /You're a laid-back, witty friend/);
+  assert.match(defaultVoice, /Be conversationally independent/);
+  assert.match(defaultVoice, /funny without trying too hard/);
+  assert.match(
+    defaultVoice,
+    /Don't manufacture emotions or pretend to have experiences you don't have\./,
   );
-  assert.equal(
-    getPersonalityInstruction('default', 'ignored custom text'),
-    getDefaultPersonalityInstruction(),
+  assert.match(defaultVoice, /Answer the actual joke, tease, or implication/);
+  assert.match(
+    defaultVoice,
+    /Don't default to flat lines like "no thanks," "fair enough," or "haha no worries"/,
   );
+  assert.match(defaultVoice, /Disagree or push back/);
+  assert.match(
+    defaultVoice,
+    /if someone is upset or the topic is serious, drop the bit and respond directly/,
+  );
+  assert.match(defaultVoice, /A genuine question is fine when you actually want an answer/);
+  assert.match(defaultVoice, /Don't narrate the conversation or announce a graceful exit/);
+  assert.match(defaultVoice, /socially confident without being aggressive/);
 });
 
 test('custom personality replaces only the personality layer', () => {
@@ -1890,6 +1907,13 @@ test('production prompt forbids obligatory reciprocal questions and allows stand
   assert.match(composed, /be comfortable ending a response with a statement/u);
   assert.match(composed, /"And you\?", "What about you\?", "How about you\?"/u);
   assert.match(composed, /"Anything interesting\?", or "What did you have in mind\?"/u);
+  assert.match(
+    composed,
+    /"What do you think\?", "You got plans\?", "Anything specific on your mind\?", and "What are you up to\?"/u,
+  );
+  assert.match(composed, /Do not use a question to soften a joke, opinion, or tease/u);
+  assert.match(composed, /the rule is against reflexive follow-ups, not questions themselves/u);
+  assert.match(composed, /When a conversation is winding down, let it end/u);
 });
 
 test('memory and initiative instructions are appended once and stay idempotent', () => {

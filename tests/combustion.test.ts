@@ -4260,7 +4260,7 @@ test('a mention-triggered echo is suppressed without entering outgoing history',
     );
     assert.match(
       String(harness.generateRequests[1].systemInstruction),
-      /natural, conversational Messenger participant/,
+      /You're a laid-back, witty friend/,
       'the configured personality survives the retry',
     );
     assert.match(

@@ -336,6 +336,26 @@ test('a short exact reply is repeated only when an incoming message intervenes',
     false,
     'the legitimate short-reply allowlist is preserved',
   );
+  assert.equal(
+    isSelfRepetitionReply('Fair enough.', [], {
+      history: [
+        { message: 'fair enough', direction: 'OUTGOING', messageId: 'out-1' },
+        { message: 'you got plans?', direction: 'INCOMING', messageId: 'in-1' },
+      ],
+    }),
+    true,
+    'a repeated generic acknowledgment is still a repetition',
+  );
+  assert.equal(
+    isSelfRepetitionReply('No thanks.', [], {
+      history: [
+        { message: 'no thanks', direction: 'OUTGOING', messageId: 'out-1' },
+        { message: 'can you kiss my ass?', direction: 'INCOMING', messageId: 'in-1' },
+      ],
+    }),
+    true,
+    'a repeated flat refusal is still a repetition',
+  );
 });
 
 test('composer batches are compared as one logical reply, not separate bubbles', () => {

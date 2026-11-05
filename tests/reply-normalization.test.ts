@@ -32,10 +32,25 @@ test('habitual reciprocal question endings are removed while the answer stays in
     ["Haha. I'm bored too. What did you have in mind?", "Haha. I'm bored too."],
     ["I'm bored. Anything interesting?", "I'm bored."],
     ["I'm bored. Anything fun happening?", "I'm bored."],
+    ["I'm bored. Anything specific on your mind?", "I'm bored."],
     ['That is fair. How about you?', 'That is fair.'],
     ['Same. What about you?', 'Same.'],
     ["I'm fine, and you?", "I'm fine"],
     ["I'm bored too, what did you have in mind?", "I'm bored too"],
+    ['Fair enough. You got plans?', 'Fair enough.'],
+    [
+      'I can work with that. Anything specific on your mind or just catching up?',
+      'I can work with that.',
+    ],
+    [
+      "Boredom's a solid reason to text. You got plans or just passing time?",
+      "Boredom's a solid reason to text.",
+    ],
+    ["That's fair. What do you think?", "That's fair."],
+    ["Same. How's it going?", 'Same.'],
+    ['Haha no worries. What are you up to these days?', 'Haha no worries.'],
+    ['Cool. What are you doing later?', 'Cool.'],
+    ['Fair enough. You got plans though?', 'Fair enough.'],
   ];
 
   for (const [reply, expected] of cases) {
@@ -53,6 +68,24 @@ test('standalone statements are never rewritten by trailing question cleanup', (
     'You?',
     'And you?',
     'Anything interesting?',
+    'What do you think?',
+    'You got plans?',
+    'Anything specific on your mind?',
+    'What are you up to?',
+    "How's it going?",
+    'Want to talk about it?',
+  ]) {
+    assert.equal(stripGenericTrailingQuestions(reply), reply, reply);
+  }
+});
+
+test('plain acknowledgments are preserved when no trailing question is present', () => {
+  for (const reply of [
+    'No thanks.',
+    'Fair enough.',
+    'Haha no worries, it happens to the best of us.',
+    "I'm good, just hanging out.",
+    'Fair point. Catch you later.',
   ]) {
     assert.equal(stripGenericTrailingQuestions(reply), reply, reply);
   }
@@ -60,14 +93,22 @@ test('standalone statements are never rewritten by trailing question cleanup', (
 
 test('meaningful, game, and clarification questions survive trailing cleanup', () => {
   for (const reply of [
+    "Nah, I'm good. You looking for volunteers?",
     'I can meet at 7. What time works for you?',
+    'I can meet at 7. What do you think?',
     'I do not understand. What do you mean?',
     'Knock knock. Who is there?',
     'Want to play a game? Truth or dare?',
     'We could watch a movie. What did you have in mind?',
     'We could watch a movie. Anything interesting?',
+    'We could watch a movie. What do you think?',
     "I'm free tonight. What did you have in mind?",
+    'The deadline is Friday. What do you think about it?',
     'The movie starts at eight. Which showing do you want?',
+    "I'm sorry, that sounds rough. Want to talk about it?",
+    'You seem quiet. Anything on your mind?',
+    'You got plans for the project?',
+    'What are you doing with the files?',
   ]) {
     assert.equal(stripGenericTrailingQuestions(reply), reply, reply);
   }
