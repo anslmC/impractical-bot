@@ -96,6 +96,7 @@ import {
 import { CLI_COMMANDS, formatCliCommand } from './cli-commands.js';
 import {
   checkDashboardTerminal,
+  DashboardTerminalError,
   startDashboard,
   type DashboardSession,
   type DashboardTerminalCheck,
@@ -1726,10 +1727,11 @@ async function handleStart(
               },
             });
           } catch (error) {
-            writeError(
-              'Unable to open the terminal dashboard: ' +
-              `${error instanceof Error ? error.message : String(error)}`,
-            );
+            const detail = error instanceof DashboardTerminalError
+              ? error.detail
+              : error instanceof Error ? error.message : String(error);
+            console.error(`[dashboard] Startup failed: ${detail}`);
+            writeError('Dashboard unavailable; continuing without it.');
           }
         }
         const engineSession = session;
@@ -1774,10 +1776,11 @@ async function handleStart(
       try {
         await dashboardSession.close();
       } catch (error) {
-        writeError(
-          `Unable to close the terminal dashboard: ` +
+        console.error(
+          `[dashboard] Shutdown failed: ` +
           `${error instanceof Error ? error.message : String(error)}`,
         );
+        writeError('Dashboard shutdown failed.');
         exitCode = 1;
       }
     }

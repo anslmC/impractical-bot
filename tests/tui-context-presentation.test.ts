@@ -380,6 +380,6 @@ test('dashboard LIVE LOGS renders Context Store output as a hierarchy', () => {
   assert.match(plain, /└─ PleaseGetout Daily content that must stay verbatim  m2/);
   assert.doesNotMatch(plain, /^={8,}$/m);
   assert.match(plain, /\[engine\] Combustion resumed\./);
-  assert.match(lines.join('\n'), /\u001b\[36m\[poll\]\u001b\[0m/, 'other categories keep their color');
+  assert.match(lines.join('\n'), /\u001b\[37m\[poll\]\u001b\[0m/, 'other categories keep their light-gray tone');
   assert.ok(lines.every(line => visibleWidth(line) === 80));
 });

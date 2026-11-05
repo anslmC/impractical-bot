@@ -171,7 +171,7 @@ export function validateDestinationInput(value: string): DestinationValidation {
   if (destination.length === 0) {
     return {
       ok: false,
-      message: 'Invalid destination URL. Enter a valid HTTP or HTTPS URL.',
+      message: 'Enter a valid HTTP or HTTPS URL.',
     };
   }
   try {
@@ -183,7 +183,7 @@ export function validateDestinationInput(value: string): DestinationValidation {
   } catch {
     return {
       ok: false,
-      message: 'Invalid destination URL. Enter a valid HTTP or HTTPS URL.',
+      message: 'Enter a valid HTTP or HTTPS URL.',
     };
   }
 }

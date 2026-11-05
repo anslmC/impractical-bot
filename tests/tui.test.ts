@@ -105,7 +105,7 @@ test('dashboard layout renders every field within the requested dimensions', () 
   assert.match(rendered, /Personality:\s+Default/);
   assert.match(rendered, /1618007223454558/);
   assert.match(rendered, /COMMANDS/);
-  assert.match(rendered, /\[C\] Close dashboard/);
+  assert.match(rendered, /\[D\] Enter debug/);
   assert.doesNotMatch(rendered, /\[Q\]/);
   assert.doesNotMatch(rendered, /\[Esc\]/);
   assert.doesNotMatch(rendered, /start --tui/);
@@ -205,8 +205,8 @@ test('dashboard terminal preflight requires TTY stdin, TTY stdout, and raw mode'
   assert.equal(checkDashboardTerminal(streamInput(input), streamOutput(output)).ok, false);
 });
 
-test('dashboard restores the terminal for C and closes idempotently', async () => {
-  for (const key of ['c', 'C']) {
+test('dashboard restores the terminal for D and closes idempotently', async () => {
+  for (const key of ['d', 'D']) {
     const input = new FakeInput();
     const output = new FakeOutput();
     const session = await startDashboard({
@@ -293,7 +293,7 @@ test('dashboard preserves an input that was already flowing before it started', 
   assert.equal(input.listenerCount('data'), 0);
 });
 
-test('dashboard ignores Q and Escape until C closes it', async () => {
+test('dashboard ignores Q and Escape until D closes it', async () => {
   const input = new FakeInput();
   const output = new FakeOutput();
   const session = await startDashboard({
@@ -310,7 +310,7 @@ test('dashboard ignores Q and Escape until C closes it', async () => {
     assert.deepEqual(input.rawModes, [true]);
   }
 
-  input.emit('data', Buffer.from('c'));
+  input.emit('data', Buffer.from('d'));
   await session.closed;
   assert.deepEqual(input.rawModes, [true, false]);
   assert.equal(input.listenerCount('data'), 0);
@@ -330,6 +330,7 @@ test('dashboard polling never overlaps and recovers after a disconnected result'
     input: streamInput(input),
     output: streamOutput(output),
     pollIntervalMs: 60_000,
+    captureConsoleOutput: true,
     requestStatus: async () => {
       requests += 1;
       if (requests === 1) {

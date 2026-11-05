@@ -256,7 +256,7 @@ test('invalid and empty destinations are rejected locally without calling the ru
     await waitFor(() => output.text().includes('Destination URL:'));
     input.emit('data', Buffer.from('ftp://example.com'));
     input.emit('data', Buffer.from('\r'));
-    await waitFor(() => output.text().includes('Invalid destination URL.'));
+    await waitFor(() => output.text().includes('Enter a valid HTTP or HTTPS URL.'));
     assert.equal(calls, 0);
 
     input.emit('data', Buffer.from('\u001b'));
@@ -265,7 +265,8 @@ test('invalid and empty destinations are rejected locally without calling the ru
     await waitFor(() => output.text().includes('Destination URL:'));
     const beforeSubmit = output.writes.length;
     input.emit('data', Buffer.from('\r'));
-    await waitFor(() => output.writesSince(beforeSubmit).includes('Invalid destination URL.'));
+    await waitFor(() =>
+      output.writesSince(beforeSubmit).includes('Enter a valid HTTP or HTTPS URL.'));
     assert.equal(calls, 0);
   } finally {
     await session.close();
@@ -338,12 +339,12 @@ test('empty and oversized custom personality instructions are not submitted', as
     input.emit('data', Buffer.from('y2'));
     await waitFor(() => output.text().includes('Personality instruction:'));
     input.emit('data', Buffer.from('\r'));
-    await waitFor(() => output.text().includes('Personality instruction must not be empty.'));
+    await waitFor(() => output.text().includes('Enter a personality instruction.'));
     assert.equal(calls, 0);
 
     input.emit('data', Buffer.from('a'.repeat(MAX_PERSONALITY_INSTRUCTION_CHARS + 5)));
     await waitFor(() =>
-      output.text().includes(`Personality instruction cannot exceed ${MAX_PERSONALITY_INSTRUCTION_CHARS} characters.`));
+      output.text().includes(`Instruction too long (max ${MAX_PERSONALITY_INSTRUCTION_CHARS} characters).`));
     assert.equal(calls, 0);
   } finally {
     await session.close();
@@ -424,17 +425,16 @@ test('stop requires confirmation and tolerates settling after dashboard closure'
   assert.equal(input.listenerCount('data'), 0);
 });
 
-test('runtime failures are shown as footer errors and do not crash the dashboard', async () => {
+test('runtime failures are shown as concise footer errors and do not crash the dashboard', async () => {
   const { input, output, session } = await startHarness(commandApi({
     pause: async () => {
       throw new Error('The engine rejected the pause request (BUSY).');
     },
-  }));
+  }), { captureConsoleOutput: true });
 
   try {
     input.emit('data', Buffer.from('p'));
-    await waitFor(() =>
-      output.text().includes('Error: The engine rejected the pause request (BUSY).'));
+    await waitFor(() => output.text().includes('Error: Pause failed. See the logs.'));
 
     const beforeEscape = output.writes.length;
     input.emit('data', Buffer.from('\u001b'));
@@ -508,7 +508,7 @@ test('long prompt input scrolls horizontally and keeps the cursor on screen', as
   assert.ok(cursor.column >= 1 && cursor.column <= dimensions.columns);
 });
 
-test('prompt and pending states hide unavailable commands but keep C in normal mode', () => {
+test('prompt and pending states hide unavailable commands but keep D in normal mode', () => {
   const view: DashboardView = {
     connection: 'connected',
     state: 'running',
@@ -518,7 +518,7 @@ test('prompt and pending states hide unavailable commands but keep C in normal m
     messengerDestination: 'https://example.com',
   };
   const normal = renderDashboardLines(view, { columns: 80, rows: 24 }).join('\n');
-  assert.match(normal, /\[C\] Close dashboard/);
+  assert.match(normal, /\[D\] Enter debug/);
   assert.match(normal, /\[P\] pause/);
   assert.doesNotMatch(normal, /\[R\] resume/);
 
@@ -526,7 +526,7 @@ test('prompt and pending states hide unavailable commands but keep C in normal m
     { ...view, prompt: { kind: 'temperament' } },
     { columns: 80, rows: 24 },
   ).join('\n');
-  assert.doesNotMatch(prompt, /\[C\] Close dashboard/);
+  assert.doesNotMatch(prompt, /\[D\] Enter debug/);
   assert.doesNotMatch(prompt, /\[P\] pause/);
   assert.match(prompt, /Select temperament:/);
 
@@ -534,7 +534,7 @@ test('prompt and pending states hide unavailable commands but keep C in normal m
     { ...view, pending: true, notice: { tone: 'pending', message: 'Pausing...', transient: false } },
     { columns: 80, rows: 24 },
   ).join('\n');
-  assert.match(pending, /\[C\] Close dashboard/);
+  assert.match(pending, /\[D\] Enter debug/);
   assert.doesNotMatch(pending, /\[P\] pause/);
   assert.match(pending, /Pausing\.\.\./);
 });

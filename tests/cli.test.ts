@@ -4425,7 +4425,7 @@ test('start Ctrl+C inside the active dashboard completes shutdown and releases r
   assert.match(afterShutdown.output[0], /No impractical-bot engine is running/);
 });
 
-test('C closes the dashboard without stopping the engine and a later Ctrl+C shuts it down', async context => {
+test('D closes the dashboard without stopping the engine and a later Ctrl+C shuts it down', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
   saveApplicationApiKey(configurationFilePath);

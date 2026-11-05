@@ -2,65 +2,96 @@ import { centerVisible, paint, renderLine, type DashboardTone } from './theme.js
 
 export const WORDMARK_TAGLINE = 'MESSENGER CONVERSATION ENGINE';
 
-const GLYPH_HEIGHT = 5;
+export const WORDMARK_GLYPH_HEIGHT = 5;
+export const FULL_WORDMARK_ADVANCE = 4;
+export const COMPACT_WORDMARK_ADVANCE = 3;
+export const WORDMARK_TRACKING = 1;
+export const FULL_WORDMARK_GAP = 5;
+export const COMPACT_WORDMARK_GAP = 3;
+
 const WORDMARK_TEXT = 'IMPractical BOT';
+const WORDMARK_DISPLAY_TEXT = WORDMARK_TEXT.toUpperCase();
+const WORDMARK_PLAIN_WIDTH = WORDMARK_DISPLAY_TEXT.length;
 
 type GlyphSet = Readonly<Record<string, readonly string[]>>;
 
-const GLYPHS: GlyphSet = {
-  I: ['▐█▌', ' █ ', ' █ ', ' █ ', '▐█▌'],
-  M: ['█   █', '██ ██', '█ █ █', '█   █', '█   █'],
+export const FULL_WORDMARK_GLYPHS: GlyphSet = {
+  I: ['████', ' ██ ', ' ██ ', ' ██ ', '████'],
+  M: ['█  █', '█▌▐█', '█▐▌█', '█  █', '█  █'],
+  N: ['█  █', '██ █', '█ ██', '█  █', '█  █'],
   P: ['████', '█  █', '████', '█   ', '█   '],
   R: ['████', '█  █', '████', '█ █ ', '█  █'],
   A: [' ██ ', '█  █', '████', '█  █', '█  █'],
   C: [' ███', '█   ', '█   ', '█   ', ' ███'],
   T: ['████', ' ██ ', ' ██ ', ' ██ ', ' ██ '],
-  L: ['█  ', '█  ', '█  ', '█  ', '███'],
-  B: ['████', '█  █', '███▌', '█  █', '████'],
+  L: ['█   ', '█   ', '█   ', '█   ', '████'],
+  B: ['███ ', '█  █', '████', '█  █', '████'],
   O: [' ██ ', '█  █', '█  █', '█  █', ' ██ '],
-  ' ': ['   ', '   ', '   ', '   ', '   '],
+  ' ': ['    ', '    ', '    ', '    ', '    '],
 };
 
-const COMPACT_GLYPHS: GlyphSet = {
-  I: ['▐█▌', ' █ ', ' █ ', ' █ ', '▐█▌'],
-  M: ['█ █', '███', '█ █', '█ █', '█ █'],
+export const COMPACT_WORDMARK_GLYPHS: GlyphSet = {
+  I: ['███', ' █ ', ' █ ', ' █ ', '███'],
+  M: ['█ █', '█▌█', '█▐█', '█▌█', '█▐█'],
+  N: ['█ █', '███', '███', '█ █', '█ █'],
   P: ['██ ', '█ █', '██ ', '█  ', '█  '],
   R: ['██ ', '█ █', '██ ', '█ █', '█ █'],
   A: [' █ ', '█ █', '███', '█ █', '█ █'],
   C: [' ██', '█  ', '█  ', '█  ', ' ██'],
   T: ['███', ' █ ', ' █ ', ' █ ', ' █ '],
   L: ['█  ', '█  ', '█  ', '█  ', '███'],
-  B: ['██ ', '█ █', '██ ', '█ █', '██ '],
+  B: ['██▌', '█ █', '███', '█ █', '███'],
   O: [' █ ', '█ █', '█ █', '█ █', ' █ '],
-  ' ': [' ', ' ', ' ', ' ', ' '],
+  ' ': ['   ', '   ', '   ', '   ', '   '],
 };
 
 const GRADIENT: readonly DashboardTone[] = [
   'brand',
   'info',
   'brandSoft',
-  'accent',
+  'violet',
   'accent',
 ];
 
-function glyphRows(glyphs: GlyphSet, character: string): readonly string[] {
-  const glyph = glyphs[character.toUpperCase()] ?? glyphs[' ']!;
-  const width = Math.max(...glyph.map(row => row.length));
-  return glyph.map(row => row.padEnd(width));
+interface GlyphMetrics {
+  readonly advance: number;
+  readonly wordGap: number;
 }
 
-function glyphLines(glyphs: GlyphSet): string[] {
-  const rows: string[] = [];
-  for (let row = 0; row < GLYPH_HEIGHT; row += 1) {
-    rows.push(
-      [...WORDMARK_TEXT]
-        .map(character => glyphRows(glyphs, character)[row])
-        .join(' ')
-        .replace(/\s+$/, ''),
-    );
-  }
-  const width = Math.max(...rows.map(row => row.length));
-  return rows.map(row => row.padEnd(width));
+const FULL_METRICS: GlyphMetrics = {
+  advance: FULL_WORDMARK_ADVANCE,
+  wordGap: FULL_WORDMARK_GAP,
+};
+
+const COMPACT_METRICS: GlyphMetrics = {
+  advance: COMPACT_WORDMARK_ADVANCE,
+  wordGap: COMPACT_WORDMARK_GAP,
+};
+
+function glyphRows(
+  glyphs: GlyphSet,
+  character: string,
+  advance: number,
+): readonly string[] {
+  const glyph = glyphs[character.toUpperCase()] ?? glyphs[' ']!;
+  return Array.from(
+    { length: WORDMARK_GLYPH_HEIGHT },
+    (_, row) => (glyph[row] ?? '').padEnd(advance),
+  );
+}
+
+function glyphLines(glyphs: GlyphSet, metrics: GlyphMetrics): string[] {
+  const words = WORDMARK_DISPLAY_TEXT
+    .split(' ')
+    .filter(word => word.length > 0);
+  const laidOut = words.map(word =>
+    [...word].map(character => glyphRows(glyphs, character, metrics.advance)),
+  );
+  return Array.from({ length: WORDMARK_GLYPH_HEIGHT }, (_, row) =>
+    laidOut
+      .map(word => word.map(glyph => glyph[row]).join(' '.repeat(WORDMARK_TRACKING)))
+      .join(' '.repeat(WORDMARK_TRACKING + metrics.wordGap)),
+  );
 }
 
 function paintRows(rows: readonly string[], color: boolean): string[] {
@@ -71,11 +102,11 @@ function paintRows(rows: readonly string[], color: boolean): string[] {
 }
 
 export function wordmarkArtLines(): string[] {
-  return glyphLines(GLYPHS);
+  return glyphLines(FULL_WORDMARK_GLYPHS, FULL_METRICS);
 }
 
 export function compactWordmarkLines(): string[] {
-  return glyphLines(COMPACT_GLYPHS);
+  return glyphLines(COMPACT_WORDMARK_GLYPHS, COMPACT_METRICS);
 }
 
 export const WORDMARK_WIDTH = Math.max(...wordmarkArtLines().map(row => row.length));
@@ -113,13 +144,11 @@ export function renderWordmarkCentered(
 export function renderPlainWordmark({ color = true }: { color?: boolean } = {}): string {
   return renderLine(
     [
-      { text: 'IMP', tone: 'brand' },
-      { text: 'ractical', tone: 'brandSoft' },
-      { text: ' BOT', tone: 'accent' },
+      { text: WORDMARK_DISPLAY_TEXT.slice(0, 3), tone: 'brand' },
+      { text: WORDMARK_DISPLAY_TEXT.slice(3, -4), tone: 'brandSoft' },
+      { text: WORDMARK_DISPLAY_TEXT.slice(-4), tone: 'accent' },
     ],
     WORDMARK_PLAIN_WIDTH,
     color,
   ).trimEnd();
 }
-
-const WORDMARK_PLAIN_WIDTH = 'IMPractical BOT'.length;

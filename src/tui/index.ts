@@ -30,6 +30,13 @@ import {
   type DashboardNoticeTone,
   type DashboardPrompt,
 } from './commands.js';
+import {
+  describeError,
+  reportTuiDestinationFailure,
+  reportTuiError,
+  reportTuiStatusPollingFailure,
+  type TuiErrorCategory,
+} from './errors.js';
 
 export type {
   DashboardCommandApi,
@@ -62,11 +69,15 @@ const CLEAR_SCREEN = '\u001b[2J\u001b[H';
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
 const ESCAPE_SEQUENCE_TIMEOUT_MS = 30;
 const SUCCESS_NOTICE_TIMEOUT_MS = 4_000;
+const ERROR_NOTICE_TIMEOUT_MS = 6_000;
 
 export class DashboardTerminalError extends Error {
-  constructor(message: string) {
-    super(message);
+  readonly detail: string;
+
+  constructor(detail: string) {
+    super('Dashboard requires an interactive terminal.');
     this.name = 'DashboardTerminalError';
+    this.detail = detail;
   }
 }
 
@@ -146,10 +157,6 @@ interface CommandOutcome {
   readonly message: string;
 }
 
-function describeError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 export async function startDashboard(
   options: DashboardOptions = {},
 ): Promise<DashboardSession> {
@@ -157,7 +164,7 @@ export async function startDashboard(
   const output = options.output ?? process.stdout;
   const terminal = checkDashboardTerminal(input, output);
   if (!terminal.ok) {
-    throw new DashboardTerminalError(`The dashboard cannot start: ${terminal.reason}`);
+    throw new DashboardTerminalError(terminal.reason);
   }
 
   const requestStatus = options.requestStatus ?? requestRuntimeStatusSnapshot;
@@ -192,6 +199,7 @@ export async function startDashboard(
   let cursorShown = false;
   let capturedConsole: ConsoleCapture | undefined;
   let inFlight = false;
+  let lastStatusFailure: string | undefined;
   let closed = false;
   let resolveClosed!: () => void;
   const closedPromise = new Promise<void>(resolve => {
@@ -302,6 +310,7 @@ export async function startDashboard(
       if (closed) {
         return;
       }
+      lastStatusFailure = undefined;
       if (result.status === 'running') {
         statusView = {
           connection: 'connected',
@@ -317,8 +326,13 @@ export async function startDashboard(
         statusView = emptyView('unsupported', 'disconnected');
       }
       render();
-    } catch {
+    } catch (error) {
       if (!closed) {
+        const detail = describeError(error);
+        if (detail !== lastStatusFailure) {
+          lastStatusFailure = detail;
+          reportTuiStatusPollingFailure(error);
+        }
         statusView = emptyView('disconnected', 'disconnected');
         render();
       }
@@ -350,7 +364,10 @@ export async function startDashboard(
     clearNoticeTimer();
     const next: DashboardNotice = { tone, message, transient };
     notice = next;
-    if (transient) {
+    const timeoutMs = tone === 'error'
+      ? ERROR_NOTICE_TIMEOUT_MS
+      : transient ? SUCCESS_NOTICE_TIMEOUT_MS : undefined;
+    if (timeoutMs !== undefined) {
       noticeTimer = setTimeout(() => {
         noticeTimer = undefined;
         if (closed || notice !== next) {
@@ -358,7 +375,7 @@ export async function startDashboard(
         }
         notice = undefined;
         render();
-      }, SUCCESS_NOTICE_TIMEOUT_MS);
+      }, timeoutMs);
     }
     render();
   };
@@ -399,6 +416,7 @@ export async function startDashboard(
   };
 
   const runOperation = async <T>(
+    category: TuiErrorCategory,
     pendingMessage: string,
     operation: (api: DashboardCommandApi) => Promise<T>,
     interpret: (result: T) => CommandOutcome,
@@ -407,7 +425,7 @@ export async function startDashboard(
       return;
     }
     if (commands === undefined) {
-      showNotice('error', 'Command execution is unavailable.', false);
+      showNotice('error', 'Dashboard commands are unavailable.', false);
       return;
     }
 
@@ -427,12 +445,13 @@ export async function startDashboard(
         return;
       }
       pending = false;
-      showNotice('error', describeError(error), false);
+      showNotice('error', reportTuiError(category, error), false);
     }
   };
 
   const runPause = async (): Promise<void> => {
     await runOperation(
+      'pause',
       'Pausing...',
       api => api.pause(),
       result => result.status === 'paused'
@@ -443,6 +462,7 @@ export async function startDashboard(
 
   const runResume = async (): Promise<void> => {
     await runOperation(
+      'resume',
       'Resuming...',
       api => api.resume(),
       result => result.status === 'resumed'
@@ -453,6 +473,7 @@ export async function startDashboard(
 
   const runChangeDestination = async (destination: string): Promise<void> => {
     await runOperation(
+      'destination',
       'Changing Messenger destination...',
       api => api.changeDestination(destination),
       result => {
@@ -464,24 +485,14 @@ export async function startDashboard(
               (result.resumed ? 'Engine resumed.' : 'Engine remains paused.'),
           };
         }
-        if (result.status === 'rejected') {
+        if (result.status === 'rejected' || result.status === 'failed') {
           return {
             ok: false,
-            message:
-              `Destination change rejected: ${result.reason} ` +
-              (result.resumed
-                ? 'The engine resumed at the previous destination.'
-                : 'The engine remains paused.'),
-          };
-        }
-        if (result.status === 'failed') {
-          return {
-            ok: false,
-            message:
-              `Destination change failed: ${result.reason} ` +
-              (result.resumed
-                ? 'The engine resumed at the previous destination.'
-                : 'The engine remains paused.'),
+            message: reportTuiDestinationFailure(
+              result.status,
+              result.reason,
+              result.resumed,
+            ),
           };
         }
         return { ok: false, message: 'No impractical-bot engine is running.' };
@@ -493,6 +504,7 @@ export async function startDashboard(
     temperament: NonNullable<ReturnType<typeof temperamentForSelection>>,
   ): Promise<void> => {
     await runOperation(
+      'temperament',
       'Changing temperament...',
       api => api.setTemperament(temperament),
       result => {
@@ -503,7 +515,10 @@ export async function startDashboard(
           };
         }
         if (result.status === 'failed') {
-          return { ok: false, message: `Temperament change failed: ${result.reason}` };
+          return {
+            ok: false,
+            message: reportTuiError('temperament', result.reason),
+          };
         }
         return { ok: false, message: 'No impractical-bot engine is running.' };
       },
@@ -515,6 +530,7 @@ export async function startDashboard(
     instruction: string,
   ): Promise<void> => {
     await runOperation(
+      'personality',
       'Changing personality...',
       api => api.setPersonality(mode, instruction),
       result => {
@@ -525,7 +541,10 @@ export async function startDashboard(
           };
         }
         if (result.status === 'failed') {
-          return { ok: false, message: `Personality change failed: ${result.reason}` };
+          return {
+            ok: false,
+            message: reportTuiError('personality', result.reason),
+          };
         }
         return { ok: false, message: 'No impractical-bot engine is running.' };
       },
@@ -534,6 +553,7 @@ export async function startDashboard(
 
   const runStop = async (): Promise<void> => {
     await runOperation(
+      'stop',
       'Stopping engine...',
       api => api.stop(),
       result => result.status === 'stopped'
@@ -599,7 +619,7 @@ export async function startDashboard(
     if (prompt.value.length + character.length > maximum) {
       prompt = {
         ...prompt,
-        error: `Personality instruction cannot exceed ${maximum} characters.`,
+        error: `Instruction too long (max ${maximum} characters).`,
       };
       render();
       return;
@@ -646,7 +666,7 @@ export async function startDashboard(
     const instruction = value.trim();
     if (instruction.length === 0) {
       if (prompt?.kind === 'personalityInstruction') {
-        prompt = { ...prompt, error: 'Personality instruction must not be empty.' };
+        prompt = { ...prompt, error: 'Enter a personality instruction.' };
         render();
       }
       return;
@@ -656,7 +676,7 @@ export async function startDashboard(
       if (prompt?.kind === 'personalityInstruction') {
         prompt = {
           ...prompt,
-          error: `Personality instruction cannot exceed ${maximum} characters.`,
+          error: `Instruction too long (max ${maximum} characters).`,
         };
         render();
       }
@@ -720,7 +740,7 @@ export async function startDashboard(
   };
 
   const handleDashboardKey = (character: string): void => {
-    if (character === 'c' || character === 'C') {
+    if (character === 'd' || character === 'D') {
       void close();
       return;
     }

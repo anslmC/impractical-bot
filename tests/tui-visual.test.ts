@@ -12,11 +12,20 @@ import {
 import { formatDashboardLogLine, type DashboardLogEntry } from '../src/tui/logs.js';
 import { stripAnsi, visibleWidth } from '../src/tui/theme.js';
 import {
+  COMPACT_WORDMARK_ADVANCE,
+  COMPACT_WORDMARK_GAP,
+  COMPACT_WORDMARK_GLYPHS,
   COMPACT_WORDMARK_WIDTH,
+  FULL_WORDMARK_ADVANCE,
+  FULL_WORDMARK_GAP,
+  FULL_WORDMARK_GLYPHS,
+  WORDMARK_GLYPH_HEIGHT,
   WORDMARK_TAGLINE,
+  WORDMARK_TRACKING,
   WORDMARK_WIDTH,
   compactWordmarkLines,
   renderCompactWordmark,
+  renderPlainWordmark,
   renderWordmark,
   renderWordmarkForWidth,
   wordmarkArtLines,
@@ -116,7 +125,8 @@ test('the wordmark is block-drawn, aligned, and sized for a standard terminal', 
 
   assert.equal(art.length, 5, 'the wordmark is five rows tall');
   assert.equal(new Set(art.map(row => row.length)).size, 1, 'every row shares one width');
-  assert.equal(WORDMARK_WIDTH, art[0].length);
+  assert.equal(WORDMARK_WIDTH, 74);
+  assert.equal(WORDMARK_WIDTH, art[0]?.length);
   assert.ok(WORDMARK_WIDTH <= 78, 'the artwork fits the 80-column dashboard body');
   assert.ok(WORDMARK_WIDTH > 40, 'the artwork is the visual centerpiece');
   assert.ok(art.every(row => /[█▀▄▌▐]/.test(row)), 'the artwork uses block characters');
@@ -124,7 +134,7 @@ test('the wordmark is block-drawn, aligned, and sized for a standard terminal', 
 
   const rendered = renderDashboardLines(connectedView, { columns: 80, rows: 24 });
   const plain = rendered.map(stripAnsi).join('\n');
-  assert.match(plain, /▐█▌/, 'the block wordmark is displayed at 80 columns');
+  assert.match(plain, /[█▌▐]/, 'the block wordmark is displayed at 80 columns');
   assert.match(plain, new RegExp(WORDMARK_TAGLINE));
   assert.ok(
     rendered.some(line => escapeCodes(line).length === 0),
@@ -132,9 +142,135 @@ test('the wordmark is block-drawn, aligned, and sized for a standard terminal', 
   );
 });
 
-test('the wordmark paints a cyan to blue to purple gradient', () => {
+test('full and compact atlases use five-row fixed-width cells', () => {
+  assert.equal(WORDMARK_GLYPH_HEIGHT, 5);
+  assert.equal(FULL_WORDMARK_ADVANCE, 4);
+  assert.equal(COMPACT_WORDMARK_ADVANCE, 3);
+
+  const atlases: Array<[string, Readonly<Record<string, readonly string[]>>, number]> = [
+    ['full', FULL_WORDMARK_GLYPHS, FULL_WORDMARK_ADVANCE],
+    ['compact', COMPACT_WORDMARK_GLYPHS, COMPACT_WORDMARK_ADVANCE],
+  ];
+
+  for (const [name, glyphs, advance] of atlases) {
+    for (const [character, rows] of Object.entries(glyphs)) {
+      assert.equal(
+        rows.length,
+        WORDMARK_GLYPH_HEIGHT,
+        `${name} ${character} has exactly ${WORDMARK_GLYPH_HEIGHT} rows`,
+      );
+      assert.ok(
+        rows.every(row => row.length === advance),
+        `${name} ${character} occupies its full ${advance}-column cell`,
+      );
+      if (character === ' ') {
+        assert.ok(rows.every(row => row.trim().length === 0), `${name} space is blank`);
+        continue;
+      }
+      assert.ok(rows[0]!.trim().length > 0, `${name} ${character} reaches the cap line`);
+      assert.ok(
+        rows[WORDMARK_GLYPH_HEIGHT - 1]!.trim().length > 0,
+        `${name} ${character} reaches the baseline`,
+      );
+    }
+
+    for (const character of ['I', 'L']) {
+      const rows = glyphs[character]!;
+      assert.equal(
+        rows[WORDMARK_GLYPH_HEIGHT - 1]!.trimEnd().length,
+        advance,
+        `${name} ${character} has a full-width baseline`,
+      );
+    }
+  }
+});
+
+test('M uses inward diagonals and differs from H and N in both atlases', () => {
+  const atlases: Array<[string, Readonly<Record<string, readonly string[]>>, number]> = [
+    ['full', FULL_WORDMARK_GLYPHS, FULL_WORDMARK_ADVANCE],
+    ['compact', COMPACT_WORDMARK_GLYPHS, COMPACT_WORDMARK_ADVANCE],
+  ];
+  const hGlyphs: Readonly<Record<string, readonly string[]>> = {
+    full: ['█  █', '████', '█  █', '█  █', '█  █'],
+    compact: ['█ █', '███', '█ █', '█ █', '█ █'],
+  };
+
+  for (const [name, glyphs, advance] of atlases) {
+    const m = glyphs.M!;
+    const h = hGlyphs[name]!;
+    const n = glyphs.N!;
+
+    assert.notDeepEqual(m, h, `${name} M and H are distinct glyphs`);
+    assert.notDeepEqual(m, n, `${name} M and N are distinct glyphs`);
+    assert.equal(m.length, WORDMARK_GLYPH_HEIGHT, `${name} M has five rows`);
+    assert.ok(m.every(row => row.length === advance), `${name} M keeps its fixed advance`);
+    assert.ok(
+      m.every(row => row[0] === '█' && row[advance - 1] === '█'),
+      `${name} M keeps both outer vertical stems`,
+    );
+    assert.ok(
+      m.slice(1).some(row => /[▌▐]/.test(row)),
+      `${name} M uses half-blocks for its inward diagonals`,
+    );
+    assert.ok(
+      m.every(row => row !== '█'.repeat(advance)),
+      `${name} M has no horizontal middle crossbar`,
+    );
+    assert.notEqual(n[2], m[2], `${name} N does not share M's central valley`);
+  }
+});
+
+test('B has an asymmetrical lower bowl in both atlases', () => {
+  const atlases = [
+    ['full', FULL_WORDMARK_GLYPHS, FULL_WORDMARK_ADVANCE],
+    ['compact', COMPACT_WORDMARK_GLYPHS, COMPACT_WORDMARK_ADVANCE],
+  ] as const;
+
+  for (const [name, glyphs, advance] of atlases) {
+    const b = glyphs.B!;
+
+    assert.notDeepEqual(b, glyphs.O, `${name} B and O are distinct glyphs`);
+    assert.equal(b.length, WORDMARK_GLYPH_HEIGHT, `${name} B has five rows`);
+    assert.ok(b.every(row => row.length === advance), `${name} B keeps its fixed advance`);
+    assert.notEqual(b[0], b[4], `${name} B upper and lower bowls are asymmetric`);
+    assert.ok(
+      b.every(row => row[0] === '█'),
+      `${name} B keeps a continuous left spine`,
+    );
+  }
+});
+
+test('wordmark dimensions and spacing follow fixed metrics', () => {
+  const letters = 14;
+  const internalGaps = 12;
+  const fullWidth =
+    letters * FULL_WORDMARK_ADVANCE +
+    internalGaps * WORDMARK_TRACKING +
+    (WORDMARK_TRACKING + FULL_WORDMARK_GAP);
+  const compactWidth =
+    letters * COMPACT_WORDMARK_ADVANCE +
+    internalGaps * WORDMARK_TRACKING +
+    (WORDMARK_TRACKING + COMPACT_WORDMARK_GAP);
+
+  assert.equal(WORDMARK_TRACKING, 1);
+  assert.equal(FULL_WORDMARK_GAP, 5);
+  assert.equal(COMPACT_WORDMARK_GAP, 3);
+  assert.equal(WORDMARK_WIDTH, fullWidth);
+  assert.equal(COMPACT_WORDMARK_WIDTH, compactWidth);
+  assert.equal(WORDMARK_WIDTH, 74);
+  assert.equal(COMPACT_WORDMARK_WIDTH, 58);
+
+  const full = wordmarkArtLines();
+  const compact = compactWordmarkLines();
+  assert.ok(full.every(row => row.length === fullWidth));
+  assert.ok(compact.every(row => row.length === compactWidth));
+  assert.match(full[4]!, /████ {6}████/, 'full words have five extra gap columns');
+  assert.match(compact[4]!, /███ {4}███ /, 'compact words have three extra gap columns');
+});
+
+test('the wordmark paints a bright-white to gray gradient', () => {
   const colored = renderWordmark({ color: true });
-  const tones = ['38;5;51', '38;5;45', '38;5;39', '38;5;141', '38;5;141'];
+  const tones = ['1;97', '97', '37', '90', '2;90'];
 
   colored.forEach((row, index) => {
     assert.ok(
@@ -142,7 +278,7 @@ test('the wordmark paints a cyan to blue to purple gradient', () => {
       `row ${index + 1} uses the ${tones[index]} gradient tone`,
     );
   });
-  assert.ok(new Set(tones).size >= 3, 'the gradient spans several hues');
+  assert.equal(new Set(tones).size, 5, 'the gradient uses five distinct tones');
   assert.equal(new Set(colored.map(visibleWidth)).size, 1, 'coloring keeps the art aligned');
   assert.deepEqual(renderWordmark({ color: false }), wordmarkArtLines());
 });
@@ -152,13 +288,14 @@ test('medium terminals use the compact block wordmark', () => {
 
   assert.equal(compact.length, 5, 'the compact wordmark is five rows tall');
   assert.equal(new Set(compact.map(row => row.length)).size, 1, 'compact rows share one width');
-  assert.equal(COMPACT_WORDMARK_WIDTH, compact[0].length);
+  assert.equal(COMPACT_WORDMARK_WIDTH, compact[0]?.length);
+  assert.equal(COMPACT_WORDMARK_WIDTH, 58);
   assert.ok(COMPACT_WORDMARK_WIDTH < WORDMARK_WIDTH, 'the compact tier is narrower');
   assert.ok(COMPACT_WORDMARK_WIDTH <= 58, 'the compact art fits a 60-column terminal body');
   assert.ok(compact.every(row => /[█▀▄▌▐]/.test(row)), 'the compact art is block-drawn');
   assert.doesNotMatch(compact.join('\n'), /[A-Za-z]/, 'no ordinary lettering inside the compact art');
 
-  const tones = ['38;5;51', '38;5;45', '38;5;39', '38;5;141', '38;5;141'];
+  const tones = ['1;97', '97', '37', '90', '2;90'];
   renderCompactWordmark({ color: true }).forEach((row, index) => {
     assert.ok(row.includes(`\u001b[${tones[index]}m`), `compact row ${index + 1} keeps the gradient`);
   });
@@ -177,7 +314,7 @@ test('medium terminals use the compact block wordmark', () => {
       lines.every(line => visibleWidth(line) === columns),
       `${columns} columns keeps every line in bounds`,
     );
-    assert.match(plain, /▐█▌/, `${columns} columns shows the compact art`);
+    assert.match(plain, /[█▌▐]/, `${columns} columns shows the compact art`);
     assert.match(plain, new RegExp(WORDMARK_TAGLINE), `${columns} columns keeps the tagline`);
   }
 });
@@ -207,6 +344,32 @@ test('the artwork tier follows the available width', () => {
   );
 });
 
+test('the wordmark centers at odd and even widths', () => {
+  const widths: Array<[number, number]> = [
+    [WORDMARK_WIDTH, WORDMARK_WIDTH],
+    [WORDMARK_WIDTH + 1, WORDMARK_WIDTH],
+    [78, WORDMARK_WIDTH],
+    [79, WORDMARK_WIDTH],
+    [80, WORDMARK_WIDTH],
+    [81, WORDMARK_WIDTH],
+    [COMPACT_WORDMARK_WIDTH, COMPACT_WORDMARK_WIDTH],
+    [COMPACT_WORDMARK_WIDTH + 1, COMPACT_WORDMARK_WIDTH],
+    [60, COMPACT_WORDMARK_WIDTH],
+    [61, COMPACT_WORDMARK_WIDTH],
+  ];
+
+  for (const [container, artWidth] of widths) {
+    const lines = renderWordmarkForWidth(container, { color: false });
+    assert.ok(lines !== undefined, `${container}-column container uses block art`);
+    assert.ok(lines.every(line => visibleWidth(line) === container));
+    const first = lines[0]!;
+    const left = first.length - first.trimStart().length;
+    const right = container - left - artWidth;
+    assert.equal(left, Math.floor((container - artWidth) / 2), `${container} left padding`);
+    assert.ok(Math.abs(left - right) <= 1, `${container} is visually centered`);
+  }
+});
+
 test('narrow terminals fall back to the plain wordmark without overflowing', () => {
   for (const columns of [40, 56]) {
     const lines = renderDashboardLines(connectedView, { columns, rows: 24 });
@@ -214,9 +377,14 @@ test('narrow terminals fall back to the plain wordmark without overflowing', () 
 
     assert.equal(lines.length, 24);
     assert.ok(lines.every(line => visibleWidth(line) === columns), `${columns} columns`);
-    assert.match(plain, /IMPractical BOT/);
-    assert.doesNotMatch(plain, /▐█▌/, 'the artwork is dropped when it cannot fit');
+    assert.match(plain, /IMPRACTICAL BOT/);
+    assert.doesNotMatch(plain, /[█▌▐]/, 'the artwork is dropped when it cannot fit');
   }
+});
+
+test('the plain fallback matches the block wordmark capitalization', () => {
+  assert.equal(renderPlainWordmark({ color: false }), 'IMPRACTICAL BOT');
+  assert.equal(stripAnsi(renderPlainWordmark({ color: true })), 'IMPRACTICAL BOT');
 });
 
 test('the dashboard fills every supported dimension without horizontal overflow', () => {
@@ -255,13 +423,13 @@ test('the dashboard fills every supported dimension without horizontal overflow'
   assert.match(stripAnsi(empty), new RegExp(DASHBOARD_EMPTY_LOGS_MESSAGE));
 });
 
-test('status states are compact pills with distinct colors', () => {
+test('status states are compact pills with monochrome emphasis', () => {
   const cases: Array<[Partial<DashboardView>, string, string]> = [
-    [{ state: 'running' }, 'Running', '114'],
-    [{ state: 'paused' }, 'Paused', '221'],
-    [{ connection: 'connecting', state: 'starting' }, 'Starting', '221'],
-    [{ state: 'stopping' }, 'Stopping', '203'],
-    [{ connection: 'disconnected', state: 'disconnected' }, 'Disconnected', '203'],
+    [{ state: 'running' }, 'Running', '37'],
+    [{ state: 'paused' }, 'Paused', '1;37'],
+    [{ connection: 'connecting', state: 'starting' }, 'Starting', '1;37'],
+    [{ state: 'stopping' }, 'Stopping', '1;97'],
+    [{ connection: 'disconnected', state: 'disconnected' }, 'Disconnected', '1;97'],
   ];
 
   for (const [overrides, label, code] of cases) {
@@ -272,8 +440,8 @@ test('status states are compact pills with distinct colors', () => {
     ).join('\n');
     assert.match(
       rendered,
-      new RegExp(`\u001b\\[38;5;${code}m ● ${label} ──`),
-      `${label} uses the expected tone`,
+      new RegExp(`\u001b\\[${code}m ● ${label} ──`),
+      `${label} uses the expected monochrome emphasis`,
     );
     assert.match(stripAnsi(rendered), new RegExp(`● ${label}`));
   }
@@ -315,14 +483,14 @@ test('engine state stays visible when the label cannot fit the status heading', 
   }
 });
 
-test('timestamps are dimmed, categories use the CLI label color, and metadata muted', () => {
+test('timestamps, categories, and metadata use a monochrome hierarchy', () => {
   const poll = formatDashboardLogLine(
     logEntry('[poll] Poll: 1 new messages checked; 1 mention detected.'),
     80,
     { color: true },
   );
   assert.match(poll, /^\u001b\[2m\[03:04:05\] \u001b\[0m/, 'timestamps are dim');
-  assert.match(poll, /\u001b\[36m\[poll\]\u001b\[0m/, 'poll output uses the CLI label color');
+  assert.match(poll, /\u001b\[37m\[poll\]\u001b\[0m/, 'poll output uses a light-gray label');
   assert.equal(
     stripAnsi(poll),
     formatDashboardLogLine(logEntry('[poll] Poll: 1 new messages checked; 1 mention detected.'), 80),
@@ -334,7 +502,7 @@ test('timestamps are dimmed, categories use the CLI label color, and metadata mu
     80,
     { color: true },
   );
-  assert.match(timing, /\u001b\[36m\[timing\]\u001b\[0m/, 'timing labels use the CLI label color');
+  assert.match(timing, /\u001b\[37m\[timing\]\u001b\[0m/, 'timing labels use a light-gray label');
   assert.match(timing, /\u001b\[2mhold=\u001b\[0m/, 'secondary metadata keys are muted');
 
   const rng = formatDashboardLogLine(
@@ -342,25 +510,25 @@ test('timestamps are dimmed, categories use the CLI label color, and metadata mu
     80,
     { color: true },
   );
-  assert.match(rng, /\u001b\[36m\[rng\]\u001b\[0m/, 'rng activity uses the CLI label color');
+  assert.match(rng, /\u001b\[37m\[rng\]\u001b\[0m/, 'rng activity uses a light-gray label');
 });
 
-test('log severity colors warnings, errors, and successful statuses', () => {
+test('log severity uses monochrome emphasis for warnings and errors', () => {
   const warning = formatDashboardLogLine(
     logEntry('[engine] connector stalled', 'warn'),
     80,
     { color: true },
   );
-  assert.match(warning, /\u001b\[33m\[WARN\] \u001b\[0m/);
-  assert.match(warning, /\u001b\[33mconnector stalled\u001b\[0m/);
+  assert.match(warning, /\u001b\[1;37m\[WARN\] \u001b\[0m/);
+  assert.match(warning, /\u001b\[1;37mconnector stalled\u001b\[0m/);
 
   const error = formatDashboardLogLine(
     logEntry('[compose] stage=click-failed error=timeout', 'error'),
     80,
     { color: true },
   );
-  assert.match(error, /\u001b\[31m\[ERROR\] \u001b\[0m/);
-  assert.match(error, /\u001b\[31mclick-failed\u001b\[0m/);
+  assert.match(error, /\u001b\[1;97m\[ERROR\] \u001b\[0m/);
+  assert.match(error, /\u001b\[1;97mclick-failed\u001b\[0m/);
 
   const debug = formatDashboardLogLine(
     logEntry('[identity] merged duplicate rendered record', 'debug'),
@@ -374,9 +542,9 @@ test('log severity colors warnings, errors, and successful statuses', () => {
     80,
     { color: true },
   );
-  assert.match(success, /\u001b\[32msent\u001b\[0m/, 'successful values are green');
-  assert.match(success, /\u001b\[33munconfirmed\u001b\[0m/, 'unconfirmed delivery is amber');
-  assert.match(success, /\u001b\[36m\[packet packet-001\]\u001b\[0m/);
+  assert.match(success, /\u001b\[37msent\u001b\[0m/, 'successful values use light-gray emphasis');
+  assert.match(success, /\u001b\[1;37munconfirmed\u001b\[0m/, 'unconfirmed delivery is bold gray');
+  assert.match(success, /\u001b\[37m\[packet packet-001\]\u001b\[0m/);
 });
 
 test('long log messages are truncated inside the panel and stay well formed', () => {
@@ -418,8 +586,10 @@ test('command chips and prompts render in the styled layout', () => {
   ).join('\n');
   assert.match(stripAnsi(normal), /\[P\] pause/);
   assert.match(stripAnsi(normal), /\[M\] changemsgUrl/);
-  assert.match(stripAnsi(normal), /\[C\] Close dashboard/);
-  assert.match(normal, /\u001b\[38;5;39m\[P\]\u001b\[0m/, 'command keys use the brand tone');
+  assert.match(stripAnsi(normal), /\[D\] Enter debug/);
+  assert.match(normal, /\u001b\[90mBrowser: \u001b\[0m/, 'dashboard labels use medium gray');
+  assert.match(normal, /\u001b\[1;37mENGINE STATUS\u001b\[0m/, 'section headings use bold light gray');
+  assert.match(normal, /\u001b\[37m\[P\]\u001b\[0m/, 'command keys use the light-gray brand tone');
 
   const promptView: DashboardView = {
     ...connectedView,
@@ -432,7 +602,7 @@ test('command chips and prompts render in the styled layout', () => {
   );
   const plainPrompt = prompt.map(stripAnsi).join('\n');
   assert.match(plainPrompt, /Destination URL: https:\/\/example\.com\/messages\/t\/1/);
-  assert.doesNotMatch(plainPrompt, /\[C\] Close dashboard/);
+  assert.doesNotMatch(plainPrompt, /\[D\] Enter debug/);
 
   const cursor = getDashboardPromptCursor(promptView, { columns: 80, rows: 24 });
   assert.ok(cursor);
@@ -472,9 +642,9 @@ test('rapid styled log updates keep the panel intact and restore the terminal', 
     assert.match(plain, /\[poll\] update 59/);
     assert.doesNotMatch(plain, /update 0\b/, 'older log lines have scrolled out of the panel');
     assert.match(frame, /\u001b\[2m\[03:04:05\] \u001b\[0m/);
-    assert.match(frame, /\u001b\[36m\[poll\]\u001b\[0m/);
+    assert.match(frame, /\u001b\[37m\[poll\]\u001b\[0m/);
   } finally {
-    input.emit('data', Buffer.from('c'));
+    input.emit('data', Buffer.from('d'));
     await session.closed;
   }
 

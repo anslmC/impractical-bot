@@ -63,7 +63,6 @@ export const DASHBOARD_UNKNOWN_VALUE = 'Unknown';
 export const DASHBOARD_EMPTY_LOGS_MESSAGE = 'Waiting for engine output...';
 
 const FIELD_GAP = 3;
-const BORDER_TONE: DashboardTone = 'brandSoft';
 
 export function createInitialDashboardView(): DashboardView {
   return {
@@ -190,7 +189,7 @@ function renderFields(
       currentWidth += FIELD_GAP;
     }
     current.push(
-      { text: `${field.label}: `, tone: 'muted' },
+      { text: `${field.label}: `, tone: 'cyanMuted' },
       { text: field.value, tone: 'value' },
     );
     currentWidth += fieldWidth;
@@ -274,8 +273,8 @@ function commandChips(
   ]);
   if (view.prompt === undefined) {
     chips.push([
-      { text: '[C]', tone: 'brandSoft' },
-      { text: ' Close dashboard', tone: 'value' },
+      { text: '[D]', tone: 'brandSoft' },
+      { text: ' Enter debug', tone: 'value' },
     ]);
   }
   const rows: StyledSegment[][] = [];
@@ -380,7 +379,7 @@ function footerLines(
     return promptFooterLines(view.prompt, width);
   }
   const segments: StyledSegment[] = [
-    { text: 'Status: ', tone: 'muted' },
+    { text: 'Status: ', tone: 'cyanMuted' },
     { text: connectionLabel(view), tone: connectionTone(view) },
   ];
   if (view.notice !== undefined) {
@@ -507,14 +506,14 @@ function bodyLines(
       engineHeading,
       ...configRows,
       ...spacer,
-      logsHeading,
-    ];
-    const bottom = [
-      ...spacer,
       commandsHeading,
       ...chips,
-      ...footer,
+      ...spacer,
+      logsHeading,
     ];
+    const bottom = view.prompt === undefined
+      ? ['', ...footer]
+      : [...footer];
     const capacity = available - top.length - bottom.length;
     if (capacity >= level.minimumLogs) {
       return [
@@ -604,21 +603,13 @@ export function getDashboardPromptCursor(
     return undefined;
   }
 
-  const plain = columns < 12 || rows < 6;
-  const contentWidth = plain ? columns : columns - 2;
-  const footer = footerLines(view, contentWidth, false);
+  const footer = footerLines(view, columns, false);
   const promptLineIndex = 0;
-  const rendered = renderPromptInput(input.prefix, input.value, contentWidth);
+  const rendered = renderPromptInput(input.prefix, input.value, columns);
 
-  if (plain) {
-    return {
-      row: Math.max(1, rows - footer.length + promptLineIndex + 1),
-      column: Math.min(columns, Math.max(1, 1 + rendered.cursorOffset)),
-    };
-  }
   return {
-    row: Math.max(1, rows - footer.length + promptLineIndex),
-    column: Math.min(columns, Math.max(2, 2 + rendered.cursorOffset)),
+    row: Math.max(1, rows - footer.length + promptLineIndex + 1),
+    column: Math.min(columns, Math.max(1, 1 + rendered.cursorOffset)),
   };
 }
 
@@ -638,14 +629,7 @@ export function renderDashboardLines(
     return plainLines(view, columns, rows, color);
   }
 
-  const innerWidth = columns - 2;
-  const body = bodyLines(view, innerWidth, rows - 2, color);
-  return [
-    paint(`┌${'─'.repeat(innerWidth)}┐`, BORDER_TONE, color),
-    ...body.map(line =>
-      `${paint('│', BORDER_TONE, color)}${padVisible(line, innerWidth)}${paint('│', BORDER_TONE, color)}`),
-    paint(`└${'─'.repeat(innerWidth)}┘`, BORDER_TONE, color),
-  ];
+  return bodyLines(view, columns, rows, color).map(line => padVisible(line, columns));
 }
 
 export function renderDashboard(

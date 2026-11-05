@@ -10,15 +10,15 @@ import { stripAnsi, visibleWidth } from '../src/tui/theme.js';
 
 const timestamp = new Date(2024, 0, 2, 3, 4, 5);
 
-// The traditional CLI palette: standard ANSI cyan labels, green success,
-// yellow warnings, red errors, dim secondary text, and bold emphasis.
+// Monochrome log roles: light-gray labels, bold warning/error emphasis,
+// dim secondary text, and bold emphasis.
 const TONE = {
-  cyan: '36',
+  label: '37',
   dim: '2',
   bold: '1',
-  green: '32',
-  amber: '33',
-  red: '31',
+  success: '37',
+  warning: '1;37',
+  danger: '1;97',
 } as const;
 
 const view: DashboardView = {
@@ -69,7 +69,7 @@ function isUncolored(line: string, text: string): boolean {
   return !new RegExp(`\\u001b\\[(?!0m)[0-9;]+m${escapeRegExp(text)}`).test(line);
 }
 
-test('every production log category uses the CLI label color', () => {
+test('every production log category uses a light-gray label tone', () => {
   const cases: Array<[string, string]> = [
     ['  [poll] Poll: 0 new messages checked; 0 mention detected.', '[poll]'],
     ['      [rng] Roll: YES (50% chance)', '[rng]'],
@@ -87,13 +87,13 @@ test('every production log category uses the CLI label color', () => {
   ];
 
   for (const [message, chip] of cases) {
-    assert.equal(tokenTone(styled(message), chip), TONE.cyan, message);
+    assert.equal(tokenTone(styled(message), chip), TONE.label, message);
   }
 });
 
 test('ordinary informational messages keep the normal foreground color', () => {
   const resumed = styled('[engine] Combustion resumed.');
-  assert.equal(tokenTone(resumed, '[engine]'), TONE.cyan);
+  assert.equal(tokenTone(resumed, '[engine]'), TONE.label);
   assert.ok(isUncolored(resumed, 'Combustion resumed.'), 'message stays uncolored');
 
   const info = styled('[engine] Combustion resumed.', 'info');
@@ -115,31 +115,31 @@ test('timestamps stay dim, aligned, and separate from the message', () => {
 
 test('warnings and errors are prominent without flooding the line', () => {
   const warning = styled('[engine] connector stalled', 'warn');
-  assert.equal(tokenTone(warning, '[WARN] '), TONE.amber);
-  assert.match(warning, new RegExp(`\\u001b\\[${TONE.amber}mconnector stalled\\u001b\\[0m`));
+  assert.equal(tokenTone(warning, '[WARN] '), TONE.warning);
+  assert.match(warning, new RegExp(`\\u001b\\[${TONE.warning}mconnector stalled\\u001b\\[0m`));
 
   const error = styled('[engine] destination rejected', 'error');
-  assert.equal(tokenTone(error, '[ERROR] '), TONE.red);
-  assert.match(error, new RegExp(`\\u001b\\[${TONE.red}mrejected\\u001b\\[0m`));
+  assert.equal(tokenTone(error, '[ERROR] '), TONE.danger);
+  assert.match(error, new RegExp(`\\u001b\\[${TONE.danger}mrejected\\u001b\\[0m`));
   assert.match(stripAnsi(error), /destination rejected/);
 });
 
-test('successful operations are green accents', () => {
+test('successful operations use light-gray emphasis', () => {
   assert.match(
     styled('      [rng] Roll: YES (50% chance)'),
-    new RegExp(`\\u001b\\[${TONE.green}mRoll: YES\\u001b\\[0m`),
+    new RegExp(`\\u001b\\[${TONE.success}mRoll: YES\\u001b\\[0m`),
   );
   assert.match(
     styled('      [rng] Cooldown ended'),
-    new RegExp(`\\u001b\\[${TONE.green}mCooldown ended\\u001b\\[0m`),
+    new RegExp(`\\u001b\\[${TONE.success}mCooldown ended\\u001b\\[0m`),
   );
   assert.match(
     styled('      [rng] Processing completed: rng-packet-012 (success)'),
-    new RegExp(`\\u001b\\[${TONE.green}mProcessing completed\\u001b\\[0m`),
+    new RegExp(`\\u001b\\[${TONE.success}mProcessing completed\\u001b\\[0m`),
   );
   assert.match(
     styled('[packet packet-001] stage=complete status=sent'),
-    new RegExp(`\\u001b\\[${TONE.green}msent\\u001b\\[0m`),
+    new RegExp(`\\u001b\\[${TONE.success}msent\\u001b\\[0m`),
   );
   assert.match(styled('      [rng] Roll: NO (50% chance)'), /\u001b\[2mRoll: NO\u001b\[0m/);
 });
@@ -153,13 +153,13 @@ test('debug output and secondary detail stay subdued', () => {
   assert.match(debug, /\u001b\[2mmerged duplicate rendered record:\u001b\[0m/);
 
   const rng = styled('      [rng] Cooldown started: 15s (reply sent)');
-  assert.match(rng, /\u001b\[1mCooldown started:\u001b\[0m/, 'labels use emphasis, not color');
+  assert.match(rng, /\u001b\[1;97mCooldown started:\u001b\[0m/, 'labels use bright-white emphasis');
   assert.match(rng, /\u001b\[2m\(reply sent\)\u001b\[0m/);
 
   const poll = styled('  [poll] Poll: 2 new messages checked; 1 mention detected.');
-  assert.match(poll, /\u001b\[1mPoll:\u001b\[0m/);
-  assert.match(poll, new RegExp(`\\u001b\\[${TONE.green}m2\\u001b\\[0m`));
-  assert.match(poll, new RegExp(`\\u001b\\[${TONE.green}m1\\u001b\\[0m`));
+  assert.match(poll, /\u001b\[1;97mPoll:\u001b\[0m/);
+  assert.match(poll, new RegExp(`\\u001b\\[${TONE.success}m2\\u001b\\[0m`));
+  assert.match(poll, new RegExp(`\\u001b\\[${TONE.success}m1\\u001b\\[0m`));
 
   const zero = styled('  [poll] Poll: 0 new messages checked; 0 mention detected.');
   assert.match(zero, /\u001b\[2m0\u001b\[0m/);
@@ -168,13 +168,13 @@ test('debug output and secondary detail stay subdued', () => {
   assert.match(timing, /\u001b\[2mhold=\u001b\[0m/);
 
   const baseline = styled('Baseline recorded: 1 unique message IDs.');
-  assert.match(baseline, /\u001b\[1mBaseline recorded:\u001b\[0m/);
+  assert.match(baseline, /\u001b\[1;97mBaseline recorded:\u001b\[0m/);
 });
 
-test('unknown categories keep the CLI label color and plain text', () => {
+test('unknown categories keep the light-gray label tone and plain text', () => {
   const line = styled('[whatever] something happened');
 
-  assert.equal(tokenTone(line, '[whatever]'), TONE.cyan);
+  assert.equal(tokenTone(line, '[whatever]'), TONE.label);
   assert.match(stripAnsi(line), /\[whatever\] something happened/);
   assert.ok(isUncolored(line, 'something happened'), 'unknown text keeps normal foreground');
   assert.equal(stripAnsi(line), plain('[whatever] something happened'));
@@ -223,7 +223,7 @@ test('colored log lines stay inside the panel at every width', () => {
   }
 });
 
-test('rapid log updates keep category colors and FIFO ordering', () => {
+test('rapid log updates keep category tones and FIFO ordering', () => {
   const logs = Array.from({ length: 40 }, (_, index) =>
     entry(`      [rng] Cooldown started: ${index}s`));
 
@@ -237,8 +237,8 @@ test('rapid log updates keep category colors and FIFO ordering', () => {
   const visibleLogs = lines.filter(line => line.includes('[rng]'));
   assert.ok(visibleLogs.length >= 1);
   assert.ok(
-    visibleLogs.every(line => line.includes(`\u001b[${TONE.cyan}m[rng]\u001b[0m`)),
-    'every rendered rng line keeps the CLI label color',
+    visibleLogs.every(line => line.includes(`\u001b[${TONE.label}m[rng]\u001b[0m`)),
+    'every rendered rng line keeps the light-gray label tone',
   );
   const text = stripAnsi(lines.join('\n'));
   assert.match(text, /Cooldown started: 39s/);

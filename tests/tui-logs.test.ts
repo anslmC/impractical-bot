@@ -191,7 +191,8 @@ test('captured logs strip ANSI, control characters, and secrets', () => {
 });
 
 test('dashboard renders the latest bounded logs and an empty waiting message', () => {
-  const logs = [logEntry('one'), logEntry('two'), logEntry('three'), logEntry('four'), logEntry('five')];
+  const logs = ['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine']
+    .map(message => logEntry(message));
   const lines = renderDashboardLines(
     { ...connectedView, logs },
     { columns: 80, rows: 24 },
@@ -201,11 +202,15 @@ test('dashboard renders the latest bounded logs and an empty waiting message', (
   assert.equal(lines.length, 24);
   assert.ok(lines.every(line => line.length === 80));
   assert.match(rendered, /LIVE LOGS/);
-  assert.match(rendered, /\[03:04:05\] two/);
-  assert.match(rendered, /\[03:04:05\] three/);
-  assert.match(rendered, /\[03:04:05\] four/);
   assert.match(rendered, /\[03:04:05\] five/);
+  assert.match(rendered, /\[03:04:05\] six/);
+  assert.match(rendered, /\[03:04:05\] seven/);
+  assert.match(rendered, /\[03:04:05\] eight/);
+  assert.match(rendered, /\[03:04:05\] nine/);
   assert.doesNotMatch(rendered, /\[03:04:05\] one/);
+  assert.doesNotMatch(rendered, /\[03:04:05\] two/);
+  assert.doesNotMatch(rendered, /\[03:04:05\] three/);
+  assert.doesNotMatch(rendered, /\[03:04:05\] four/);
   assert.match(rendered, /Status: Connected/);
 
   const empty = renderDashboardLines(
