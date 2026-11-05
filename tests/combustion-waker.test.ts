@@ -326,6 +326,19 @@ function createWakerPage() {
       message.setAttribute('aria-label', `At October 18, 2026, 1:15 PM, ${sender}: ${text}`);
       return message;
     },
+    replaceMessageId(
+      previousMessageId: string,
+      messageId: string,
+      text: string,
+      sender = 'Alex',
+    ) {
+      const message = document.querySelectorAll(MESSAGE_SELECTOR)
+        .find(candidate => candidate.getAttribute('data-message-id') === previousMessageId);
+      assert.ok(message, `expected message ${previousMessageId} to be rendered`);
+      const replacement = createMessage(messageId, text, sender);
+      message.replaceWith(replacement);
+      return replacement;
+    },
     setMessagePresentation(
       messageId: string,
       ariaLabel: string | null,
@@ -926,6 +939,104 @@ test('Stop during wake-up completes cleanly', async context => {
     assert.equal(wakerPage.observer, undefined);
   } finally {
     Math.random = originalRandom;
+    context.mock.timers.reset();
+  }
+});
+
+test('a diagnostic logging failure cannot block a changed-id edit update or later polls', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
+  const originalRandom = Math.random;
+  const originalLog = console.log;
+  const logs: string[] = [];
+  Math.random = () => 0.99;
+  console.log = (...values: unknown[]) => {
+    const line = values.map(String).join(' ');
+    logs.push(line);
+    if (line.includes('MESSAGE_EDIT_RECONCILED')) {
+      throw new Error('diagnostic sink unavailable');
+    }
+  };
+  const wakerPage = createWakerPage();
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page: wakerPage.page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    context.mock.timers.tick(3_000);
+    await flush();
+    wakerPage.replaceMessageId('baseline-1', 'replacement-1', 'hello but edited');
+    context.mock.timers.tick(3_000);
+    await flush();
+
+    assert.deepEqual(contextStore.getState().messageIds, ['baseline-1']);
+    assert.equal(contextStore.getRecent(10)[0].message, 'hello but edited');
+    assert.ok(logs.some(line => line.includes('MESSAGE_EDIT_RECONCILED')));
+
+    wakerPage.appendMessage('after-failure', 'polling still works');
+    context.mock.timers.tick(3_000);
+    await flush();
+
+    assert.deepEqual(
+      contextStore.getState().messageIds,
+      ['baseline-1', 'after-failure'],
+    );
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    console.log = originalLog;
+    context.mock.timers.reset();
+  }
+});
+
+test('empty rendered message ids are skipped and cannot stop later polling', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
+  const originalRandom = Math.random;
+  const originalLog = console.log;
+  const logs: string[] = [];
+  Math.random = () => 0.99;
+  console.log = (...values: unknown[]) => {
+    logs.push(values.map(String).join(' '));
+  };
+  const wakerPage = createWakerPage();
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page: wakerPage.page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    context.mock.timers.tick(3_000);
+    await flush();
+    wakerPage.appendMessage('', 'missing id');
+    context.mock.timers.tick(3_000);
+    await flush();
+
+    assert.deepEqual(contextStore.getState().messageIds, ['baseline-1']);
+    assert.ok(logs.some(line => line.includes('MESSAGE IDENTITY SUMMARY')));
+    assert.ok(logs.some(line => line.includes('invalid=1')));
+
+    wakerPage.appendMessage('valid-after-invalid', 'still polling');
+    context.mock.timers.tick(3_000);
+    await flush();
+
+    assert.deepEqual(
+      contextStore.getState().messageIds,
+      ['baseline-1', 'valid-after-invalid'],
+    );
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    console.log = originalLog;
     context.mock.timers.reset();
   }
 });

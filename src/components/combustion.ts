@@ -45,6 +45,7 @@ import {
   normalizeConversationSender,
 } from './conversation-context.js';
 import {
+  classifyMessageLabel,
   extractMessageDetails,
   type MessageDetails,
 } from './message-extraction.js';
@@ -58,7 +59,11 @@ import {
 import {
   createMessageIdentityTracker,
   fingerprintMessageText,
+  formatMessageIdentitySummary,
+  formatReconciledEditDiagnostic,
   type DuplicateMessageRecord,
+  type MessageIdentityDiagnostics,
+  type ReconciledMessageEdit,
 } from './message-identity.js';
 import { PacketStaleError, createPacketProcessor } from './packet-processor.js';
 import { createMentionMatcher } from './mention-matcher.js';
@@ -1766,6 +1771,24 @@ export async function startCombustion({
       );
     }
   };
+  const reportMessageIdentityDiagnostics = (
+    edits: readonly ReconciledMessageEdit[],
+    diagnostics: MessageIdentityDiagnostics,
+  ): void => {
+    try {
+      for (const edit of edits) {
+        console.log(
+          `${styled('[identity]', 'cyan')} ${formatReconciledEditDiagnostic(edit)}`,
+        );
+      }
+      const summary = formatMessageIdentitySummary(diagnostics);
+      if (summary !== null) {
+        console.log(`${styled('[identity]', 'cyan')} ${summary}`);
+      }
+    } catch {
+    }
+  };
+
   const readLatestMessages = async (): Promise<{
     messages: MessageDetails[];
     editedMessages: MessageDetails[];
@@ -1784,8 +1807,18 @@ export async function startCombustion({
       }),
     MESSAGE_LIMIT,
     );
-    const reconciled = messageIdentity.reconcile(elements.map(extractMessageDetails));
+    const observations = elements.map(element => ({
+      timestamp: classifyMessageLabel(
+        element.ariaLabel,
+        element.textWithoutSenderHeading,
+      ).timestamp,
+    }));
+    const reconciled = messageIdentity.reconcile(
+      elements.map(extractMessageDetails),
+      { observations },
+    );
     reportMergedDuplicates(reconciled.duplicates);
+    reportMessageIdentityDiagnostics(reconciled.reconciledEdits, reconciled.diagnostics);
     const editedMessages: MessageDetails[] = [];
     const metadataChangedMessages: MessageDetails[] = [];
     for (const message of reconciled.messages) {

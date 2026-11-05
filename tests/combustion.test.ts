@@ -5845,3 +5845,168 @@ test('a violating reply is suppressed before composition and never becomes pendi
     }).composeMessengerReply = originalCompose;
   }
 });
+
+test('a changed-id edit of a mention reuses the turn without another response or mention', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
+  const originalRandom = Math.random;
+  const originalLog = console.log;
+  const logs: string[] = [];
+  Math.random = () => 0.99;
+  console.log = (...values: unknown[]) => {
+    logs.push(values.map(String).join(' '));
+  };
+  let generatedRequests = 0;
+  let composeCalls = 0;
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (): Promise<string> => {
+    generatedRequests += 1;
+    return 'mocked reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => {
+    composeCalls += 1;
+    return { status: 'sent' };
+  };
+
+  const advancePoll = async (): Promise<void> => {
+    context.mock.timers.tick(3_000);
+    await flushEngine();
+  };
+
+  const { page, inject, replace } = createInjectedMessengerPage();
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page,
+    contextStore,
+    configuration,
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    const messages = [
+      { messageId: 'mention-neighbor-before', sender: 'Anselmo', message: 'before' },
+      { messageId: 'mention-edit-A', sender: 'Anselmo', message: '@Bot test' },
+      { messageId: 'mention-neighbor-after', sender: 'Anselmo', message: 'after' },
+    ];
+    inject(messages);
+    await advancePoll();
+    await advancePoll();
+    await advancePoll();
+    assert.equal(generatedRequests, 1, 'the original mention is answered once');
+    assert.equal(composeCalls, 1);
+
+    replace([
+      messages[0],
+      { messageId: 'mention-edit-B', sender: 'Anselmo', message: '@Bot test but edited' },
+      messages[2],
+    ]);
+    await advancePoll();
+    await advancePoll();
+    await advancePoll();
+
+    assert.equal(generatedRequests, 1, 'the edited mention does not open a second packet');
+    assert.equal(composeCalls, 1, 'the edited mention does not compose a second reply');
+    assert.deepEqual(
+      contextStore.getState().messageIds,
+      ['mention-neighbor-before', 'mention-edit-A', 'mention-neighbor-after'],
+    );
+    const edited = contextStore.getRecent(10)
+      .find(message => message.messageId === 'mention-edit-A');
+    assert.equal(edited?.message, '@Bot test but edited');
+    assert.ok(contextStore.getState().messageIds.includes('mention-edit-B') === false);
+    assert.ok(logs.some(line => line.includes('MESSAGE_EDIT_RECONCILED')));
+    assert.ok(logs.some(line => line.includes('MESSAGE IDENTITY SUMMARY')));
+    assert.ok(logs.some(line => line.includes('reconciled=1')));
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    console.log = originalLog;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
+
+test('a changed-id edit during cooldown cannot create another RNG opportunity', async context => {
+  context.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+  const originalRandom = Math.random;
+  const originalLog = console.log;
+  const logs: string[] = [];
+  Math.random = () => 0;
+  console.log = (...values: unknown[]) => {
+    logs.push(values.map(String).join(' '));
+  };
+  let generatedRequests = 0;
+  let composeCalls = 0;
+  const originalGenerateNvidiaReply = nvidiaModule.generateNvidiaReply;
+  const originalCompose = composerModule.composeMessengerReply;
+  (nvidiaModule as unknown as {
+    generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+  }).generateNvidiaReply = async (): Promise<string> => {
+    generatedRequests += 1;
+    return 'mocked reply';
+  };
+  (composerModule as unknown as {
+    composeMessengerReply: typeof composerModule.composeMessengerReply;
+  }).composeMessengerReply = async () => {
+    composeCalls += 1;
+    return { status: 'sent' };
+  };
+
+  const pollsTo = async (elapsedMs: number): Promise<void> => {
+    context.mock.timers.tick(elapsedMs);
+    await flushEngine();
+  };
+
+  const { page, inject, replace } = createInjectedMessengerPage();
+  const contextStore = createContextStore();
+  const controller = await startCombustion({
+    page,
+    contextStore,
+    configuration: { ...configuration, botTemperament: 'talkative' },
+    aliases: ['@Bot'],
+    apiKey: 'offline-test-key',
+    debugMode: true,
+  });
+
+  try {
+    inject([{ messageId: 'rng-edit-A', sender: 'Alex', message: 'just chatting' }]);
+    await pollsTo(1_500);
+    await pollsTo(15_000);
+    assert.equal(generatedRequests, 1, 'the original RNG turn is answered once');
+    assert.equal(composeCalls, 1);
+
+    replace([{ messageId: 'rng-edit-B', sender: 'Alex', message: 'just chatting edited' }]);
+    for (let poll = 0; poll < 12; poll += 1) {
+      await pollsTo(1_500);
+    }
+
+    assert.equal(generatedRequests, 1, 'the edit does not make the answered turn eligible again');
+    assert.equal(composeCalls, 1);
+    assert.deepEqual(contextStore.getState().messageIds, ['rng-edit-A']);
+    assert.equal(contextStore.getRecent(1)[0].message, 'just chatting edited');
+    assert.ok(logs.some(line => line.includes('MESSAGE_EDIT_RECONCILED')));
+    assert.ok(logs.some(line => line.includes('Skipping dice roll:')));
+  } finally {
+    await controller.stop();
+    Math.random = originalRandom;
+    console.log = originalLog;
+    context.mock.timers.reset();
+    (nvidiaModule as unknown as {
+      generateNvidiaReply: typeof nvidiaModule.generateNvidiaReply;
+    }).generateNvidiaReply = originalGenerateNvidiaReply;
+    (composerModule as unknown as {
+      composeMessengerReply: typeof composerModule.composeMessengerReply;
+    }).composeMessengerReply = originalCompose;
+  }
+});
