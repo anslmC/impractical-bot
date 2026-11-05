@@ -37,6 +37,13 @@ import {
   reportTuiStatusPollingFailure,
   type TuiErrorCategory,
 } from './errors.js';
+import {
+  DashboardTerminalError,
+  TerminalSession,
+  checkDashboardTerminal,
+  type TerminalHandoff,
+} from './terminal.js';
+import type { TerminalKey } from './input.js';
 
 export type {
   DashboardCommandApi,
@@ -61,45 +68,33 @@ export {
   type DashboardLogLevel,
 } from './logs.js';
 
-const ALTERNATE_SCREEN_ENTER = '\u001b[?1049h';
-const ALTERNATE_SCREEN_EXIT = '\u001b[?1049l';
-const CURSOR_HIDE = '\u001b[?25l';
-const CURSOR_SHOW = '\u001b[?25h';
-const CLEAR_SCREEN = '\u001b[2J\u001b[H';
+export {
+  DashboardTerminalError,
+  checkDashboardTerminal,
+  restoreTerminalState,
+  type DashboardTerminalCheck,
+  type TerminalHandoff,
+} from './terminal.js';
+
+export {
+  DEBUG_EMPTY_LOGS_MESSAGE,
+  DEBUG_QUIT_CONTROL,
+  DEBUG_SCROLL_CONTROLS,
+  DEBUG_SPINNER_FRAMES,
+  DEBUG_SPINNER_INTERVAL_MS,
+  DEBUG_VIEWPORT_SUBTITLE,
+  formatDebugSpinnerMessage,
+  renderDebugLines,
+  startDebugView,
+  type DebugRenderOptions,
+  type DebugScrollState,
+  type DebugViewportOptions,
+  type DebugViewportSession,
+} from './debug.js';
+
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
-const ESCAPE_SEQUENCE_TIMEOUT_MS = 30;
 const SUCCESS_NOTICE_TIMEOUT_MS = 4_000;
 const ERROR_NOTICE_TIMEOUT_MS = 6_000;
-
-export class DashboardTerminalError extends Error {
-  readonly detail: string;
-
-  constructor(detail: string) {
-    super('Dashboard requires an interactive terminal.');
-    this.name = 'DashboardTerminalError';
-    this.detail = detail;
-  }
-}
-
-export type DashboardTerminalCheck =
-  | { ok: true }
-  | { ok: false; reason: string };
-
-export function checkDashboardTerminal(
-  input: NodeJS.ReadStream = process.stdin,
-  output: NodeJS.WriteStream = process.stdout,
-): DashboardTerminalCheck {
-  if (!input.isTTY) {
-    return { ok: false, reason: 'stdin is not an interactive terminal.' };
-  }
-  if (!output.isTTY) {
-    return { ok: false, reason: 'stdout is not an interactive terminal.' };
-  }
-  if (typeof input.setRawMode !== 'function') {
-    return { ok: false, reason: 'stdin does not support raw-mode input.' };
-  }
-  return { ok: true };
-}
 
 export interface DashboardOptions {
   configurationFilePath?: string;
@@ -112,16 +107,23 @@ export interface DashboardOptions {
   captureConsoleOutput?: boolean;
   maximumCapturedConsoleLines?: number;
   maximumLogEntries?: number;
+  logBuffer?: DashboardLogBuffer;
+  initialEntries?: readonly DashboardLogEntry[];
   now?: () => Date;
   onInterrupt?: () => void;
+  onDebug?: () => void;
+  handoff?: TerminalHandoff;
   commands?: DashboardCommandApi;
   color?: boolean;
+  escapeTimeoutMs?: number;
 }
 
 export interface DashboardSession {
   closed: Promise<void>;
   close(): Promise<void>;
+  closeForHandoff?(): Promise<TerminalHandoff | undefined>;
   refresh(): Promise<void>;
+  getEntries?(): DashboardLogEntry[];
 }
 
 function getDimensions(output: NodeJS.WriteStream): DashboardDimensions {
@@ -129,13 +131,6 @@ function getDimensions(output: NodeJS.WriteStream): DashboardDimensions {
     columns: output.columns ?? 80,
     rows: output.rows ?? 24,
   };
-}
-
-function sameLines(left: string[] | undefined, right: string[]): boolean {
-  if (left === undefined || left.length !== right.length) {
-    return false;
-  }
-  return left.every((line, index) => line === right[index]);
 }
 
 function emptyView(
@@ -175,7 +170,12 @@ export async function startDashboard(
   const logCapacity = options.maximumLogEntries ??
     options.maximumCapturedConsoleLines ??
     DEFAULT_MAXIMUM_LOG_ENTRIES;
-  const logBuffer = new DashboardLogBuffer(logCapacity);
+  const logBuffer = options.logBuffer ?? new DashboardLogBuffer(logCapacity);
+  if (options.initialEntries !== undefined) {
+    for (const entry of options.initialEntries) {
+      logBuffer.add(entry);
+    }
+  }
   const commands = options.commands;
   const colorEnabled = options.color ?? (
     output === process.stdout &&
@@ -183,23 +183,18 @@ export async function startDashboard(
     process.env.NO_COLOR === undefined &&
     process.env.TERM !== 'dumb'
   );
-  const wasRaw = input.isRaw === true;
-  const wasFlowing = input.readableFlowing === true;
   let statusView = createInitialDashboardView();
   let prompt: DashboardPrompt | undefined;
   let notice: DashboardNotice | undefined;
   let pending = false;
-  let previousLines: string[] | undefined;
-  let previousDimensions: DashboardDimensions | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
   let pendingLogRender: NodeJS.Immediate | undefined;
   let noticeTimer: ReturnType<typeof setTimeout> | undefined;
-  let escapeTimer: ReturnType<typeof setTimeout> | undefined;
-  let escapeBuffer = '';
-  let cursorShown = false;
   let capturedConsole: ConsoleCapture | undefined;
+  let unsubscribeLogs: (() => void) | undefined;
   let inFlight = false;
   let lastStatusFailure: string | undefined;
+  let finalized = false;
   let closed = false;
   let resolveClosed!: () => void;
   const closedPromise = new Promise<void>(resolve => {
@@ -215,68 +210,17 @@ export async function startDashboard(
     commandsEnabled: commands !== undefined,
   });
 
-  const writeOutput = (text: string): void => {
-    if (closed) {
-      return;
-    }
-    try {
-      output.write(text);
-    } catch {
-      void close();
-    }
-  };
-
-  const updateCursor = (view: DashboardView, dimensions: DashboardDimensions): void => {
-    const cursor = getDashboardPromptCursor(view, dimensions);
-    if (cursor === undefined) {
-      if (cursorShown) {
-        writeOutput(CURSOR_HIDE);
-        cursorShown = false;
-      }
-      return;
-    }
-    if (!cursorShown) {
-      writeOutput(CURSOR_SHOW);
-      cursorShown = true;
-    }
-    writeOutput(`\u001b[${cursor.row};${cursor.column}H`);
-  };
-
   const render = (): void => {
-    if (closed) {
+    if (closed || terminalSession === undefined) {
       return;
     }
     try {
       const dimensions = getDimensions(output);
       const view = buildView();
       const lines = renderDashboardLines(view, dimensions, { color: colorEnabled });
-      const dimensionsChanged = previousDimensions === undefined ||
-        previousDimensions.columns !== dimensions.columns ||
-        previousDimensions.rows !== dimensions.rows;
-      if (!dimensionsChanged && sameLines(previousLines, lines)) {
-        return;
-      }
-
-      if (previousLines === undefined || dimensionsChanged) {
-        writeOutput(
-          CLEAR_SCREEN +
-          lines.map((line, index) => `\u001b[${index + 1};1H\u001b[2K${line}`).join(''),
-        );
-      } else {
-        const changed: string[] = [];
-        const lineCount = Math.max(previousLines.length, lines.length);
-        for (let index = 0; index < lineCount; index += 1) {
-          if (previousLines[index] !== lines[index]) {
-            changed.push(`\u001b[${index + 1};1H\u001b[2K${lines[index] ?? ''}`);
-          }
-        }
-        if (changed.length > 0) {
-          writeOutput(changed.join(''));
-        }
-      }
-      previousLines = lines;
-      previousDimensions = dimensions;
-      updateCursor(view, dimensions);
+      terminalSession.render(lines, {
+        cursor: getDashboardPromptCursor(view, dimensions),
+      });
     } catch {
       void close();
     }
@@ -290,14 +234,6 @@ export async function startDashboard(
       pendingLogRender = undefined;
       render();
     });
-  };
-
-  const appendLog = (entry: DashboardLogEntry): void => {
-    if (closed) {
-      return;
-    }
-    logBuffer.add(entry);
-    scheduleLogRender();
   };
 
   const requestStatusSafely = async (): Promise<void> => {
@@ -741,7 +677,15 @@ export async function startDashboard(
 
   const handleDashboardKey = (character: string): void => {
     if (character === 'd' || character === 'D') {
-      void close();
+      if (options.onDebug !== undefined) {
+        try {
+          options.onDebug();
+        } catch {
+          // The view owner decides whether to close after a failed switch request.
+        }
+      } else {
+        void close();
+      }
       return;
     }
     if (pending) {
@@ -784,133 +728,65 @@ export async function startDashboard(
     }
   };
 
-  const handleEscapeSequence = (sequence: string): void => {
-    if (sequence === '\u001b[3~' && prompt !== undefined) {
-      backspacePrompt();
+  const interrupt = (): void => {
+    try {
+      options.onInterrupt?.();
+    } catch {
+      // Shutdown still falls through to terminal restoration.
+    } finally {
+      void close();
     }
   };
 
-  const scheduleEscapeFlush = (): void => {
-    if (escapeTimer !== undefined) {
-      clearTimeout(escapeTimer);
-    }
-    escapeTimer = setTimeout(() => {
-      escapeTimer = undefined;
-      const buffered = escapeBuffer;
-      escapeBuffer = '';
-      if (buffered === '\u001b') {
-        handleEscapeKey();
-      }
-    }, ESCAPE_SEQUENCE_TIMEOUT_MS);
-  };
-
-  const processInputText = (text: string): void => {
-    let index = 0;
-    while (index < text.length) {
-      const character = text[index];
-      if (character === '\u001b') {
-        if (index + 1 >= text.length) {
-          escapeBuffer = '\u001b';
-          scheduleEscapeFlush();
-          return;
-        }
-        const next = text[index + 1];
-        if (next === '[' || next === 'O') {
-          let cursor = index + 2;
-          let complete = false;
-          while (cursor < text.length) {
-            const code = text.charCodeAt(cursor);
-            cursor += 1;
-            if (code >= 0x40 && code <= 0x7e) {
-              complete = true;
-              break;
-            }
-          }
-          if (!complete) {
-            escapeBuffer = text.slice(index);
-            scheduleEscapeFlush();
-            return;
-          }
-          handleEscapeSequence(text.slice(index, cursor));
-          index = cursor;
-          continue;
-        }
-        index += 2;
-        continue;
-      }
-      handleCharacter(character);
-      index += 1;
-    }
-  };
-
-  const handleCharacter = (character: string): void => {
-    if (character === '\u0003') {
-      try {
-        if (options.onInterrupt) {
-          options.onInterrupt();
-        } else {
-          void close();
-        }
-      } catch {
-        void close();
-      }
+  const handleKey = (key: TerminalKey): void => {
+    if (key === 'ctrlC') {
+      interrupt();
       return;
     }
-    if (prompt !== undefined) {
-      handlePromptCharacter(character);
+    if (key === 'escape') {
+      handleEscapeKey();
       return;
     }
-    handleDashboardKey(character);
+    if (prompt === undefined) {
+      return;
+    }
+    switch (key) {
+      case 'enter':
+        submitPrompt();
+        return;
+      case 'backspace':
+      case 'delete':
+        backspacePrompt();
+        return;
+      case 'up':
+      case 'down':
+      case 'home':
+      case 'end':
+      case 'pageUp':
+      case 'pageDown':
+      case 'tab':
+        return;
+    }
   };
 
-  const onInputError = (): void => {
-    void close();
-  };
-  const onOutputError = (): void => {
-    void close();
-  };
-  const onResize = (): void => {
-    previousLines = undefined;
-    render();
-  };
-  const onData = (chunk: Buffer | string): void => {
+  const handleText = (text: string): void => {
     if (closed) {
       return;
     }
-    let text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-    if (text.length === 0) {
-      return;
-    }
-
-    if (escapeBuffer.length > 0) {
-      const clearEscapeTimer = (): void => {
-        if (escapeTimer !== undefined) {
-          clearTimeout(escapeTimer);
-          escapeTimer = undefined;
-        }
-      };
-      if (
-        escapeBuffer === '\u001b' &&
-        !text.startsWith('[') &&
-        !text.startsWith('O')
-      ) {
-        clearEscapeTimer();
-        escapeBuffer = '';
-        handleEscapeKey();
+    for (const character of text) {
+      if (prompt !== undefined) {
+        handlePromptCharacter(character);
       } else {
-        text = escapeBuffer + text;
-        escapeBuffer = '';
-        clearEscapeTimer();
+        handleDashboardKey(character);
       }
     }
-
-    processInputText(text);
   };
 
-  function close(): Promise<void> {
-    if (closed) {
-      return closedPromise;
+  const finalize = (): void => {
+    if (finalized) {
+      return;
     }
+    finalized = true;
     closed = true;
     if (timer !== undefined) {
       clearInterval(timer);
@@ -924,61 +800,67 @@ export async function startDashboard(
       clearTimeout(noticeTimer);
       noticeTimer = undefined;
     }
-    if (escapeTimer !== undefined) {
-      clearTimeout(escapeTimer);
-      escapeTimer = undefined;
-    }
-    escapeBuffer = '';
-    input.removeListener('data', onData);
-    input.removeListener('error', onInputError);
-    output.removeListener('resize', onResize);
-    output.removeListener('error', onOutputError);
-    try {
-      if (typeof input.setRawMode === 'function') {
-        input.setRawMode(wasRaw);
-      }
-    } catch {
-      // Terminal restoration is best effort during teardown.
-    }
-    try {
-      if (!wasFlowing) {
-        input.pause();
-      }
-    } catch {
-      // Input restoration is best effort during teardown.
-    }
+    unsubscribeLogs?.();
+    unsubscribeLogs = undefined;
     try {
       capturedConsole?.restore();
     } catch {
       // Console restoration is best effort during teardown.
     }
-    try {
-      output.write(`${CURSOR_SHOW}${ALTERNATE_SCREEN_EXIT}`);
-    } catch {
-      // The terminal may already be gone; there is nothing else to restore.
-    }
+    capturedConsole = undefined;
     resolveClosed();
-    return closedPromise;
+  };
+
+  async function closeWithOptions(
+    preserveState: boolean,
+  ): Promise<TerminalHandoff | undefined> {
+    if (closed) {
+      return undefined;
+    }
+    closed = true;
+    const session = terminalSession;
+    const handoff = session === undefined
+      ? undefined
+      : await session.close({ preserveState });
+    finalize();
+    return handoff;
   }
+
+  async function close(): Promise<void> {
+    await closeWithOptions(false);
+  }
+
+  const closeForHandoff = (): Promise<TerminalHandoff | undefined> =>
+    closeWithOptions(true);
+
+  const terminalSession = new TerminalSession({
+    input,
+    output,
+    handoff: options.handoff,
+    escapeTimeoutMs: options.escapeTimeoutMs,
+    onKey: key => {
+      if (!closed) {
+        handleKey(key);
+      }
+    },
+    onText: handleText,
+    onResize: () => {
+      render();
+    },
+  });
+  void terminalSession.closed.then(finalize);
 
   try {
     const captureOptions: ConsoleCaptureOptions = {
-      onEntry: appendLog,
       now: options.now,
+      buffer: logBuffer,
     };
     if (options.captureConsoleOutput) {
       capturedConsole = captureConsoleOutput(logBuffer.capacity, captureOptions);
     }
-    output.write(`${ALTERNATE_SCREEN_ENTER}${CURSOR_HIDE}${CLEAR_SCREEN}`);
-    if (typeof input.setRawMode === 'function') {
-      input.setRawMode(true);
-    }
-    input.on('data', onData);
-    input.on('error', onInputError);
-    output.on('resize', onResize);
-    output.on('error', onOutputError);
-    input.resume();
+    terminalSession.start();
     render();
+    unsubscribeLogs = logBuffer.subscribe(scheduleLogRender);
     timer = setInterval(() => {
       void requestStatusSafely();
     }, pollIntervalMs);
@@ -991,6 +873,8 @@ export async function startDashboard(
   return {
     closed: closedPromise,
     close,
+    closeForHandoff,
     refresh: requestStatusSafely,
+    getEntries: () => logBuffer.getEntries(),
   };
 }

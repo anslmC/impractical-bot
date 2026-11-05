@@ -95,14 +95,28 @@ import {
 } from './runtime-control.js';
 import { CLI_COMMANDS, formatCliCommand } from './cli-commands.js';
 import {
+  captureConsoleOutput,
   checkDashboardTerminal,
+  DashboardLogBuffer,
   DashboardTerminalError,
+  restoreTerminalState,
   startDashboard,
+  startDebugView,
+  type ConsoleCapture,
   type DashboardSession,
   type DashboardTerminalCheck,
+  type DebugViewportSession,
+  type TerminalHandoff,
 } from './tui/index.js';
 
 type Output = (message: string) => void;
+
+const consoleBackedWriters = new WeakSet<Output>();
+const defaultWriteOutput: Output = message => console.log(message);
+const defaultWriteError: Output = message =>
+  console.error(formatTerminalText(message, 'red'));
+consoleBackedWriters.add(defaultWriteOutput);
+consoleBackedWriters.add(defaultWriteError);
 
 export interface CliRuntimeOptions {
   checkBrowserStartup?: (configuration: Configuration) => Promise<void>;
@@ -131,6 +145,7 @@ export interface CliRuntimeOptions {
   browserExecutableExists?: (path: string) => boolean;
   checkDashboardTerminal?: () => DashboardTerminalCheck;
   startDashboard?: typeof startDashboard;
+  startDebugView?: typeof startDebugView;
 }
 
 const commandReference = CLI_COMMANDS
@@ -154,7 +169,7 @@ ${composerSlicerCommandReference}
 Options:
   -h, --help     Show this help
   -v, --version  Show the version
-  --debug        Start without the interactive dashboard`;
+  --debug        Start in the debug log view`;
 
 function promptTerminal(question: string): Promise<string | null> {
   const terminal = createInterface({ input: stdin, output: stdout });
@@ -1200,10 +1215,92 @@ async function handleStart(
   runtime: CliRuntimeOptions,
   debug = false,
 ): Promise<number> {
-  const dashboardTerminal = debug === false
-    ? (runtime.checkDashboardTerminal ?? checkDashboardTerminal)()
+  const terminalCheck = (runtime.checkDashboardTerminal ?? checkDashboardTerminal)();
+  const useDashboard = debug === false && terminalCheck.ok;
+  const useDebugView = debug === true && terminalCheck.ok;
+  const useStartupDebugView = useDashboard && (
+    runtime.startDebugView !== undefined || stdout.isTTY === true
+  );
+  const startupLogBuffer = useDashboard || useDebugView
+    ? new DashboardLogBuffer()
     : undefined;
-  const useDashboard = dashboardTerminal?.ok === true;
+
+  let startupConsoleCapture: ConsoleCapture | undefined;
+  const restoreStartupCapture = (): void => {
+    if (startupConsoleCapture !== undefined) {
+      startupConsoleCapture.restore();
+      startupConsoleCapture = undefined;
+    }
+  };
+  const startStartupCapture = (): void => {
+    if (startupLogBuffer !== undefined && startupConsoleCapture === undefined) {
+      startupConsoleCapture = captureConsoleOutput(startupLogBuffer.capacity, {
+        buffer: startupLogBuffer,
+        tee: true,
+      });
+    }
+  };
+
+  let startupViewActive = false;
+  const originalWriteOutput = writeOutput;
+  const originalWriteError = writeError;
+  const appendStartupLog = (level: 'log' | 'error', message: string): void => {
+    startupLogBuffer?.add({
+      timestamp: new Date(),
+      level,
+      message,
+    });
+  };
+  writeOutput = message => {
+    if (startupViewActive && startupLogBuffer !== undefined) {
+      appendStartupLog('log', message);
+      if (!consoleBackedWriters.has(originalWriteOutput)) {
+        originalWriteOutput(message);
+      }
+      return;
+    }
+    originalWriteOutput(message);
+  };
+  writeError = message => {
+    if (startupViewActive && startupLogBuffer !== undefined) {
+      appendStartupLog('error', message);
+      if (!consoleBackedWriters.has(originalWriteError)) {
+        originalWriteError(message);
+      }
+      return;
+    }
+    originalWriteError(message);
+  };
+
+  const writeStartupBanner = (): void => {
+    const columns = Math.max(20, stdout.columns ?? 80);
+    const centered = (text: string): string => {
+      const left = Math.max(0, Math.floor((columns - text.length) / 2));
+      return `${' '.repeat(left)}${text}`;
+    };
+    writeOutput('');
+    writeOutput(centered('IMPRACTICAL BOT'));
+    writeOutput(centered('STARTING'));
+    writeOutput('');
+  };
+
+  const startStartupActivity = (
+    message: string,
+    emitWithoutView = true,
+  ): void => {
+    if (startupViewActive || emitWithoutView) {
+      writeOutput(message);
+    }
+    if (startupViewActive) {
+      debugSession?.startActivity?.(message);
+    }
+  };
+
+  const stopStartupActivity = (): void => {
+    if (startupViewActive) {
+      debugSession?.stopActivity?.();
+    }
+  };
 
   let configurationResult;
   try {
@@ -1244,30 +1341,6 @@ async function handleStart(
     writeError('NVIDIA API key is missing. Run `impbot init` or `impbot updatekey` first.');
     return 1;
   }
-  writeOutput(formatTerminalMilestone('STARTUP', 'Verifying browser configuration.'));
-  try {
-    await (runtime.checkBrowserStartup ?? assertConfiguredBrowserCanStart)(
-      configurationResult.configuration,
-    );
-  } catch (error) {
-    writeError(`Unable to start browser: ${error instanceof Error ? error.message : String(error)}`);
-    return 1;
-  }
-  writeOutput(formatTerminalMilestone('BROWSER', 'Browser configuration verified.'));
-  if (!DEBUG_MODE || ENABLE_DEBUG_AUTO_RESPONSE) {
-    try {
-      await (runtime.validateNvidiaApiKey ?? validateNvidiaApiKey)(apiKey);
-    } catch (error) {
-      writeError(getSafeNvidiaError(error, 'Unable to validate the NVIDIA API key.'));
-      return 1;
-    }
-    writeOutput(formatTerminalMilestone('STARTUP', 'NVIDIA API key validated successfully.'));
-  } else {
-    writeOutput(formatTerminalMilestone(
-      'STARTUP',
-      'Debug mode enabled; skipping NVIDIA API key validation.',
-    ));
-  }
 
   type ShutdownSource = 'sigint' | 'runtime-control' | 'injected';
   let resolveShutdown!: (source: ShutdownSource) => void;
@@ -1277,10 +1350,92 @@ async function handleStart(
   let combustionController: CombustionController | undefined;
   let runtimeControl: RuntimeControl | undefined;
   let dashboardSession: DashboardSession | undefined;
+  let debugSession: DebugViewportSession | undefined;
+  let viewConsoleCapture: ConsoleCapture | undefined;
+  let activeView: DashboardSession | DebugViewportSession | undefined;
+  let debugSwitchResolver: (() => void) | undefined;
+  let terminalHandoff: TerminalHandoff | undefined;
   const onSigint = (): void => {
     runtimeControl?.setState('stopping');
     resolveShutdown('sigint');
   };
+
+  if ((useDebugView || useStartupDebugView) && startupLogBuffer !== undefined) {
+    restoreStartupCapture();
+    try {
+      debugSession = await (runtime.startDebugView ?? startDebugView)({
+        captureConsoleOutput: true,
+        logBuffer: startupLogBuffer,
+        onInterrupt: onSigint,
+      });
+      activeView = debugSession;
+      startupViewActive = true;
+    } catch (error) {
+      if (useStartupDebugView && !useDebugView) {
+        writeStartupBanner();
+        startStartupCapture();
+      } else {
+        const detail = error instanceof DashboardTerminalError
+          ? error.detail
+          : error instanceof Error ? error.message : String(error);
+        console.error(`[dashboard] Startup failed: ${detail}`);
+        writeError('Debug view unavailable; continuing without it.');
+      }
+    }
+  } else if (useDashboard && startupLogBuffer !== undefined) {
+    writeStartupBanner();
+    startStartupCapture();
+  }
+
+  startStartupActivity(
+    formatTerminalMilestone('STARTUP', 'Verifying browser configuration.'),
+  );
+  try {
+    await (runtime.checkBrowserStartup ?? assertConfiguredBrowserCanStart)(
+      configurationResult.configuration,
+    );
+  } catch (error) {
+    stopStartupActivity();
+    startupViewActive = false;
+    if (debugSession !== undefined) {
+      await debugSession.close();
+      debugSession = undefined;
+      activeView = undefined;
+    }
+    restoreStartupCapture();
+    writeError(`Unable to start browser: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+  stopStartupActivity();
+  writeOutput(formatTerminalMilestone('BROWSER', 'Browser configuration verified.'));
+  if (!DEBUG_MODE || ENABLE_DEBUG_AUTO_RESPONSE) {
+    startStartupActivity(
+      formatTerminalMilestone('STARTUP', 'Validating NVIDIA API key.'),
+      false,
+    );
+    try {
+      await (runtime.validateNvidiaApiKey ?? validateNvidiaApiKey)(apiKey);
+    } catch (error) {
+      stopStartupActivity();
+      startupViewActive = false;
+      if (debugSession !== undefined) {
+        await debugSession.close();
+        debugSession = undefined;
+        activeView = undefined;
+      }
+      restoreStartupCapture();
+      writeError(getSafeNvidiaError(error, 'Unable to validate the NVIDIA API key.'));
+      return 1;
+    }
+    stopStartupActivity();
+    writeOutput(formatTerminalMilestone('STARTUP', 'NVIDIA API key validated successfully.'));
+  } else {
+    writeOutput(formatTerminalMilestone(
+      'STARTUP',
+      'Debug mode enabled; skipping NVIDIA API key validation.',
+    ));
+  }
+
   process.once('SIGINT', onSigint);
   try {
     runtimeControl = await createRuntimeControl(
@@ -1498,6 +1653,17 @@ async function handleStart(
     );
   } catch (error) {
     process.removeListener('SIGINT', onSigint);
+    startupViewActive = false;
+    if (debugSession !== undefined) {
+      try {
+        await debugSession.close();
+      } catch {
+        // View teardown is best effort while reporting a startup failure.
+      }
+      debugSession = undefined;
+      activeView = undefined;
+    }
+    restoreStartupCapture();
     writeError(error instanceof RuntimeAlreadyRunningError
       ? error.message
       : `Unable to claim runtime ownership: ${error instanceof Error ? error.message : String(error)}`);
@@ -1519,8 +1685,183 @@ async function handleStart(
   let exitCode = 0;
   let startupStage: 'launch' | 'prepare' | 'cranking' | 'combustion' = 'launch';
 
+  const restoreViewCapture = (): void => {
+    if (viewConsoleCapture !== undefined) {
+      viewConsoleCapture.restore();
+      viewConsoleCapture = undefined;
+    }
+  };
+
+  const startViewCapture = (): void => {
+    if (startupLogBuffer !== undefined && viewConsoleCapture === undefined) {
+      viewConsoleCapture = captureConsoleOutput(startupLogBuffer.capacity, {
+        buffer: startupLogBuffer,
+      });
+    }
+  };
+
+  const requestDebugView = (): void => {
+    const resolve = debugSwitchResolver;
+    if (resolve !== undefined) {
+      debugSwitchResolver = undefined;
+      resolve();
+    }
+  };
+
+  const restoreHandoff = (): void => {
+    if (terminalHandoff !== undefined) {
+      restoreTerminalState(stdin, stdout, terminalHandoff);
+      terminalHandoff = undefined;
+    }
+  };
+
+  const closeForHandoff = async (
+    view: DashboardSession | DebugViewportSession,
+  ): Promise<TerminalHandoff | undefined> => {
+    if (view.closeForHandoff !== undefined) {
+      return view.closeForHandoff();
+    }
+    await view.close();
+    return undefined;
+  };
+
+  const startDashboardView = async (): Promise<DashboardSession> => {
+    const view = await (runtime.startDashboard ?? startDashboard)({
+      configurationFilePath,
+      requestStatus: runtime.requestRuntimeStatusSnapshot ?? requestRuntimeStatusSnapshot,
+      captureConsoleOutput: false,
+      logBuffer: startupLogBuffer,
+      handoff: terminalHandoff,
+      onInterrupt: onSigint,
+      onDebug: requestDebugView,
+      commands: {
+        pause: () => (runtime.requestRuntimePause ?? requestRuntimePause)(
+          configurationFilePath,
+        ),
+        resume: () => (runtime.requestRuntimeResume ?? requestRuntimeResume)(
+          configurationFilePath,
+        ),
+        stop: () => (runtime.requestRuntimeStop ?? requestRuntimeStop)(
+          configurationFilePath,
+        ),
+        changeDestination: destination =>
+          (runtime.requestRuntimeChangeDestination ?? requestRuntimeChangeDestination)(
+            configurationFilePath,
+            destination,
+          ),
+        setTemperament: temperament =>
+          (runtime.requestRuntimeSetTemperament ?? requestRuntimeSetTemperament)(
+            configurationFilePath,
+            temperament,
+          ),
+        setPersonality: (mode, instruction) =>
+          (runtime.requestRuntimeSetPersonality ?? requestRuntimeSetPersonality)(
+            configurationFilePath,
+            mode,
+            instruction,
+          ),
+      },
+    });
+    terminalHandoff = undefined;
+    dashboardSession = view;
+    activeView = view;
+    return view;
+  };
+
+  const startDebugForView = async (): Promise<DebugViewportSession> => {
+    const view = await (runtime.startDebugView ?? startDebugView)({
+      captureConsoleOutput: false,
+      logBuffer: startupLogBuffer,
+      handoff: terminalHandoff,
+      onInterrupt: onSigint,
+    });
+    terminalHandoff = undefined;
+    debugSession = view;
+    activeView = view;
+    return view;
+  };
+
+  const reportViewFailure = (
+    mode: 'dashboard' | 'debug',
+    error: unknown,
+  ): void => {
+    const detail = error instanceof DashboardTerminalError
+      ? error.detail
+      : error instanceof Error ? error.message : String(error);
+    console.error(`[dashboard] Startup failed: ${detail}`);
+    writeError(mode === 'dashboard'
+      ? 'Dashboard unavailable; continuing without it.'
+      : 'Debug view unavailable; continuing without it.');
+  };
+
+  const runInteractiveViews = async (): Promise<void> => {
+    const debugSwitch = new Promise<void>(resolve => {
+      debugSwitchResolver = resolve;
+    });
+
+    let dashboard: DashboardSession;
+    try {
+      dashboard = await startDashboardView();
+    } catch (error) {
+      debugSwitchResolver = undefined;
+      restoreHandoff();
+      restoreViewCapture();
+      reportViewFailure('dashboard', error);
+      return;
+    }
+
+    const dashboardResult = await Promise.race([
+      dashboard.closed.then(() => 'closed' as const),
+      debugSwitch.then(() => 'debug' as const),
+      shutdownPromise.then(() => 'shutdown' as const),
+    ]);
+    debugSwitchResolver = undefined;
+    activeView = undefined;
+
+    if (dashboardResult === 'closed') {
+      restoreViewCapture();
+      return;
+    }
+    if (dashboardResult === 'shutdown') {
+      await dashboard.close();
+      dashboardSession = undefined;
+      restoreViewCapture();
+      return;
+    }
+
+    terminalHandoff = await closeForHandoff(dashboard) ?? undefined;
+    dashboardSession = undefined;
+
+    let debug: DebugViewportSession;
+    try {
+      debug = await startDebugForView();
+    } catch (error) {
+      restoreHandoff();
+      restoreViewCapture();
+      reportViewFailure('debug', error);
+      return;
+    }
+
+    let debugClosed = false;
+    const debugClosedPromise = debug.closed.then(() => {
+      debugClosed = true;
+    });
+    await Promise.race([
+      debugClosedPromise,
+      shutdownPromise,
+    ]);
+    activeView = undefined;
+    if (!debugClosed) {
+      await debug.close();
+    }
+    debugSession = undefined;
+    restoreViewCapture();
+  };
+
   try {
-    writeOutput(formatTerminalMilestone('BROWSER', 'Launching browser session.'));
+    startStartupActivity(
+      formatTerminalMilestone('BROWSER', 'Launching browser session.'),
+    );
     const launchPromise = (runtime.launchBrowser ?? launchConfiguredBrowser)(configurationResult.configuration);
     const launchResult = await Promise.race([
       launchPromise.then(
@@ -1529,6 +1870,7 @@ async function handleStart(
       ),
       shutdownPromise.then(source => ({ type: 'shutdown' as const, source })),
     ]);
+    stopStartupActivity();
     if (launchResult.type === 'failed') {
       writeError(`Unable to start browser: ${launchResult.error instanceof Error ? launchResult.error.message : String(launchResult.error)}`);
       exitCode = 1;
@@ -1544,6 +1886,10 @@ async function handleStart(
         `${session.reusedExistingBrowser ? 'Attached to existing browser' : 'Browser launched and connected'} ` +
         `(${session.browserVersion}).`,
       ));
+      startStartupActivity(
+        formatTerminalMilestone('BROWSER', 'Verifying conversation readiness.'),
+        false,
+      );
       const preparationResult = await Promise.race([
         session.prepare({ signal: startupAbort.signal }).then(
           page => ({ type: 'ready' as const, page }),
@@ -1551,35 +1897,43 @@ async function handleStart(
         shutdownPromise.then(source => ({ type: 'shutdown' as const, source })),
         session.disconnected.then(() => ({ type: 'disconnected' as const })),
       ]);
+      stopStartupActivity();
       if (preparationResult.type === 'shutdown') {
         writeOutput(formatTerminalText('Shutdown requested; disconnecting Playwright.', 'bold'));
         exitCode = preparationResult.source === 'runtime-control' ? 0 : 130;
       } else if (preparationResult.type === 'disconnected') {
         throw new Error('The browser disconnected during startup preparation.');
       } else {
-        writeOutput(formatTerminalMilestone('CRANKING', 'Preparing Messenger context.'));
-        await updatePuppetName(
-          preparationResult.page,
-          configurationResult.configuration,
-          configurationFilePath,
-          writeOutput,
+        startStartupActivity(
+          formatTerminalMilestone('CRANKING', 'Preparing Messenger context.'),
         );
-        const puppetName = configurationResult.configuration.puppetName;
-        if (!puppetName) {
-          throw new Error('A configured puppet name is required to initialize the alias engine.');
-        }
+        let puppetName: string;
         let groupRoster: GroupRoster;
         try {
-          groupRoster = sanitizeGroupRoster(
-            await (runtime.extractGroupRoster ?? extractGroupRoster)(
-              preparationResult.page,
-              puppetName,
-            ),
+          await updatePuppetName(
+            preparationResult.page,
+            configurationResult.configuration,
+            configurationFilePath,
+            writeOutput,
           );
-        } catch {
-          groupRoster = createUnavailableGroupRoster('group roster extraction failed');
+          puppetName = configurationResult.configuration.puppetName ?? '';
+          if (!puppetName) {
+            throw new Error('A configured puppet name is required to initialize the alias engine.');
+          }
+          try {
+            groupRoster = sanitizeGroupRoster(
+              await (runtime.extractGroupRoster ?? extractGroupRoster)(
+                preparationResult.page,
+                puppetName,
+              ),
+            );
+          } catch {
+            groupRoster = createUnavailableGroupRoster('group roster extraction failed');
+          }
+          console.log(formatGroupRosterOutcome(groupRoster));
+        } finally {
+          stopStartupActivity();
         }
-        console.log(formatGroupRosterOutcome(groupRoster));
         aliasData = generateAliases(puppetName);
         writeOutput(formatTerminalMilestone(
           'ALIASES',
@@ -1681,63 +2035,39 @@ async function handleStart(
         }
 
         startupStage = 'combustion';
-        combustionController = await (runtime.startCombustion ?? startCombustion)({
-          page: preparationResult.page,
-          contextStore,
-          configuration: configurationResult.configuration,
-          aliases: aliasData.valids,
-          apiKey,
-          debugMode: DEBUG_MODE,
-          roster: groupRoster,
-        });
+        startStartupActivity(
+          formatTerminalMilestone('CRANKING', 'Initializing Combustion.'),
+          false,
+        );
+        try {
+          combustionController = await (runtime.startCombustion ?? startCombustion)({
+            page: preparationResult.page,
+            contextStore,
+            configuration: configurationResult.configuration,
+            aliases: aliasData.valids,
+            apiKey,
+            debugMode: DEBUG_MODE,
+            roster: groupRoster,
+          });
+        } finally {
+          stopStartupActivity();
+        }
         runtimeControl.setState('running');
         writeOutput(formatTerminalMilestone(
           'READY',
           `Engine ready at ${configurationResult.configuration.messageDestination}.`,
         ));
-        if (useDashboard) {
-          try {
-            dashboardSession = await (runtime.startDashboard ?? startDashboard)({
-              configurationFilePath,
-              requestStatus: runtime.requestRuntimeStatusSnapshot ?? requestRuntimeStatusSnapshot,
-              captureConsoleOutput: true,
-              onInterrupt: onSigint,
-              commands: {
-                pause: () => (runtime.requestRuntimePause ?? requestRuntimePause)(
-                  configurationFilePath,
-                ),
-                resume: () => (runtime.requestRuntimeResume ?? requestRuntimeResume)(
-                  configurationFilePath,
-                ),
-                stop: () => (runtime.requestRuntimeStop ?? requestRuntimeStop)(
-                  configurationFilePath,
-                ),
-                changeDestination: destination =>
-                  (runtime.requestRuntimeChangeDestination ?? requestRuntimeChangeDestination)(
-                    configurationFilePath,
-                    destination,
-                  ),
-                setTemperament: temperament =>
-                  (runtime.requestRuntimeSetTemperament ?? requestRuntimeSetTemperament)(
-                    configurationFilePath,
-                    temperament,
-                  ),
-                setPersonality: (mode, instruction) =>
-                  (runtime.requestRuntimeSetPersonality ?? requestRuntimeSetPersonality)(
-                    configurationFilePath,
-                    mode,
-                    instruction,
-                  ),
-              },
-            });
-          } catch (error) {
-            const detail = error instanceof DashboardTerminalError
-              ? error.detail
-              : error instanceof Error ? error.message : String(error);
-            console.error(`[dashboard] Startup failed: ${detail}`);
-            writeError('Dashboard unavailable; continuing without it.');
-          }
+        if (useStartupDebugView && debugSession !== undefined) {
+          terminalHandoff = await closeForHandoff(debugSession) ?? undefined;
+          debugSession = undefined;
+          activeView = undefined;
+          startupViewActive = false;
         }
+        restoreStartupCapture();
+        if (useDashboard) {
+          startViewCapture();
+        }
+        const interactiveViews = useDashboard ? runInteractiveViews() : undefined;
         const engineSession = session;
         const engineCombustion = combustionController;
         const waitForEngine = () => Promise.race([
@@ -1745,14 +2075,17 @@ async function handleStart(
           engineSession.disconnected.then(() => 'disconnected' as const),
           engineCombustion.stopped.then(() => 'combustion-stopped' as const),
         ]);
-        const dashboardClosed = dashboardSession?.closed.then(
-          () => ({ type: 'dashboard-closed' as const }),
-        );
-        let runtimeResult = dashboardClosed === undefined
-          ? await waitForEngine()
-          : await Promise.race([waitForEngine(), dashboardClosed]);
-        if (typeof runtimeResult === 'object' && runtimeResult.type === 'dashboard-closed') {
+        let runtimeResult;
+        if (interactiveViews === undefined) {
           runtimeResult = await waitForEngine();
+        } else {
+          const outcome = await Promise.race([
+            waitForEngine().then(result => ({ type: 'engine' as const, result })),
+            interactiveViews.then(() => ({ type: 'views' as const })),
+          ]);
+          runtimeResult = outcome.type === 'engine'
+            ? outcome.result
+            : await waitForEngine();
         }
         if (typeof runtimeResult === 'object' && runtimeResult.type === 'shutdown') {
           writeOutput(formatTerminalText('Shutdown requested; disconnecting Playwright.', 'bold'));
@@ -1765,6 +2098,22 @@ async function handleStart(
       }
     }
   } catch (error) {
+    stopStartupActivity();
+    startupViewActive = false;
+    restoreStartupCapture();
+    restoreHandoff();
+    const viewToClose = activeView ?? dashboardSession ?? debugSession;
+    if (viewToClose !== undefined) {
+      try {
+        await viewToClose.close();
+      } catch {
+        // View teardown is best effort while reporting a startup failure.
+      }
+      activeView = undefined;
+      dashboardSession = undefined;
+      debugSession = undefined;
+    }
+    restoreViewCapture();
     const action = startupStage === 'launch'
       ? 'start browser'
       : startupStage === 'prepare'
@@ -1776,10 +2125,14 @@ async function handleStart(
     exitCode = 1;
   } finally {
     process.removeListener('SIGINT', onSigint);
-    if (dashboardSession) {
+    stopStartupActivity();
+    restoreStartupCapture();
+    const viewToClose = activeView ?? dashboardSession ?? debugSession;
+    if (viewToClose !== undefined) {
       try {
-        await dashboardSession.close();
+        await viewToClose.close();
       } catch (error) {
+        restoreViewCapture();
         console.error(
           `[dashboard] Shutdown failed: ` +
           `${error instanceof Error ? error.message : String(error)}`,
@@ -1787,7 +2140,12 @@ async function handleStart(
         writeError('Dashboard shutdown failed.');
         exitCode = 1;
       }
+      activeView = undefined;
+      dashboardSession = undefined;
+      debugSession = undefined;
     }
+    restoreViewCapture();
+    restoreHandoff();
     runtimeControl.setState('stopping');
     if (combustionController) {
       try {
@@ -1957,8 +2315,8 @@ function getVersion(): string {
 
 export async function runCli(
   args: string[],
-  writeOutput: Output = message => console.log(message),
-  writeError: Output = message => console.error(formatTerminalText(message, 'red')),
+  writeOutput: Output = defaultWriteOutput,
+  writeError: Output = defaultWriteError,
   configurationFilePath?: string,
   prompt: TerminalPrompt = promptTerminal,
   initialize: (options: InitializationOptions) => Promise<InitializationStatus> = initializeConfiguration,

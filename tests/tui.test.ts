@@ -237,7 +237,7 @@ test('dashboard restores the terminal for D and closes idempotently', async () =
   }
 });
 
-test('dashboard Ctrl+C delegates interruption and pauses resumed input when closed', async () => {
+test('dashboard Ctrl+C delegates interruption and restores the terminal', async () => {
   const input = new FakeInput();
   const output = new FakeOutput();
   const originalLog = console.log;
@@ -254,25 +254,19 @@ test('dashboard Ctrl+C delegates interruption and pauses resumed input when clos
     },
   });
 
-  try {
-    assert.equal(input.readableFlowing, true);
-    assert.notEqual(console.log, originalLog);
+  assert.equal(input.readableFlowing, true);
+  assert.notEqual(console.log, originalLog);
 
-    input.emit('data', Buffer.from('\u0003'));
-    await new Promise(resolve => setTimeout(resolve, 5));
+  input.emit('data', Buffer.from('\u0003'));
+  await session.closed;
 
-    assert.equal(interrupts, 1);
-    assert.equal(input.listenerCount('data'), 1);
-    assert.deepEqual(input.rawModes, [true]);
-  } finally {
-    await session.close();
-  }
-
+  assert.equal(interrupts, 1);
   assert.equal(input.readableFlowing, false);
   assert.equal(input.pauses, 1);
   assert.equal(input.listenerCount('data'), 0);
   assert.deepEqual(input.rawModes, [true, false]);
   assert.equal(console.log, originalLog);
+  assert.match(output.text(), /\u001b\[\?25h\u001b\[\?1049l$/);
 });
 
 test('dashboard preserves an input that was already flowing before it started', async () => {

@@ -1,5 +1,6 @@
 import { format } from 'node:util';
 import {
+  renderLine,
   renderSegments,
   stripAnsi,
   truncateVisible,
@@ -28,6 +29,8 @@ export interface DashboardLogEntry {
 export interface ConsoleCaptureOptions {
   onEntry?: (entry: DashboardLogEntry) => void;
   now?: () => Date;
+  buffer?: DashboardLogBuffer;
+  tee?: boolean;
 }
 
 export interface ConsoleCapture {
@@ -612,6 +615,115 @@ function renderContextStoreBlock(
   return rows;
 }
 
+function formatDashboardEntryRows(
+  entry: DashboardLogEntry,
+  width: number,
+  options: DashboardLogLineOptions,
+): string[] {
+  return sanitizeLogText(entry.message)
+    .split('\n')
+    .map(message => formatDashboardLogLine(
+      { ...entry, message },
+      width,
+      options,
+    ));
+}
+
+function debugContextStoreBlock(
+  entries: readonly DashboardLogEntry[],
+  width: number,
+  color: boolean,
+): string[] {
+  const rows: string[] = [];
+  for (const entry of entries) {
+    const raw = sanitizeLogText(entry.message).replace(/\s+$/u, '');
+    const trimmed = raw.trim();
+    if (isContextStoreBorder(raw)) {
+      rows.push(renderLine([{ text: '─'.repeat(width), tone: 'muted' }], width, color));
+      continue;
+    }
+
+    const timestamp = `[${formatLogTimestamp(entry.timestamp)}] `;
+    const prefix = width >= 16 ? timestamp : '';
+    if (trimmed === CONTEXT_STORE_HEADER) {
+      const suffix = ' ──';
+      const used = prefix.length + CONTEXT_STORE_HEADER.length + suffix.length;
+      const fill = Math.max(2, width - used - 1);
+      rows.push(renderLine(
+        [
+          { text: prefix, tone: 'muted' },
+          { text: CONTEXT_STORE_HEADER, tone: 'strong' },
+          { text: ` ${'─'.repeat(fill)}${suffix}`, tone: 'muted' },
+        ],
+        width,
+        color,
+      ));
+      continue;
+    }
+
+    const continuationPrefix = ' '.repeat(prefix.length);
+    const physicalLines = raw.split('\n');
+    physicalLines.forEach((line, index) => {
+      const characters = Array.from(line);
+      const firstPrefix = index === 0 ? prefix : continuationPrefix;
+      if (characters.length === 0) {
+        rows.push(renderLine(
+          [{ text: firstPrefix, tone: 'muted' }],
+          width,
+          color,
+        ));
+        return;
+      }
+      let offset = 0;
+      let firstChunk = true;
+      while (offset < characters.length) {
+        const chunkPrefix = firstChunk ? firstPrefix : continuationPrefix;
+        const available = Math.max(1, width - chunkPrefix.length);
+        const chunk = characters.slice(offset, offset + available).join('');
+        rows.push(renderLine(
+          [
+            { text: chunkPrefix, tone: 'muted' },
+            { text: chunk },
+          ],
+          width,
+          color,
+        ));
+        offset += available;
+        firstChunk = false;
+      }
+    });
+  }
+  return rows;
+}
+
+export function formatDebugLogEntries(
+  entries: readonly DashboardLogEntry[],
+  maximumWidth: number,
+  options: DashboardLogLineOptions = {},
+): string[] {
+  const width = Math.max(0, Math.floor(maximumWidth));
+  if (width === 0) {
+    return [];
+  }
+  const rows: string[] = [];
+  let index = 0;
+  while (index < entries.length) {
+    const end = contextStoreBlockEnd(entries, index);
+    if (end !== undefined) {
+      rows.push(...debugContextStoreBlock(
+        entries.slice(index, end + 1),
+        width,
+        options.color === true,
+      ));
+      index = end + 1;
+      continue;
+    }
+    rows.push(...formatDashboardEntryRows(entries[index], width, options));
+    index += 1;
+  }
+  return rows;
+}
+
 export function formatDashboardLogEntries(
   entries: readonly DashboardLogEntry[],
   maximumWidth: number,
@@ -630,7 +742,7 @@ export function formatDashboardLogEntries(
       index = end + 1;
       continue;
     }
-    rows.push(formatDashboardLogLine(entries[index], width, options));
+    rows.push(...formatDashboardEntryRows(entries[index], width, options));
     index += 1;
   }
   return rows;
@@ -643,7 +755,7 @@ export function formatDashboardLogLine(
 ): string {
   const color = options.color === true;
   const width = Math.max(0, Math.floor(maximumWidth));
-  const message = sanitizeLogText(entry.message);
+  const message = sanitizeLogText(entry.message).replace(/\n/g, ' ');
   const category = dashboardLogCategory(message);
   const segments: StyledSegment[] = [
     { text: `[${formatLogTimestamp(entry.timestamp)}] `, tone: 'muted' },
@@ -679,6 +791,7 @@ export function formatDashboardLogLine(
 export class DashboardLogBuffer {
   readonly capacity: number;
   private readonly entries: DashboardLogEntry[] = [];
+  private readonly listeners = new Set<() => void>();
 
   constructor(capacity = DEFAULT_MAXIMUM_LOG_ENTRIES) {
     const normalized = Math.floor(capacity);
@@ -692,6 +805,9 @@ export class DashboardLogBuffer {
     if (this.entries.length > this.capacity) {
       this.entries.splice(0, this.entries.length - this.capacity);
     }
+    for (const listener of this.listeners) {
+      listener();
+    }
   }
 
   getEntries(): DashboardLogEntry[] {
@@ -701,6 +817,13 @@ export class DashboardLogBuffer {
   get size(): number {
     return this.entries.length;
   }
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
 }
 
 function messageLines(text: string): string[] {
@@ -709,54 +832,109 @@ function messageLines(text: string): string[] {
     .filter(line => line.length > 0);
 }
 
+const consoleRecord = console as unknown as Record<
+  CapturedConsoleMethod,
+  (...args: unknown[]) => void
+>;
+
+interface ConsoleCaptureTarget {
+  readonly buffer: DashboardLogBuffer;
+  readonly now: () => Date;
+  readonly onEntry?: (entry: DashboardLogEntry) => void;
+  readonly tee: boolean;
+}
+
+interface ActiveConsoleCapture {
+  readonly targets: Set<ConsoleCaptureTarget>;
+  readonly originals: Map<CapturedConsoleMethod, (...args: unknown[]) => void>;
+}
+
+let activeConsoleCapture: ActiveConsoleCapture | undefined;
+let consoleCaptureDepth = 0;
+
+function appendCapturedConsole(
+  active: ActiveConsoleCapture,
+  level: DashboardLogLevel,
+  args: unknown[],
+): void {
+  if (consoleCaptureDepth > 0) {
+    return;
+  }
+  consoleCaptureDepth = 1;
+  try {
+    let text: string;
+    try {
+      text = typeof format === 'function' ? format(...args) : args.map(String).join(' ');
+    } catch {
+      text = args.map(value => String(value)).join(' ');
+    }
+    const lines = messageLines(text);
+    for (const target of active.targets) {
+      try {
+        const timestamp = target.now();
+        for (const line of lines) {
+          const entry: DashboardLogEntry = { timestamp, level, message: line };
+          target.buffer.add(entry);
+          try {
+            target.onEntry?.(entry);
+          } catch {
+            // A dashboard callback must never break engine logging.
+          }
+        }
+      } catch {
+        // One failing capture target must not break the other targets.
+      }
+    }
+
+    if ([...active.targets].some(target => target.tee)) {
+      const original = active.originals.get(level);
+      try {
+        original?.apply(console, args);
+      } catch {
+        // The original console method must never break capture.
+      }
+    }
+  } catch {
+    // Console capture must never break the engine's own output path.
+  } finally {
+    consoleCaptureDepth = 0;
+  }
+}
+
 export function captureConsoleOutput(
   maximumEntries = DEFAULT_MAXIMUM_LOG_ENTRIES,
   options: ConsoleCaptureOptions = {},
 ): ConsoleCapture {
-  const consoleRecord = console as unknown as Record<
-    CapturedConsoleMethod,
-    (...args: unknown[]) => void
-  >;
-  const originals = new Map<CapturedConsoleMethod, (...args: unknown[]) => void>();
-  const buffer = new DashboardLogBuffer(maximumEntries);
-  const now = options.now ?? (() => new Date());
-  let capturing = false;
-
-  const append = (level: DashboardLogLevel, args: unknown[]): void => {
-    if (capturing) {
-      return;
-    }
-    capturing = true;
-    try {
-      let text: string;
-      try {
-        text = typeof format === 'function' ? format(...args) : args.map(String).join(' ');
-      } catch {
-        text = args.map(value => String(value)).join(' ');
-      }
-      const timestamp = now();
-      for (const line of messageLines(text)) {
-        const entry: DashboardLogEntry = { timestamp, level, message: line };
-        buffer.add(entry);
-        try {
-          options.onEntry?.(entry);
-        } catch {
-          // A dashboard callback must never break engine logging.
-        }
-      }
-    } catch {
-      // Console capture must never break the engine's own output path.
-    } finally {
-      capturing = false;
-    }
+  const buffer = options.buffer ?? new DashboardLogBuffer(maximumEntries);
+  const target: ConsoleCaptureTarget = {
+    buffer,
+    now: options.now ?? (() => new Date()),
+    onEntry: options.onEntry,
+    tee: options.tee === true,
   };
 
-  for (const method of CAPTURED_CONSOLE_METHODS) {
-    const original = consoleRecord[method];
-    originals.set(method, original);
-    consoleRecord[method] = (...args: unknown[]) => append(method, args);
+  let active = activeConsoleCapture;
+  if (active === undefined) {
+    const originals = new Map<CapturedConsoleMethod, (...args: unknown[]) => void>();
+    active = { targets: new Set([target]), originals };
+    activeConsoleCapture = active;
+    for (const method of CAPTURED_CONSOLE_METHODS) {
+      const original = consoleRecord[method];
+      originals.set(method, original);
+      consoleRecord[method] = (...args: unknown[]) => {
+        const current = activeConsoleCapture;
+        if (current !== undefined) {
+          appendCapturedConsole(current, method, args);
+        }
+      };
+    }
+  } else {
+    // Multiple views and the startup capture share one wrapper. This keeps
+    // console ownership singular instead of nesting and leaking wrappers.
+    active.targets.add(target);
   }
 
+  const ownedCapture = active;
   let restored = false;
   return {
     restore() {
@@ -764,7 +942,14 @@ export function captureConsoleOutput(
         return;
       }
       restored = true;
-      for (const [method, original] of originals) {
+      ownedCapture.targets.delete(target);
+      if (ownedCapture.targets.size > 0) {
+        return;
+      }
+      if (activeConsoleCapture === ownedCapture) {
+        activeConsoleCapture = undefined;
+      }
+      for (const [method, original] of ownedCapture.originals) {
         consoleRecord[method] = original;
       }
     },

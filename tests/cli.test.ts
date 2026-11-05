@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -23,6 +24,12 @@ import type { BackreadResult } from '../src/components/backread.js';
 import type { CombustionController } from '../src/components/combustion.js';
 import { createContextStore } from '../src/components/context-store.js';
 import {
+  startDashboard,
+  startDebugView,
+  type DashboardLogBuffer,
+  type DashboardLogEntry,
+} from '../src/tui/index.js';
+import {
   getRuntimeControlEndpoint,
   requestRuntimeChangeDestination,
   requestRuntimePause,
@@ -32,6 +39,7 @@ import {
   requestRuntimeStatusSnapshot,
   RuntimeControlEndpointError,
   RuntimeControlTimeoutError,
+  type RuntimeStatusSnapshotResult,
 } from '../src/runtime-control.js';
 
 async function captureCli(
@@ -149,6 +157,53 @@ function createTemporaryConfigPath(context: TestContext): string {
   const directory = mkdtempSync(join(tmpdir(), 'impractical-bot-cli-'));
   context.after(() => rmSync(directory, { recursive: true, force: true }));
   return join(directory, 'config.json');
+}
+
+class TransitionInput extends EventEmitter {
+  isTTY = true;
+  isRaw = false;
+  rawModes: boolean[] = [];
+  readableFlowing: boolean | null = null;
+  pauses = 0;
+  setRawMode(value: boolean): this {
+    this.isRaw = value;
+    this.rawModes.push(value);
+    return this;
+  }
+  isPaused(): boolean {
+    return this.readableFlowing === false;
+  }
+  pause(): this {
+    this.readableFlowing = false;
+    this.pauses += 1;
+    return this;
+  }
+  resume(): this {
+    this.readableFlowing = true;
+    return this;
+  }
+}
+
+class TransitionOutput extends EventEmitter {
+  isTTY = true;
+  columns = 80;
+  rows = 24;
+  writes: string[] = [];
+  write(chunk: string | Uint8Array): boolean {
+    this.writes.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+    return true;
+  }
+  text(): string {
+    return this.writes.join('');
+  }
+}
+
+function transitionInput(input: TransitionInput): NodeJS.ReadStream {
+  return input as unknown as NodeJS.ReadStream;
+}
+
+function transitionOutput(output: TransitionOutput): NodeJS.WriteStream {
+  return output as unknown as NodeJS.WriteStream;
 }
 
 async function captureComposerSlicer(
@@ -4296,7 +4351,7 @@ test('start automatically opens the dashboard after readiness and keeps the engi
         assert.match(beforeDashboard, /READY/);
         assert.ok(options);
         assert.equal(options.configurationFilePath, configurationFilePath);
-        assert.equal(options.captureConsoleOutput, true);
+        assert.equal(options.captureConsoleOutput, false);
         assert.equal(typeof options.requestStatus, 'function');
         assert.ok(options.commands);
         for (const operation of [
@@ -4508,6 +4563,844 @@ test('D closes the dashboard without stopping the engine and a later Ctrl+C shut
   assert.match(afterShutdown.output[0], /No impractical-bot engine is running/);
 });
 
+test('D enters debug once and keeps keyboard input on the shared terminal lease', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const dashboardReady = deferred<void>();
+  const debugReady = deferred<void>();
+  const input = new TransitionInput();
+  const output = new TransitionOutput();
+  const runningStatus: RuntimeStatusSnapshotResult = {
+    status: 'running',
+    instanceId: 'transition-instance',
+    state: 'running',
+    browser: 'brave',
+    temperament: 'balanced',
+    personality: 'default',
+    messengerDestination: 'https://www.facebook.com/messages/t/1618007223454558',
+  };
+  let sharedBuffer: DashboardLogBuffer | undefined;
+  let dashboardSession: Awaited<ReturnType<typeof startDashboard>> | undefined;
+  let debugSession: Awaited<ReturnType<typeof startDebugView>> | undefined;
+  let dashboardStarts = 0;
+  let debugStarts = 0;
+  let interactiveDebugStarts = 0;
+  let launchCount = 0;
+  let combustionStarts = 0;
+
+  const start = captureCli(
+    ['start'],
+    configurationFilePath,
+    undefined,
+    undefined,
+    {
+      checkDashboardTerminal: () => ({ ok: true }),
+      validateNvidiaApiKey: async () => undefined,
+      launchBrowser: async () => {
+        launchCount += 1;
+        return {
+          endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+          browserVersion: 'Brave Chromium test',
+          disconnected: new Promise<void>(() => undefined),
+          async prepare() {
+            return stubPage;
+          },
+          async disconnect() {
+            return undefined;
+          },
+        };
+      },
+      readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+      startCombustion: async () => {
+        combustionStarts += 1;
+        return createTestCombustionController();
+      },
+      waitForShutdown: () => new Promise<void>(() => undefined),
+      startDashboard: async options => {
+        assert.ok(options);
+        assert.equal(options.captureConsoleOutput, false);
+        assert.ok(options.logBuffer);
+        if (sharedBuffer === undefined) {
+          sharedBuffer = options.logBuffer;
+        } else {
+          assert.equal(options.logBuffer, sharedBuffer);
+        }
+        dashboardStarts += 1;
+        const view = await startDashboard({
+          ...options,
+          input: transitionInput(input),
+          output: transitionOutput(output),
+          pollIntervalMs: 60_000,
+          requestStatus: async () => runningStatus,
+        });
+        dashboardSession = view;
+        dashboardReady.resolve();
+        return view;
+      },
+      startDebugView: async options => {
+        assert.ok(options);
+        assert.ok(options.logBuffer);
+        if (sharedBuffer === undefined) {
+          sharedBuffer = options.logBuffer;
+        } else {
+          assert.equal(options.logBuffer, sharedBuffer);
+        }
+        const view = await startDebugView({
+          ...options,
+          input: transitionInput(input),
+          output: transitionOutput(output),
+        });
+        debugStarts += 1;
+        if (options.captureConsoleOutput === true) {
+          assert.equal(options.handoff, undefined);
+        } else {
+          interactiveDebugStarts += 1;
+          assert.ok(options.handoff);
+          debugSession = view;
+          debugReady.resolve();
+        }
+        return view;
+      },
+    },
+    message => {
+      if (message.includes('Engine ready')) ready.resolve();
+    },
+  );
+
+  await ready.promise;
+  await dashboardReady.promise;
+  assert.equal(dashboardStarts, 1);
+  assert.equal(debugStarts, 1, 'the startup debug view is closed before the dashboard opens');
+  assert.equal(interactiveDebugStarts, 0);
+  assert.ok(dashboardSession);
+  assert.ok(sharedBuffer);
+
+  for (let index = 0; index < 40; index += 1) {
+    sharedBuffer.add({
+      timestamp: new Date(0),
+      level: 'log',
+      message: `entry-${index + 1}`,
+    });
+  }
+  const entriesBeforeDebug = sharedBuffer.getEntries().length;
+
+  input.emit('data', Buffer.from('d'));
+  await Promise.race([
+    debugReady.promise,
+    new Promise<never>((_, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error('Debug view did not start after D.')),
+        1_000,
+      );
+      timer.unref?.();
+    }),
+  ]);
+
+  assert.equal(interactiveDebugStarts, 1);
+  assert.equal(debugStarts, 2);
+  assert.equal(dashboardStarts, 1, 'debug is a one-way transition');
+  assert.ok(debugSession);
+  assert.equal(debugSession.getEntries().length, entriesBeforeDebug);
+  assert.equal(input.listenerCount('data'), 1);
+  assert.equal(input.readableFlowing, true);
+  assert.equal(input.isRaw, true);
+  assert.deepEqual(input.rawModes, [true]);
+  assert.equal(input.pauses, 0);
+
+  input.emit('data', Buffer.from('\u001b[5~'));
+  assert.ok(debugSession.getScrollState().offset > 0);
+  input.emit('data', Buffer.from('\u001b[6~'));
+  assert.equal(debugSession.getScrollState().offset, 0);
+  input.emit('data', Buffer.from('\u001b[5~'));
+  input.emit('data', Buffer.from('l'));
+  assert.equal(debugSession.getScrollState().pinned, true);
+
+  sharedBuffer.add({
+    timestamp: new Date(0),
+    level: 'log',
+    message: 'arrived-after-latest',
+  });
+  assert.ok(debugSession.getEntries().some(
+    entry => entry.message === 'arrived-after-latest',
+  ));
+
+  let debugClosed = false;
+  void debugSession.closed.then(() => {
+    debugClosed = true;
+  });
+  input.emit('data', Buffer.from('d'));
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(debugClosed, false);
+  assert.equal(interactiveDebugStarts, 1);
+  assert.equal(dashboardStarts, 1);
+  assert.equal(input.listenerCount('data'), 1);
+  assert.doesNotMatch(output.text(), /\[D\] Dashboard/);
+  assert.match(
+    output.text(),
+    /\[PgUp\/PgDn\] Scroll  \[L\] Latest  \[Ctrl\+C\] Quit/,
+  );
+
+  input.emit('data', Buffer.from('\u0003'));
+  const result = await start;
+
+  assert.equal(result.exitCode, 130);
+  assert.equal(launchCount, 1);
+  assert.equal(combustionStarts, 1);
+  assert.equal(input.isRaw, false);
+  assert.equal(input.readableFlowing, false);
+  assert.equal(input.listenerCount('data'), 0);
+  assert.equal(output.listenerCount('resize'), 0);
+  assert.deepEqual(input.rawModes, [true, false]);
+  assert.equal(input.pauses, 1);
+  assert.match(output.text(), /\u001b\[\?25h\u001b\[\?1049l$/);
+  assert.deepEqual(result.errors, []);
+});
+
+test('standalone --debug starts the debug viewport and keeps its controls on Ctrl+C', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const input = new TransitionInput();
+  const output = new TransitionOutput();
+  let debugSession: Awaited<ReturnType<typeof startDebugView>> | undefined;
+  let sharedBuffer: DashboardLogBuffer | undefined;
+  let debugStarts = 0;
+  let dashboardStarts = 0;
+  let launchCount = 0;
+  let combustionStarts = 0;
+
+  const start = captureCli(
+    ['start', '--debug'],
+    configurationFilePath,
+    undefined,
+    undefined,
+    {
+      checkDashboardTerminal: () => ({ ok: true }),
+      validateNvidiaApiKey: async () => undefined,
+      launchBrowser: async () => {
+        launchCount += 1;
+        return {
+          endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+          browserVersion: 'Brave Chromium test',
+          disconnected: new Promise<void>(() => undefined),
+          async prepare() {
+            return stubPage;
+          },
+          async disconnect() {
+            return undefined;
+          },
+        };
+      },
+      readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+      startCombustion: async () => {
+        combustionStarts += 1;
+        return createTestCombustionController();
+      },
+      waitForShutdown: () => new Promise<void>(() => undefined),
+      startDashboard: async () => {
+        dashboardStarts += 1;
+        throw new Error('the dashboard must not start in --debug mode');
+      },
+      startDebugView: async options => {
+        assert.ok(options);
+        assert.equal(options.captureConsoleOutput, true);
+        assert.equal(options.handoff, undefined);
+        assert.ok(options.logBuffer);
+        sharedBuffer = options.logBuffer;
+        const view = await startDebugView({
+          ...options,
+          input: transitionInput(input),
+          output: transitionOutput(output),
+        });
+        debugStarts += 1;
+        debugSession = view;
+        return view;
+      },
+    },
+    message => {
+      if (message.includes('Engine ready')) ready.resolve();
+    },
+  );
+
+  await ready.promise;
+  assert.equal(debugStarts, 1);
+  assert.equal(dashboardStarts, 0);
+  assert.ok(debugSession);
+  assert.ok(sharedBuffer);
+  assert.equal(input.listenerCount('data'), 1);
+  assert.equal(input.isRaw, true);
+  assert.equal(input.readableFlowing, true);
+
+  for (let index = 0; index < 40; index += 1) {
+    sharedBuffer.add({
+      timestamp: new Date(0),
+      level: 'log',
+      message: `entry-${index + 1}`,
+    });
+  }
+  const entriesBeforeInput = debugSession.getEntries().length;
+
+  input.emit('data', Buffer.from('\u001b[5~'));
+  assert.ok(debugSession.getScrollState().offset > 0);
+  input.emit('data', Buffer.from('\u001b[6~'));
+  assert.equal(debugSession.getScrollState().offset, 0);
+  input.emit('data', Buffer.from('\u001b[5~'));
+  input.emit('data', Buffer.from('l'));
+  assert.equal(debugSession.getScrollState().pinned, true);
+
+  input.emit('data', Buffer.from('d'));
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(debugStarts, 1);
+  assert.equal(dashboardStarts, 0);
+  assert.equal(input.listenerCount('data'), 1);
+  assert.doesNotMatch(output.text(), /\[D\] Dashboard/);
+  assert.match(
+    output.text(),
+    /\[PgUp\/PgDn\] Scroll  \[L\] Latest  \[Ctrl\+C\] Quit/,
+  );
+
+  input.emit('data', Buffer.from('\u0003'));
+  const result = await start;
+
+  assert.equal(result.exitCode, 130);
+  assert.equal(launchCount, 1);
+  assert.equal(combustionStarts, 1);
+  assert.equal(debugSession.getEntries().length >= entriesBeforeInput, true);
+  assert.equal(input.isRaw, false);
+  assert.equal(input.readableFlowing, false);
+  assert.equal(input.listenerCount('data'), 0);
+  assert.equal(output.listenerCount('resize'), 0);
+  assert.deepEqual(input.rawModes, [true, false]);
+  assert.equal(input.pauses, 1);
+  assert.match(output.text(), /\u001b\[\?25h\u001b\[\?1049l$/);
+  assert.deepEqual(result.errors, []);
+});
+
+test('startup output initializes the viewport before the first message and shares one buffer', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const dashboardReady = deferred<void>();
+  const shutdown = deferred<void>();
+  const events: string[] = [];
+  const input = new TransitionInput();
+  const output = new TransitionOutput();
+  let sharedBuffer: DashboardLogBuffer | undefined;
+  let debugSession: Awaited<ReturnType<typeof startDebugView>> | undefined;
+  let dashboardStarts = 0;
+  const runningStatus: RuntimeStatusSnapshotResult = {
+    status: 'running',
+    instanceId: 'startup-buffer-instance',
+    state: 'running',
+    browser: 'brave',
+    temperament: 'balanced',
+    personality: 'default',
+    messengerDestination: 'https://www.facebook.com/messages/t/1618007223454558',
+  };
+
+  const start = captureCli(
+    ['start'],
+    configurationFilePath,
+    undefined,
+    undefined,
+    {
+      checkDashboardTerminal: () => ({ ok: true }),
+      checkBrowserStartup: async () => {
+        console.log('direct browser startup console line');
+      },
+      validateNvidiaApiKey: async () => {
+        console.info('direct API validation console line');
+      },
+      launchBrowser: async () => ({
+        endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+        browserVersion: 'Brave Chromium test',
+        disconnected: new Promise<void>(() => undefined),
+        async prepare() {
+          return stubPage;
+        },
+        async disconnect() {
+          return undefined;
+        },
+      }),
+      readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+      startCombustion: async () => createTestCombustionController(),
+      waitForShutdown: () => shutdown.promise,
+      startDebugView: async options => {
+        events.push('viewport');
+        assert.ok(options);
+        assert.equal(options.captureConsoleOutput, true);
+        assert.equal(options.handoff, undefined);
+        assert.ok(options.logBuffer);
+        sharedBuffer = options.logBuffer;
+        debugSession = await startDebugView({
+          ...options,
+          input: transitionInput(input),
+          output: transitionOutput(output),
+        });
+        return debugSession;
+      },
+      startDashboard: async options => {
+        dashboardStarts += 1;
+        assert.ok(options);
+        assert.equal(options.logBuffer, sharedBuffer);
+        assert.equal(options.captureConsoleOutput, false);
+        const view = await startDashboard({
+          ...options,
+          input: transitionInput(input),
+          output: transitionOutput(output),
+          pollIntervalMs: 60_000,
+          requestStatus: async () => runningStatus,
+        });
+        dashboardReady.resolve();
+        return view;
+      },
+    },
+    message => {
+      events.push(message);
+      if (message.includes('Engine ready')) ready.resolve();
+    },
+  );
+
+  await ready.promise;
+  await dashboardReady.promise;
+  assert.equal(dashboardStarts, 1);
+  assert.ok(sharedBuffer);
+  assert.ok(debugSession);
+
+  const startupMessages = [
+    'Verifying browser configuration.',
+    'Browser configuration verified.',
+    'NVIDIA API key validated successfully.',
+  ];
+  const startupEntries: DashboardLogEntry[] = sharedBuffer.getEntries();
+  for (const message of startupMessages) {
+    const matches: DashboardLogEntry[] = startupEntries.filter(
+      entry => entry.message.includes(message),
+    );
+    assert.equal(matches.length, 1, `${message} is captured exactly once`);
+  }
+  assert.ok(sharedBuffer.getEntries().some(
+    entry => entry.message.includes('direct browser startup console line'),
+  ));
+  assert.ok(sharedBuffer.getEntries().some(
+    entry => entry.message.includes('direct API validation console line'),
+  ));
+
+  const viewportIndex = events.indexOf('viewport');
+  assert.ok(viewportIndex >= 0);
+  for (const message of startupMessages) {
+    const index = events.findIndex(event => event.includes(message));
+    assert.ok(index > viewportIndex, `${message} is emitted after the viewport starts`);
+  }
+
+  shutdown.resolve();
+  const result = await start;
+  assert.equal(result.exitCode, 130);
+  assert.deepEqual(result.errors, []);
+  assert.equal(input.listenerCount('data'), 0);
+  assert.equal(input.isRaw, false);
+});
+
+test('startup spinner activity starts and stops around every startup operation', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const shutdown = deferred<void>();
+  const checkStarted = deferred<void>();
+  const checkRelease = deferred<void>();
+  const validationStarted = deferred<void>();
+  const validationRelease = deferred<void>();
+  const launchStarted = deferred<void>();
+  const launchRelease = deferred<void>();
+  const preparationStarted = deferred<void>();
+  const preparationRelease = deferred<void>();
+  const contextStarted = deferred<void>();
+  const contextRelease = deferred<void>();
+  const combustionStarted = deferred<void>();
+  const combustionRelease = deferred<void>();
+  const input = new TransitionInput();
+  const output = new TransitionOutput();
+  const activityEvents: string[] = [];
+  let activeActivity: string | undefined;
+  let sharedBuffer: DashboardLogBuffer | undefined;
+  const roster: GroupRoster = {
+    status: 'partial',
+    members: [{ firstName: 'Test Puppet', isPuppet: true }],
+    puppet: { firstName: 'Test Puppet', isPuppet: true },
+    duplicateFirstNames: [],
+  };
+  const runningStatus: RuntimeStatusSnapshotResult = {
+    status: 'running',
+    instanceId: 'spinner-instance',
+    state: 'running',
+    browser: 'brave',
+    temperament: 'balanced',
+    personality: 'default',
+    messengerDestination: validConfiguration.messageDestination!,
+  };
+  const session: BrowserLaunchSession = {
+    endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+    browserVersion: 'Brave Chromium test',
+    disconnected: new Promise<void>(() => undefined),
+    async prepare() {
+      preparationStarted.resolve();
+      await preparationRelease.promise;
+      return stubPage;
+    },
+    async disconnect() {
+      return undefined;
+    },
+  };
+
+  const start = captureCli(
+    ['start'],
+    configurationFilePath,
+    undefined,
+    undefined,
+    {
+      checkDashboardTerminal: () => ({ ok: true }),
+      checkBrowserStartup: async () => {
+        checkStarted.resolve();
+        await checkRelease.promise;
+      },
+      validateNvidiaApiKey: async () => {
+        validationStarted.resolve();
+        await validationRelease.promise;
+      },
+      launchBrowser: async () => {
+        launchStarted.resolve();
+        await launchRelease.promise;
+        return session;
+      },
+      extractGroupRoster: async () => {
+        contextStarted.resolve();
+        await contextRelease.promise;
+        return roster;
+      },
+      readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+      startCombustion: async () => {
+        combustionStarted.resolve();
+        await combustionRelease.promise;
+        return createTestCombustionController();
+      },
+      waitForShutdown: () => shutdown.promise,
+      startDebugView: async options => {
+        assert.ok(options?.logBuffer);
+        sharedBuffer = options.logBuffer;
+        const view = await startDebugView({
+          ...options,
+          input: transitionInput(input),
+          output: transitionOutput(output),
+        });
+        return {
+          ...view,
+          startActivity(message) {
+            activeActivity = message;
+            activityEvents.push(`start:${message}`);
+            view.startActivity(message);
+          },
+          stopActivity() {
+            activeActivity = undefined;
+            activityEvents.push('stop');
+            view.stopActivity();
+          },
+        };
+      },
+      startDashboard: async options => {
+        const view = await startDashboard({
+          ...options,
+          input: transitionInput(input),
+          output: transitionOutput(output),
+          pollIntervalMs: 60_000,
+          requestStatus: async () => runningStatus,
+        });
+        return view;
+      },
+    },
+    message => {
+      if (message.includes('Engine ready')) ready.resolve();
+    },
+  );
+
+  await checkStarted.promise;
+  assert.match(activeActivity ?? '', /Verifying browser configuration\./);
+  checkRelease.resolve();
+
+  await validationStarted.promise;
+  assert.match(activeActivity ?? '', /Validating NVIDIA API key\./);
+  validationRelease.resolve();
+
+  await launchStarted.promise;
+  assert.match(activeActivity ?? '', /Launching browser session\./);
+  launchRelease.resolve();
+
+  await preparationStarted.promise;
+  assert.match(activeActivity ?? '', /Verifying conversation readiness\./);
+  preparationRelease.resolve();
+
+  await contextStarted.promise;
+  assert.match(activeActivity ?? '', /Preparing Messenger context\./);
+  contextRelease.resolve();
+
+  await combustionStarted.promise;
+  assert.match(activeActivity ?? '', /Initializing Combustion\./);
+  combustionRelease.resolve();
+
+  await ready.promise;
+  assert.equal(activeActivity, undefined, 'the last activity stops before readiness');
+
+  shutdown.resolve();
+  const result = await start;
+  assert.equal(result.exitCode, 130);
+  assert.ok(sharedBuffer);
+  assert.deepEqual(
+    activityEvents.map(event => event === 'stop' ? 'stop' : 'start'),
+    ['start', 'stop', 'start', 'stop', 'start', 'stop', 'start', 'stop', 'start', 'stop', 'start', 'stop'],
+  );
+  for (const message of [
+    'Verifying browser configuration.',
+    'Validating NVIDIA API key.',
+    'Launching browser session.',
+    'Verifying conversation readiness.',
+    'Preparing Messenger context.',
+    'Initializing Combustion.',
+  ]) {
+    assert.equal(
+      sharedBuffer.getEntries().filter(entry => entry.message.includes(message)).length,
+      1,
+      `${message} is captured exactly once while animated`,
+    );
+  }
+});
+
+test('startup output never bypasses console capture for the default writers', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const dashboardStarted = deferred<void>();
+  const shutdown = deferred<void>();
+  const input = new TransitionInput();
+  const output = new TransitionOutput();
+  let sharedBuffer: DashboardLogBuffer | undefined;
+  const originalLog = console.log;
+  const originalInfo = console.info;
+  const originalError = console.error;
+  const consoleLines: string[] = [];
+  const record = (...args: unknown[]): void => {
+    consoleLines.push(args.map(value => String(value)).join(' '));
+  };
+
+  console.log = record;
+  console.info = record;
+  console.error = record;
+  try {
+    const start = runCli(
+      ['start'],
+      undefined,
+      undefined,
+      configurationFilePath,
+      undefined,
+      undefined,
+      {
+        checkDashboardTerminal: () => ({ ok: true }),
+        checkBrowserStartup: async () => undefined,
+        closeBrowser: async () => undefined,
+        validateNvidiaApiKey: async () => undefined,
+        launchBrowser: async () => ({
+          endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+          browserVersion: 'Brave Chromium test',
+          disconnected: new Promise<void>(() => undefined),
+          async prepare() {
+            return stubPage;
+          },
+          async disconnect() {
+            return undefined;
+          },
+        }),
+        readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+        startCombustion: async () => createTestCombustionController(),
+        waitForShutdown: () => shutdown.promise,
+        startDebugView: async options => {
+          assert.ok(options?.logBuffer);
+          sharedBuffer = options.logBuffer;
+          return startDebugView({
+            ...options,
+            input: transitionInput(input),
+            output: transitionOutput(output),
+          });
+        },
+        startDashboard: async options => {
+          assert.equal(options?.logBuffer, sharedBuffer);
+          dashboardStarted.resolve();
+          return {
+            closed: new Promise<void>(() => undefined),
+            async close() {
+              return undefined;
+            },
+            async refresh() {
+              return undefined;
+            },
+          };
+        },
+      },
+    );
+
+    await dashboardStarted.promise;
+    assert.ok(sharedBuffer);
+    const startupMessages = [
+      'Verifying browser configuration.',
+      'Browser configuration verified.',
+      'NVIDIA API key validated successfully.',
+    ];
+    for (const message of startupMessages) {
+      assert.ok(
+        sharedBuffer.getEntries().some(entry => entry.message.includes(message)),
+        `${message} reaches the viewport buffer`,
+      );
+      assert.equal(
+        consoleLines.filter(line => line.includes(message)).length,
+        0,
+        `${message} does not leak to the original console`,
+      );
+    }
+
+    shutdown.resolve();
+    const exitCode = await start;
+    assert.equal(exitCode, 130);
+  } finally {
+    console.log = originalLog;
+    console.info = originalInfo;
+    console.error = originalError;
+  }
+});
+
+test('startup failures close the viewport and remain visible', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const input = new TransitionInput();
+  const output = new TransitionOutput();
+  let sharedBuffer: DashboardLogBuffer | undefined;
+
+  const start = captureCli(
+    ['start'],
+    configurationFilePath,
+    undefined,
+    undefined,
+    {
+      checkDashboardTerminal: () => ({ ok: true }),
+      checkBrowserStartup: async () => {
+        throw new Error('browser startup exploded');
+      },
+      validateNvidiaApiKey: async () => undefined,
+      launchBrowser: async () => {
+        throw new Error('browser launch must not run');
+      },
+      waitForShutdown: () => new Promise<void>(() => undefined),
+      startDebugView: async options => {
+        assert.ok(options?.logBuffer);
+        sharedBuffer = options.logBuffer;
+        return startDebugView({
+          ...options,
+          input: transitionInput(input),
+          output: transitionOutput(output),
+        });
+      },
+    },
+  );
+
+  const result = await start;
+  assert.equal(result.exitCode, 1);
+  assert.ok(result.errors.some(error => error.includes('browser startup exploded')));
+  assert.ok(sharedBuffer);
+  assert.ok(sharedBuffer.getEntries().some(
+    entry => entry.message.includes('Verifying browser configuration.'),
+  ));
+  assert.equal(input.listenerCount('data'), 0);
+  assert.equal(output.listenerCount('resize'), 0);
+  assert.equal(input.isRaw, false);
+  assert.deepEqual(input.rawModes, [true, false]);
+});
+
+test('startup spinner stops before a failed operation closes the viewport', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const started = deferred<void>();
+  const release = deferred<void>();
+  const input = new TransitionInput();
+  const output = new TransitionOutput();
+  let activeActivity: string | undefined;
+  let stops = 0;
+  let sharedBuffer: DashboardLogBuffer | undefined;
+
+  const start = captureCli(
+    ['start'],
+    configurationFilePath,
+    undefined,
+    undefined,
+    {
+      checkDashboardTerminal: () => ({ ok: true }),
+      checkBrowserStartup: async () => {
+        started.resolve();
+        await release.promise;
+        throw new Error('browser startup exploded');
+      },
+      validateNvidiaApiKey: async () => undefined,
+      launchBrowser: async () => {
+        throw new Error('browser launch must not run');
+      },
+      waitForShutdown: () => new Promise<void>(() => undefined),
+      startDebugView: async options => {
+        assert.ok(options?.logBuffer);
+        sharedBuffer = options.logBuffer;
+        const view = await startDebugView({
+          ...options,
+          input: transitionInput(input),
+          output: transitionOutput(output),
+        });
+        return {
+          ...view,
+          startActivity(message) {
+            activeActivity = message;
+            view.startActivity(message);
+          },
+          stopActivity() {
+            activeActivity = undefined;
+            stops += 1;
+            view.stopActivity();
+          },
+        };
+      },
+    },
+  );
+
+  await started.promise;
+  assert.match(activeActivity ?? '', /Verifying browser configuration\./);
+  release.resolve();
+  const result = await start;
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(activeActivity, undefined);
+  assert.equal(stops, 1);
+  assert.ok(result.errors.some(error => error.includes('browser startup exploded')));
+  assert.ok(sharedBuffer);
+  assert.equal(
+    sharedBuffer.getEntries().filter(
+      entry => entry.message.includes('Verifying browser configuration.'),
+    ).length,
+    1,
+  );
+  assert.equal(input.listenerCount('data'), 0);
+  assert.equal(output.listenerCount('resize'), 0);
+  assert.equal(input.isRaw, false);
+});
+
 test('start falls back to traditional CLI output in a non-interactive terminal', async context => {
   const configurationFilePath = createTemporaryConfigPath(context);
   saveConfiguration(validConfiguration, configurationFilePath);
@@ -4556,10 +5449,18 @@ test('start falls back to traditional CLI output in a non-interactive terminal',
   await ready.promise;
   assert.equal(dashboardStarts, 0);
   const beforeStop = observed.join('\n');
+  assert.match(beforeStop, /\[STARTUP\] Verifying browser configuration\./);
+  assert.match(beforeStop, /\[BROWSER\] Browser configuration verified\./);
+  assert.match(beforeStop, /\[STARTUP\] NVIDIA API key validated successfully\./);
+  assert.match(beforeStop, /\[BROWSER\] Launching browser session\./);
   assert.match(beforeStop, /CRANKING/);
   assert.match(beforeStop, /BACKREAD/);
   assert.match(beforeStop, /CONTEXT/);
   assert.match(beforeStop, /READY/);
+  assert.doesNotMatch(beforeStop, /\[STARTUP\] Validating NVIDIA API key\./);
+  assert.doesNotMatch(beforeStop, /\[BROWSER\] Verifying conversation readiness\./);
+  assert.doesNotMatch(beforeStop, /\[CRANKING\] Initializing Combustion\./);
+  assert.doesNotMatch(beforeStop, /\[(?:STARTUP|BROWSER|CRANKING)\] [|/\\-] /);
   assert.doesNotMatch(beforeStop, /terminal dashboard/i);
 
   const stopped = await captureCli(['stop'], configurationFilePath);
