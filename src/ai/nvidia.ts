@@ -53,6 +53,7 @@ import {
 } from '../components/personality.js';
 import { sanitizeGroupRoster, type GroupRoster } from '../browser/group-roster.js';
 import { appendIdentityAwarenessInstruction } from '../components/identity-awareness.js';
+import { appendTimeAwarenessInstruction } from '../components/time-awareness.js';
 import {
   appendMessageTargetingInstruction,
   classifyMessageTargeting,
@@ -1015,10 +1016,16 @@ export async function generateNvidiaReply(
     logRequestDiagnostics(options.requestDiagnostics, requestMessages, triggerInfo);
   }
 
-  const requestCompletion = (systemInstruction: string): Promise<string> =>
+  const requestCompletion = (
+    systemInstruction: string,
+    retryInstructions: readonly string[] = [],
+  ): Promise<string> =>
     requestNvidiaCompletion({
       apiKey,
-      systemInstruction,
+      systemInstruction: appendRetryInstruction(
+        appendTimeAwarenessInstruction(systemInstruction),
+        ...retryInstructions,
+      ),
       messages: requestMessages,
       fetch: options.fetch,
       timeoutMs: options.timeoutMs,
@@ -1131,9 +1138,7 @@ export async function generateNvidiaReply(
   if (!firstExistenceResult.valid) {
     retryInstructions.push(EXISTENCE_RETRY_INSTRUCTION);
   }
-  const retryReply = await requestCompletion(
-    appendRetryInstruction(systemInstruction, ...retryInstructions),
-  );
+  const retryReply = await requestCompletion(systemInstruction, retryInstructions);
   logGeneration({ stage: 'raw', attempt: 'retry', text: retryReply });
   const retryExistenceResult = validateReplyExistence(retryReply, {
     trigger: existenceTrigger,
