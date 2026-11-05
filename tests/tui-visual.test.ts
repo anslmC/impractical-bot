@@ -423,13 +423,13 @@ test('the dashboard fills every supported dimension without horizontal overflow'
   assert.match(stripAnsi(empty), new RegExp(DASHBOARD_EMPTY_LOGS_MESSAGE));
 });
 
-test('status states are compact pills with monochrome emphasis', () => {
+test('status states use muted warnings and red failure indicators', () => {
   const cases: Array<[Partial<DashboardView>, string, string]> = [
     [{ state: 'running' }, 'Running', '37'],
-    [{ state: 'paused' }, 'Paused', '1;37'],
-    [{ connection: 'connecting', state: 'starting' }, 'Starting', '1;37'],
-    [{ state: 'stopping' }, 'Stopping', '1;97'],
-    [{ connection: 'disconnected', state: 'disconnected' }, 'Disconnected', '1;97'],
+    [{ state: 'paused' }, 'Paused', '2;90'],
+    [{ connection: 'connecting', state: 'starting' }, 'Starting', '2;90'],
+    [{ state: 'stopping' }, 'Stopping', '1;31'],
+    [{ connection: 'disconnected', state: 'disconnected' }, 'Disconnected', '1;31'],
   ];
 
   for (const [overrides, label, code] of cases) {
@@ -513,22 +513,22 @@ test('timestamps, categories, and metadata use a monochrome hierarchy', () => {
   assert.match(rng, /\u001b\[37m\[rng\]\u001b\[0m/, 'rng activity uses a light-gray label');
 });
 
-test('log severity uses monochrome emphasis for warnings and errors', () => {
+test('log severity uses muted gray warnings and red errors', () => {
   const warning = formatDashboardLogLine(
     logEntry('[engine] connector stalled', 'warn'),
     80,
     { color: true },
   );
-  assert.match(warning, /\u001b\[1;37m\[WARN\] \u001b\[0m/);
-  assert.match(warning, /\u001b\[1;37mconnector stalled\u001b\[0m/);
+  assert.match(warning, /\u001b\[2;90m\[WARN\] \u001b\[0m/);
+  assert.match(warning, /\u001b\[2;90mconnector stalled\u001b\[0m/);
 
   const error = formatDashboardLogLine(
     logEntry('[compose] stage=click-failed error=timeout', 'error'),
     80,
     { color: true },
   );
-  assert.match(error, /\u001b\[1;97m\[ERROR\] \u001b\[0m/);
-  assert.match(error, /\u001b\[1;97mclick-failed\u001b\[0m/);
+  assert.match(error, /\u001b\[1;31m\[ERROR\] \u001b\[0m/);
+  assert.match(error, /\u001b\[1;31mclick-failed\u001b\[0m/);
 
   const debug = formatDashboardLogLine(
     logEntry('[identity] merged duplicate rendered record', 'debug'),
@@ -543,8 +543,9 @@ test('log severity uses monochrome emphasis for warnings and errors', () => {
     { color: true },
   );
   assert.match(success, /\u001b\[37msent\u001b\[0m/, 'successful values use light-gray emphasis');
-  assert.match(success, /\u001b\[1;37munconfirmed\u001b\[0m/, 'unconfirmed delivery is bold gray');
+  assert.match(success, /\u001b\[2;90munconfirmed\u001b\[0m/, 'unconfirmed delivery is muted gray');
   assert.match(success, /\u001b\[37m\[packet packet-001\]\u001b\[0m/);
+  assert.doesNotMatch(success, /\u001b\[1;31m/);
 });
 
 test('long log messages are truncated inside the panel and stay well formed', () => {
@@ -608,6 +609,27 @@ test('command chips and prompts render in the styled layout', () => {
   assert.ok(cursor);
   assert.ok(cursor.row >= 1 && cursor.row <= 24);
   assert.ok(cursor.column >= 1 && cursor.column <= 80);
+});
+
+test('prompt errors use the same red as CLI failures', () => {
+  const promptView: DashboardView = {
+    ...connectedView,
+    prompt: {
+      kind: 'destination',
+      value: 'not-a-url',
+      error: 'Enter a valid HTTP or HTTPS URL.',
+    },
+  };
+  const rendered = renderDashboardLines(
+    promptView,
+    { columns: 80, rows: 24 },
+    { color: true },
+  ).join('\n');
+
+  assert.match(
+    rendered,
+    /\u001b\[1;31mError: Enter a valid HTTP or HTTPS URL\.\u001b\[0m/,
+  );
 });
 
 test('rapid styled log updates keep the panel intact and restore the terminal', async () => {

@@ -10,15 +10,15 @@ import { stripAnsi, visibleWidth } from '../src/tui/theme.js';
 
 const timestamp = new Date(2024, 0, 2, 3, 4, 5);
 
-// Monochrome log roles: light-gray labels, bold warning/error emphasis,
-// dim secondary text, and bold emphasis.
+// Shared log roles: light-gray labels, muted warnings, dim secondary text,
+// and red errors.
 const TONE = {
   label: '37',
   dim: '2',
   bold: '1',
   success: '37',
-  warning: '1;37',
-  danger: '1;97',
+  warning: '2;90',
+  danger: '1;31',
 } as const;
 
 const view: DashboardView = {

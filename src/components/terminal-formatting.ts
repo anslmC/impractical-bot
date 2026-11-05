@@ -1,3 +1,5 @@
+import { paint, type DashboardTone } from '../tui/theme.js';
+
 export type TerminalStyle = 'bold' | 'dim' | 'cyan' | 'green' | 'yellow' | 'red';
 
 export interface TerminalColorOptions {
@@ -6,14 +8,13 @@ export interface TerminalColorOptions {
   term?: string;
 }
 
-const ANSI_RESET = '\u001b[0m';
-const ANSI_STYLE_CODES: Record<TerminalStyle, string> = {
-  bold: '\u001b[1m',
-  dim: '\u001b[2m',
-  cyan: '\u001b[36m',
-  green: '\u001b[32m',
-  yellow: '\u001b[33m',
-  red: '\u001b[31m',
+const STYLE_TONES: Record<TerminalStyle, DashboardTone> = {
+  bold: 'strong',
+  dim: 'muted',
+  cyan: 'brandSoft',
+  green: 'violet',
+  yellow: 'warning',
+  red: 'danger',
 };
 
 export function formatTerminalText(
@@ -27,16 +28,23 @@ export function formatTerminalText(
   if (!isTTY || noColor || term === 'dumb') {
     return text;
   }
-  return `${ANSI_STYLE_CODES[style]}${text}${ANSI_RESET}`;
+  return paint(text, STYLE_TONES[style], true);
 }
 
-export function formatTerminalMilestone(label: string, message: string): string {
-  return `\n${formatTerminalText(`[${label}]`, 'cyan')} ` +
-    formatTerminalText(message, 'bold');
+export function formatTerminalMilestone(
+  label: string,
+  message: string,
+  options?: TerminalColorOptions,
+): string {
+  return `\n${formatTerminalText(`[${label}]`, 'cyan', options)} ` +
+    formatTerminalText(message, 'bold', options);
 }
 
-export function formatTerminalDiagnostic(message: string): string {
-  return `  ${formatTerminalText(message, 'dim')}`;
+export function formatTerminalDiagnostic(
+  message: string,
+  options?: TerminalColorOptions,
+): string {
+  return `  ${formatTerminalText(message, 'dim', options)}`;
 }
 
 export function formatPollSummary(

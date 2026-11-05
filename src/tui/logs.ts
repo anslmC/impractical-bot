@@ -61,7 +61,7 @@ const COUNT_PATTERN = /\b\d+\b/g;
 const SEVERITY_PATTERN =
   /(?:failed|failure|rejected|suppressed|unavailable|disconnected|stopped|aborted|error)/i;
 
-// Traditional CLI output paints every bracketed label with the standard ANSI cyan.
+// Captured CLI labels use the shared light-gray section-label tone.
 const CATEGORY_TONE: DashboardTone = 'cliCyan';
 
 const EVENT_RULES: readonly LogHighlightRule[] = [

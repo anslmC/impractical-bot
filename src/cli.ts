@@ -604,7 +604,7 @@ async function updatePuppetName(
     writeOutput(formatTerminalText(
       'Puppet account name retrieval failed; keeping the existing configured value. ' +
       `${error instanceof Error ? error.message : 'Unknown retrieval error.'}`,
-      'yellow',
+      'red',
     ));
     return;
   }
@@ -624,10 +624,11 @@ async function updatePuppetName(
       `${formatTerminalText(JSON.stringify(puppetName), 'bold')}.`,
     );
   } catch (error) {
-    writeOutput(
+    writeOutput(formatTerminalText(
       `Puppet account name retrieved as ${JSON.stringify(puppetName)}, but saving failed; ` +
       `keeping the existing configured value. ${error instanceof Error ? error.message : 'Unknown save error.'}`,
-    );
+      'red',
+    ));
   }
 }
 
@@ -1533,7 +1534,7 @@ async function handleStart(
       exitCode = 1;
     } else if (launchResult.type === 'shutdown') {
       session = await launchPromise.catch(() => undefined);
-      writeOutput('Shutdown requested; disconnecting Playwright.');
+      writeOutput(formatTerminalText('Shutdown requested; disconnecting Playwright.', 'bold'));
       exitCode = launchResult.source === 'runtime-control' ? 0 : 130;
     } else {
       session = launchResult.session;
@@ -1551,7 +1552,7 @@ async function handleStart(
         session.disconnected.then(() => ({ type: 'disconnected' as const })),
       ]);
       if (preparationResult.type === 'shutdown') {
-        writeOutput('Shutdown requested; disconnecting Playwright.');
+        writeOutput(formatTerminalText('Shutdown requested; disconnecting Playwright.', 'bold'));
         exitCode = preparationResult.source === 'runtime-control' ? 0 : 130;
       } else if (preparationResult.type === 'disconnected') {
         throw new Error('The browser disconnected during startup preparation.');
@@ -1587,7 +1588,10 @@ async function handleStart(
         ));
         try {
           if (await session.isWindowMinimized?.(preparationResult.page)) {
-            writeOutput('WARNING: Browser is minimized. Backread may collect fewer messages than expected.');
+            writeOutput(formatTerminalText(
+              'WARNING: Browser is minimized. Backread may collect fewer messages than expected.',
+              'yellow',
+            ));
           }
         } catch {
           writeError('Unable to detect browser window state.');
@@ -1751,7 +1755,7 @@ async function handleStart(
           runtimeResult = await waitForEngine();
         }
         if (typeof runtimeResult === 'object' && runtimeResult.type === 'shutdown') {
-          writeOutput('Shutdown requested; disconnecting Playwright.');
+          writeOutput(formatTerminalText('Shutdown requested; disconnecting Playwright.', 'bold'));
           exitCode = runtimeResult.source === 'runtime-control' ? 0 : 130;
         } else if (runtimeResult === 'combustion-stopped') {
           throw new Error('Combustion stopped unexpectedly.');
@@ -1954,7 +1958,7 @@ function getVersion(): string {
 export async function runCli(
   args: string[],
   writeOutput: Output = message => console.log(message),
-  writeError: Output = message => console.error(message),
+  writeError: Output = message => console.error(formatTerminalText(message, 'red')),
   configurationFilePath?: string,
   prompt: TerminalPrompt = promptTerminal,
   initialize: (options: InitializationOptions) => Promise<InitializationStatus> = initializeConfiguration,

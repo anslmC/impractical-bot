@@ -326,20 +326,22 @@ function noticeTone(notice: DashboardNotice): DashboardTone {
   }
 }
 
-function promptErrorLines(prompt: DashboardPrompt, width: number): string[] {
+function promptErrorLines(prompt: DashboardPrompt, width: number, color: boolean): string[] {
   if (!('error' in prompt) || prompt.error === undefined) {
     return [];
   }
-  return [truncateVisible(`Error: ${prompt.error}`, width)];
+  return [renderLine([
+    { text: `Error: ${prompt.error}`, tone: 'danger' },
+  ], width, color)];
 }
 
-function promptFooterLines(prompt: DashboardPrompt, width: number): string[] {
+function promptFooterLines(prompt: DashboardPrompt, width: number, color: boolean): string[] {
   switch (prompt.kind) {
     case 'destination':
       return [
         truncateVisible(renderPromptInput('Destination URL: ', prompt.value, width).text, width),
         truncateVisible('[Enter] Apply  [Esc] Cancel', width),
-        ...promptErrorLines(prompt, width),
+        ...promptErrorLines(prompt, width, color),
       ];
     case 'temperament':
       return [
@@ -360,7 +362,7 @@ function promptFooterLines(prompt: DashboardPrompt, width: number): string[] {
           width,
         ),
         truncateVisible('[Enter] Apply  [Esc] Cancel', width),
-        ...promptErrorLines(prompt, width),
+        ...promptErrorLines(prompt, width, color),
       ];
     case 'stopConfirmation':
       return [
@@ -376,7 +378,7 @@ function footerLines(
   color: boolean,
 ): string[] {
   if (view.prompt !== undefined) {
-    return promptFooterLines(view.prompt, width);
+    return promptFooterLines(view.prompt, width, color);
   }
   const segments: StyledSegment[] = [
     { text: 'Status: ', tone: 'cyanMuted' },

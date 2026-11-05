@@ -1,5 +1,16 @@
 export const ANSI_RESET = '\u001b[0m';
 
+export const THEME_COLORS = {
+  white: '\u001b[97m',
+  brightWhite: '\u001b[1;97m',
+  lightGray: '\u001b[37m',
+  boldLightGray: '\u001b[1;37m',
+  mediumGray: '\u001b[90m',
+  mutedGray: '\u001b[2;90m',
+  dim: '\u001b[2m',
+  red: '\u001b[1;31m',
+} as const;
+
 export type DashboardTone =
   | 'brand'
   | 'brandSoft'
@@ -21,24 +32,24 @@ export type DashboardTone =
   | 'cliRed';
 
 const TONE_CODES: Record<DashboardTone, string> = {
-  brand: '\u001b[1;97m',
-  brandSoft: '\u001b[37m',
-  accent: '\u001b[2;90m',
-  violet: '\u001b[90m',
-  magenta: '\u001b[37m',
-  heading: '\u001b[1;37m',
-  info: '\u001b[97m',
-  cyanMuted: '\u001b[90m',
-  value: '\u001b[97m',
-  muted: '\u001b[2m',
-  strong: '\u001b[1;97m',
-  success: '\u001b[37m',
-  warning: '\u001b[1;37m',
-  danger: '\u001b[1;97m',
-  cliCyan: '\u001b[37m',
-  cliGreen: '\u001b[37m',
-  cliYellow: '\u001b[1;37m',
-  cliRed: '\u001b[1;97m',
+  brand: THEME_COLORS.brightWhite,
+  brandSoft: THEME_COLORS.lightGray,
+  accent: THEME_COLORS.mutedGray,
+  violet: THEME_COLORS.mediumGray,
+  magenta: THEME_COLORS.lightGray,
+  heading: THEME_COLORS.boldLightGray,
+  info: THEME_COLORS.white,
+  cyanMuted: THEME_COLORS.mediumGray,
+  value: THEME_COLORS.white,
+  muted: THEME_COLORS.dim,
+  strong: THEME_COLORS.brightWhite,
+  success: THEME_COLORS.lightGray,
+  warning: THEME_COLORS.mutedGray,
+  danger: THEME_COLORS.red,
+  cliCyan: THEME_COLORS.lightGray,
+  cliGreen: THEME_COLORS.lightGray,
+  cliYellow: THEME_COLORS.mutedGray,
+  cliRed: THEME_COLORS.red,
 };
 
 const ANSI_OSC_PATTERN = /\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g;

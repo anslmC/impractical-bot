@@ -35,7 +35,13 @@ import {
 } from '../src/components/personality.js';
 import { buildRngPacket } from '../src/components/rng-packet-builder.js';
 import type { GroupRoster } from '../src/browser/group-roster.js';
-import { formatPollSummary, formatTerminalText } from '../src/components/terminal-formatting.js';
+import {
+  formatPollSummary,
+  formatTerminalDiagnostic,
+  formatTerminalMilestone,
+  formatTerminalText,
+} from '../src/components/terminal-formatting.js';
+import { THEME_COLORS, paint } from '../src/tui/theme.js';
 import { generateNvidiaReply } from '../src/ai/nvidia.js';
 
 const testIdentity = { name: 'Ada', aliases: ['@Ada'] };
@@ -95,8 +101,40 @@ test('terminal text formatting respects TTY, NO_COLOR, and TERM=dumb', () => {
   assert.equal(formatTerminalText('poll', 'cyan', { isTTY: true, term: 'dumb' }), 'poll');
   assert.equal(
     formatTerminalText('poll', 'cyan', { isTTY: true, noColor: false, term: 'xterm' }),
-    '\u001b[36mpoll\u001b[0m',
+    `${THEME_COLORS.lightGray}poll\u001b[0m`,
   );
+});
+
+test('startup CLI styles reuse the shared TUI palette', () => {
+  const options = { isTTY: true, noColor: false, term: 'xterm' };
+
+  assert.equal(formatTerminalText('x', 'bold', options), paint('x', 'strong', true));
+  assert.equal(formatTerminalText('x', 'dim', options), paint('x', 'muted', true));
+  assert.equal(formatTerminalText('x', 'cyan', options), paint('x', 'brandSoft', true));
+  assert.equal(formatTerminalText('x', 'green', options), paint('x', 'violet', true));
+  assert.equal(formatTerminalText('x', 'yellow', options), paint('x', 'warning', true));
+  assert.equal(formatTerminalText('x', 'red', options), paint('x', 'danger', true));
+  assert.equal(formatTerminalText('x', 'red', options), `${THEME_COLORS.red}x\u001b[0m`);
+
+  const milestone = formatTerminalMilestone('STARTUP', 'Verifying browser configuration.', options);
+  assert.equal(
+    milestone,
+    `\n${THEME_COLORS.lightGray}[STARTUP]\u001b[0m ` +
+    `${THEME_COLORS.brightWhite}Verifying browser configuration.\u001b[0m`,
+  );
+  assert.equal(
+    formatTerminalDiagnostic('technical detail', options),
+    `  ${THEME_COLORS.dim}technical detail\u001b[0m`,
+  );
+});
+
+test('startup CLI never emits accent colors', () => {
+  const options = { isTTY: true, noColor: false, term: 'xterm' };
+  const styles = ['bold', 'dim', 'cyan', 'green', 'yellow', 'red'] as const;
+  const output = styles.map(style => formatTerminalText('sample', style, options)).join('');
+
+  assert.doesNotMatch(output, /\u001b\[(?:3[2-6]|9[1-6])m/);
+  assert.match(formatTerminalText('failure', 'red', options), /\u001b\[1;31m/);
 });
 
 test('poll summaries keep idle polls visible and emphasize activity', () => {
