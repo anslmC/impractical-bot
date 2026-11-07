@@ -981,6 +981,7 @@ test('launches configured browser, connects to its configured port, then disconn
     '--remote-debugging-address=127.0.0.1',
     `--remote-debugging-port=${port}`,
     `--user-data-dir=${config.profilePath}`,
+    '--window-size=900,600',
   ]);
   assert.equal(connectEndpoint, `ws://127.0.0.1:${port}/devtools/browser/test-session`);
   assert.notEqual(connectOptions?.noDefaults, true);

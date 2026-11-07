@@ -98,6 +98,7 @@ interface ChildState {
   failure?: Error;
 }
 
+const BROWSER_WINDOW_SIZE = '--window-size=900,600';
 const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
 const DEFAULT_POLL_INTERVAL_MS = 100;
 const DEFAULT_CONNECTION_TIMEOUT_MS = 10_000;
@@ -1451,6 +1452,7 @@ export async function launchConfiguredBrowser(
       '--remote-debugging-address=127.0.0.1',
       `--remote-debugging-port=${validatedConfiguration.cdpPort}`,
       `--user-data-dir=${validatedConfiguration.profilePath}`,
+      BROWSER_WINDOW_SIZE,
     ],
     {
       detached: true,
