@@ -19,12 +19,15 @@ export interface GroupRoster {
   reason?: string;
 }
 
+export type AutomatedActionRunner = <T>(operation: () => Promise<T>) => Promise<T>;
+
 export interface GroupRosterExtractionOptions {
   timeoutMs?: number;
   pollIntervalMs?: number;
   stableReads?: number;
   now?: () => number;
   delay?: (milliseconds: number) => Promise<void>;
+  runAutomatedAction?: AutomatedActionRunner;
 }
 
 const CONVERSATION_INFORMATION = 'Conversation information';
@@ -359,10 +362,13 @@ async function waitForStableRows(
   }
 }
 
-async function dismissObstructingProfileDialog(page: Page): Promise<void> {
+async function dismissObstructingProfileDialog(
+  page: Page,
+  runAutomated: AutomatedActionRunner,
+): Promise<void> {
   const dialog = page.getByRole('dialog', { name: PROFILE_DIALOG, exact: true });
   if (await countOf(dialog) === 1 && await isVisible(dialog)) {
-    await page.keyboard.press('Escape').catch(() => undefined);
+    await runAutomated(() => page.keyboard.press('Escape')).catch(() => undefined);
   }
 }
 
@@ -430,16 +436,19 @@ async function activateControl(
   page: Page,
   control: Locator,
   useKeyboard: boolean,
+  runAutomated: AutomatedActionRunner,
 ): Promise<void> {
   if (useKeyboard) {
     try {
-      await control.focus({ timeout: CLICK_TIMEOUT_MS });
-      await page.keyboard.press('Enter');
+      await runAutomated(async () => {
+        await control.focus({ timeout: CLICK_TIMEOUT_MS });
+        await page.keyboard.press('Enter');
+      });
       return;
     } catch {
     }
   }
-  await control.click({ timeout: CLICK_TIMEOUT_MS });
+  await runAutomated(() => control.click({ timeout: CLICK_TIMEOUT_MS }));
 }
 
 async function waitForInformationClosed(
@@ -470,6 +479,7 @@ async function closeConversationInformation(
   pollIntervalMs: number,
   now: () => number,
   delay: (milliseconds: number) => Promise<void>,
+  runAutomated: AutomatedActionRunner,
 ): Promise<boolean> {
   const backButton = page.getByRole('button', { name: BACK, exact: true });
   const infoButton = page.getByRole('button', {
@@ -488,7 +498,7 @@ async function closeConversationInformation(
       break;
     }
     try {
-      await activateControl(page, control, attempt % 2 === 0);
+      await activateControl(page, control, attempt % 2 === 0, runAutomated);
     } catch {
     }
     const remaining = deadline - now();
@@ -535,6 +545,8 @@ export async function extractGroupRoster(
   const stableReads = Math.max(2, options.stableReads ?? DEFAULT_STABLE_READS);
   const now = options.now ?? Date.now;
   const delay = options.delay ?? defaultDelay;
+  const runAutomated = options.runAutomatedAction ??
+    (<T>(operation: () => Promise<T>): Promise<T> => operation());
   if (timeoutMs <= 0 || pollIntervalMs <= 0) {
     throw new Error('Group roster extraction timeouts must be positive.');
   }
@@ -548,7 +560,7 @@ export async function extractGroupRoster(
     const expander = page.getByRole('button', { name: CHAT_MEMBERS, exact: true });
     const region = page.getByRole('region', { name: CHAT_MEMBERS, exact: true });
 
-    await dismissObstructingProfileDialog(page);
+    await dismissObstructingProfileDialog(page, runAutomated);
 
     if (!await isPanelOpen(infoButton, expander, region)) {
       if (await countOf(infoButton) !== 1 ||
@@ -556,7 +568,7 @@ export async function extractGroupRoster(
           !await isEnabled(infoButton)) {
         throw new Error('The conversation information control was not uniquely available.');
       }
-      await infoButton.click({ timeout: CLICK_TIMEOUT_MS });
+      await runAutomated(() => infoButton.click({ timeout: CLICK_TIMEOUT_MS }));
       if (!await waitForVisible(region, Math.min(timeoutMs, CLICK_TIMEOUT_MS))) {
         await waitForVisible(expander, Math.min(timeoutMs, CLICK_TIMEOUT_MS));
       }
@@ -571,7 +583,7 @@ export async function extractGroupRoster(
             !await isEnabled(expander)) {
           throw new Error('The Chat members control was not uniquely available.');
         }
-        await expander.click({ timeout: CLICK_TIMEOUT_MS });
+        await runAutomated(() => expander.click({ timeout: CLICK_TIMEOUT_MS }));
         await waitForVisible(region, timeoutMs);
       }
     }
@@ -602,6 +614,7 @@ export async function extractGroupRoster(
         pollIntervalMs,
         now,
         delay,
+        runAutomated,
       );
     } catch {
       closed = false;

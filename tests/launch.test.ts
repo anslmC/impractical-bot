@@ -997,6 +997,123 @@ test('launches configured browser, connects to its configured port, then disconn
   assert.equal(child.exited, false);
 });
 
+test('terminates the owned browser process gracefully and only once', async t => {
+  const port = await getAvailablePort();
+  const config = { ...baseConfiguration, cdpPort: port };
+  const { server, start } = createCdpServer();
+  t.after(async () => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
+  const child = new FakeProcess();
+  const browser = browserMock();
+  const closeTargets: number[] = [];
+  let forcedTerminations = 0;
+  let processScans = 0;
+  const session = await launchConfiguredBrowser(config, {
+    platform: 'win32',
+    fileSystem: new FakeFileSystem(),
+    findProfileProcesses: async () => {
+      processScans += 1;
+      return processScans === 1 ? [] : [child.pid];
+    },
+    spawnProcess: () => {
+      void start(port);
+      return child;
+    },
+    connectOverCDP: async () => browser.browser as never,
+    requestProcessClose: async processIds => {
+      closeTargets.push(...processIds);
+      child.exit();
+    },
+    terminateProcessTree: async () => {
+      forcedTerminations += 1;
+    },
+  });
+
+  assert.equal(session.ownedProcessId, child.pid);
+  await session.terminateOwnedBrowser?.();
+  await session.terminateOwnedBrowser?.();
+
+  assert.deepEqual(closeTargets, [child.pid]);
+  assert.equal(forcedTerminations, 0);
+  assert.equal(child.exited, true);
+});
+
+test('forces owned browser process tree termination after graceful shutdown times out', async t => {
+  const port = await getAvailablePort();
+  const config = { ...baseConfiguration, cdpPort: port };
+  const { server, start } = createCdpServer();
+  t.after(async () => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
+  const child = new FakeProcess();
+  const browser = browserMock();
+  const closeTargets: number[] = [];
+  const forcedTargets: number[] = [];
+  let processScans = 0;
+  const session = await launchConfiguredBrowser(config, {
+    platform: 'win32',
+    fileSystem: new FakeFileSystem(),
+    shutdownTimeoutMs: 5,
+    pollIntervalMs: 1,
+    findProfileProcesses: async () => {
+      processScans += 1;
+      return processScans === 1 ? [] : [child.pid];
+    },
+    spawnProcess: () => {
+      void start(port);
+      return child;
+    },
+    connectOverCDP: async () => browser.browser as never,
+    requestProcessClose: async processIds => {
+      closeTargets.push(...processIds);
+    },
+    terminateProcessTree: async processId => {
+      forcedTargets.push(processId);
+      child.exit();
+    },
+  });
+
+  await session.terminateOwnedBrowser?.();
+
+  assert.deepEqual(closeTargets, [child.pid]);
+  assert.deepEqual(forcedTargets, [child.pid]);
+  assert.equal(child.exited, true);
+});
+
+test('does not terminate an owned browser process that already exited', async t => {
+  const port = await getAvailablePort();
+  const config = { ...baseConfiguration, cdpPort: port };
+  const { server, start } = createCdpServer();
+  t.after(async () => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
+  const child = new FakeProcess();
+  const browser = browserMock();
+  let closeRequests = 0;
+  let forcedTerminations = 0;
+  let processScans = 0;
+  const session = await launchConfiguredBrowser(config, {
+    platform: 'win32',
+    fileSystem: new FakeFileSystem(),
+    findProfileProcesses: async () => {
+      processScans += 1;
+      return processScans === 1 ? [] : [child.pid];
+    },
+    spawnProcess: () => {
+      void start(port);
+      return child;
+    },
+    connectOverCDP: async () => browser.browser as never,
+    requestProcessClose: async () => {
+      closeRequests += 1;
+    },
+    terminateProcessTree: async () => {
+      forcedTerminations += 1;
+    },
+  });
+  child.exit();
+
+  await session.terminateOwnedBrowser?.();
+
+  assert.equal(closeRequests, 0);
+  assert.equal(forcedTerminations, 0);
+});
+
 test('navigates an engine page to a verified Messenger conversation', async () => {
   const destination = 'https://www.facebook.com/messages/t/987654321';
   const page = new StartupPage('no-pin');

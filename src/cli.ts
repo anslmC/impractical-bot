@@ -31,6 +31,12 @@ import {
   type BrowserLaunchSession,
 } from './browser/launch.js';
 import {
+  createBrowserSessionGuard,
+  formatBrowserSessionIntervention,
+  type BrowserSessionGuard,
+  type BrowserSessionInterventionReason,
+} from './browser/session-guard.js';
+import {
   discoverBrowsers,
   validateBrowserExecutablePath,
   type BrowserCandidate,
@@ -93,7 +99,11 @@ import {
   type RuntimeStatusResult,
   type RuntimeStopResult,
 } from './runtime-control.js';
-import { CLI_COMMANDS, formatCliCommand } from './cli-commands.js';
+import {
+  CLI_HELP_DEFAULT_COLUMNS,
+  CLI_HELP_MINIMUM_COLUMNS,
+  formatCliHelp,
+} from './cli-help.js';
 import {
   captureConsoleOutput,
   checkDashboardTerminal,
@@ -129,6 +139,7 @@ export interface CliRuntimeOptions {
   extractGroupRoster?: typeof extractGroupRoster;
   createContextStore?: typeof createContextStore;
   startCombustion?: typeof startCombustion;
+  createBrowserSessionGuard?: typeof createBrowserSessionGuard;
   generateNvidiaReply?: typeof generateNvidiaReply;
   composeMessengerReply?: typeof composeMessengerReply;
   waitForShutdown?: () => Promise<void>;
@@ -149,28 +160,38 @@ export interface CliRuntimeOptions {
   startDebugView?: typeof startDebugView;
 }
 
-const commandReference = CLI_COMMANDS
-  .map(command => `  ${formatCliCommand(command)}`)
-  .join('\n');
-
 const composerSlicerCommandReference = [
   '  setcomposerslicer enabled <true|false> [--force]',
   '  setcomposerslicer maxCharacters <positive-integer> [--force]',
   '  setcomposerslicer status',
 ].join('\n');
 
-const usage = `Usage: impbot <command>
+function getHelpColumns(): number {
+  return Math.max(
+    CLI_HELP_MINIMUM_COLUMNS,
+    process.stdout.columns ?? CLI_HELP_DEFAULT_COLUMNS,
+  );
+}
 
-Commands:
-${commandReference}
+function isHelpColorEnabled(): boolean {
+  return process.stdout.isTTY === true &&
+    process.env.NO_COLOR === undefined &&
+    process.env.TERM !== 'dumb';
+}
 
-Composer Slicer:
-${composerSlicerCommandReference}
+function formatHelp(): string {
+  return formatCliHelp({
+    columns: getHelpColumns(),
+    color: isHelpColorEnabled(),
+  });
+}
 
-Options:
-  -h, --help     Show this help
-  -v, --version  Show the version
-  --debug        Start in the debug log view`;
+function formatPlainHelp(): string {
+  return formatCliHelp({
+    columns: getHelpColumns(),
+    color: false,
+  });
+}
 
 function promptTerminal(question: string): Promise<string | null> {
   const terminal = createInterface({ input: stdin, output: stdout });
@@ -1343,7 +1364,7 @@ async function handleStart(
     return 1;
   }
 
-  type ShutdownSource = 'sigint' | 'runtime-control' | 'injected';
+  type ShutdownSource = 'sigint' | 'runtime-control' | 'injected' | 'intervention';
   let resolveShutdown!: (source: ShutdownSource) => void;
   const shutdownRequest = new Promise<ShutdownSource>(resolve => {
     resolveShutdown = resolve;
@@ -1682,6 +1703,16 @@ async function handleStart(
   const startupAbort = new AbortController();
   void shutdownPromise.then(() => startupAbort.abort());
   let session: BrowserLaunchSession | undefined;
+  let sessionGuard: BrowserSessionGuard | undefined;
+  let interventionReason: BrowserSessionInterventionReason | undefined;
+  let interventionReported = false;
+  const reportIntervention = (): void => {
+    if (interventionReason === undefined || interventionReported) {
+      return;
+    }
+    interventionReported = true;
+    writeError(formatBrowserSessionIntervention(interventionReason));
+  };
   let aliasData: ReturnType<typeof generateAliases> | undefined;
   let exitCode = 0;
   let startupStage: 'launch' | 'prepare' | 'cranking' | 'combustion' = 'launch';
@@ -2041,6 +2072,24 @@ async function handleStart(
           false,
         );
         try {
+          try {
+            sessionGuard = await (runtime.createBrowserSessionGuard ?? createBrowserSessionGuard)({
+              page: preparationResult.page,
+              onIntervention: intervention => {
+                if (interventionReason !== undefined) {
+                  return;
+                }
+                interventionReason = intervention.reason;
+                resolveShutdown('intervention');
+              },
+            });
+          } catch (error) {
+            throw new Error(
+              'Unable to start the browser session guard: ' +
+              `${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          const guard = sessionGuard;
           combustionController = await (runtime.startCombustion ?? startCombustion)({
             page: preparationResult.page,
             contextStore,
@@ -2049,6 +2098,9 @@ async function handleStart(
             apiKey,
             debugMode: DEBUG_MODE,
             roster: groupRoster,
+            runAutomatedAction: (operation, options) =>
+              guard.runAutomated(operation, options),
+            isSessionInterrupted: () => guard.isInterrupted(),
           });
         } finally {
           stopStartupActivity();
@@ -2088,7 +2140,9 @@ async function handleStart(
             ? outcome.result
             : await waitForEngine();
         }
-        if (typeof runtimeResult === 'object' && runtimeResult.type === 'shutdown') {
+        if (interventionReason !== undefined) {
+          exitCode = 1;
+        } else if (typeof runtimeResult === 'object' && runtimeResult.type === 'shutdown') {
           writeOutput(formatTerminalText('Shutdown requested; disconnecting Playwright.', 'bold'));
           exitCode = runtimeResult.source === 'runtime-control' ? 0 : 130;
         } else if (runtimeResult === 'combustion-stopped') {
@@ -2127,6 +2181,7 @@ async function handleStart(
   } finally {
     process.removeListener('SIGINT', onSigint);
     stopStartupActivity();
+    startupViewActive = false;
     restoreStartupCapture();
     const viewToClose = activeView ?? dashboardSession ?? debugSession;
     if (viewToClose !== undefined) {
@@ -2147,7 +2202,15 @@ async function handleStart(
     }
     restoreViewCapture();
     restoreHandoff();
+    reportIntervention();
     runtimeControl.setState('stopping');
+    if (sessionGuard) {
+      try {
+        await sessionGuard.dispose();
+      } catch {
+      }
+      sessionGuard = undefined;
+    }
     if (combustionController) {
       try {
         await combustionController.stop();
@@ -2163,11 +2226,23 @@ async function handleStart(
         writeError(`Unable to disconnect Playwright: ${error instanceof Error ? error.message : String(error)}`);
         exitCode = 1;
       }
-      try {
-        await (runtime.closeBrowser ?? closeConfiguredBrowser)(configurationResult.configuration);
-      } catch (error) {
-        writeError(`Unable to close the configured browser: ${error instanceof Error ? error.message : String(error)}`);
-        exitCode = 1;
+      if (session.terminateOwnedBrowser !== undefined) {
+        try {
+          await session.terminateOwnedBrowser();
+        } catch (error) {
+          writeError(
+            'Unable to terminate the owned browser process: ' +
+            `${error instanceof Error ? error.message : String(error)}`,
+          );
+          exitCode = 1;
+        }
+      } else {
+        try {
+          await (runtime.closeBrowser ?? closeConfiguredBrowser)(configurationResult.configuration);
+        } catch (error) {
+          writeError(`Unable to close the configured browser: ${error instanceof Error ? error.message : String(error)}`);
+          exitCode = 1;
+        }
       }
     }
     runtimeControl.complete(exitCode);
@@ -2326,7 +2401,7 @@ export async function runCli(
   const [command, ...remainingArgs] = args;
 
   if (args.length === 0 || args.length === 1 && (command === '--help' || command === '-h')) {
-    writeOutput(usage);
+    writeOutput(formatHelp());
     return 0;
   }
 
@@ -2339,7 +2414,7 @@ export async function runCli(
   const acceptsArguments = command === 'setcomposerslicer';
   const unexpectedArgs = debug ? remainingArgs.slice(1) : remainingArgs;
   if (!acceptsArguments && unexpectedArgs.length > 0) {
-    writeError(`Error: unexpected argument '${unexpectedArgs[0]}'.\n\n${usage}`);
+    writeError(`Error: unexpected argument '${unexpectedArgs[0]}'.\n\n${formatPlainHelp()}`);
     return 1;
   }
 
@@ -2391,7 +2466,7 @@ export async function runCli(
   const handler = command ? handlers[command] : undefined;
 
   if (!handler) {
-    writeError(`Error: unknown command '${command}'.\n\n${usage}`);
+    writeError(`Error: unknown command '${command}'.\n\n${formatPlainHelp()}`);
     return 1;
   }
 

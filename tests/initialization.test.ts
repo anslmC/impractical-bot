@@ -11,7 +11,12 @@ import {
   promptMultilinePersonality,
   promptPinRestorationSettings,
 } from '../src/browser/initialization.js';
-import { loadConfiguration, saveConfiguration, type Configuration } from '../src/config/configuration.js';
+import {
+  loadConfiguration,
+  resolveComposerSlicer,
+  saveConfiguration,
+  type Configuration,
+} from '../src/config/configuration.js';
 
 const environment: NodeJS.ProcessEnv = {
   LOCALAPPDATA: 'C:\\Users\\test\\AppData\\Local',
@@ -238,6 +243,53 @@ test('initial setup asks for bot temperament then personality and defaults both'
   if (loaded.status === 'valid') {
     assert.equal(loaded.configuration.botTemperament, 'balanced');
     assert.equal(loaded.configuration.botPersonality, 'default');
+  }
+});
+
+test('fresh configuration uses the 100-character composer slicer default', async context => {
+  const filePath = createConfigurationPath(context);
+  const options = createOptions(filePath, {
+    installedPaths: [bravePath],
+    answers: ['y', 'https://example.test/messages', 'yes', '', ''],
+  });
+
+  assert.equal(await initializeConfiguration(options), 'saved');
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.equal(loaded.configuration.composerSlicer, undefined);
+    assert.deepEqual(resolveComposerSlicer(loaded.configuration), {
+      enabled: true,
+      maxCharacters: 100,
+    });
+  }
+});
+
+test('startup preserves an explicitly configured composer slicer while backfilling defaults', async context => {
+  const filePath = createConfigurationPath(context);
+  const configured = {
+    ...existingConfiguration,
+    composerSlicer: { enabled: false, maxCharacters: 750 },
+  };
+  const legacyConfiguration: Record<string, unknown> = { ...configured };
+  delete legacyConfiguration.cdpPort;
+  delete legacyConfiguration.startupUrl;
+  writeFileSync(filePath, JSON.stringify(legacyConfiguration));
+
+  assert.equal(await initializeConfiguration(createOptions(filePath, {
+    installedPaths: [bravePath],
+  })), 'saved');
+  const loaded = loadConfiguration(filePath);
+  assert.equal(loaded.status, 'valid');
+  if (loaded.status === 'valid') {
+    assert.deepEqual(loaded.configuration.composerSlicer, {
+      enabled: false,
+      maxCharacters: 750,
+    });
+    assert.deepEqual(resolveComposerSlicer(loaded.configuration), {
+      enabled: false,
+      maxCharacters: 750,
+    });
   }
 });
 

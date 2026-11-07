@@ -22,7 +22,7 @@ export const DEFAULT_BOT_PERSONALITY_MODE = 'default' as const;
 
 export const MAX_PERSONALITY_INSTRUCTION_CHARS = 4000;
 
-export const DEFAULT_COMPOSER_SLICER_MAX_CHARACTERS = 200;
+export const DEFAULT_COMPOSER_SLICER_MAX_CHARACTERS = 100;
 
 export interface ComposerSlicerSettings {
   enabled: boolean;

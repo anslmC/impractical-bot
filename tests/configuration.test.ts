@@ -435,8 +435,8 @@ test('composer slicer settings resolve from defaults and persist only when confi
 
   const validated = validateConfiguration(legacyConfiguration);
   assert.equal(validated.composerSlicer, undefined, 'defaults are not baked into the configuration');
-  assert.deepEqual(DEFAULT_COMPOSER_SLICER, { enabled: true, maxCharacters: 200 });
-  assert.deepEqual(resolveComposerSlicer(validated), { enabled: true, maxCharacters: 200 });
+  assert.deepEqual(DEFAULT_COMPOSER_SLICER, { enabled: true, maxCharacters: 100 });
+  assert.deepEqual(resolveComposerSlicer(validated), { enabled: true, maxCharacters: 100 });
 
   const filePath = createTemporaryConfigPath(context);
   writeFileSync(filePath, JSON.stringify(legacyConfiguration));
@@ -446,7 +446,7 @@ test('composer slicer settings resolve from defaults and persist only when confi
     assert.equal(loaded.configuration.composerSlicer, undefined);
     assert.deepEqual(resolveComposerSlicer(loaded.configuration), {
       enabled: true,
-      maxCharacters: 200,
+      maxCharacters: 100,
     });
   }
 
@@ -479,7 +479,7 @@ test('composer slicer settings resolve from defaults and persist only when confi
   });
   assert.deepEqual(resolveComposerSlicer(enabledOnly), {
     enabled: false,
-    maxCharacters: 200,
+    maxCharacters: 100,
   });
 
   saveConfiguration(configured, filePath);

@@ -26,6 +26,7 @@ import {
 import type { BackreadMessage } from './backread.js';
 import {
   composeMessengerReply,
+  type AutomatedInputRunner,
   type ReplyCompositionResult,
 } from './composer.js';
 import { sliceComposerMessage } from './composer-slicer.js';
@@ -216,6 +217,11 @@ export interface CombustionOptions {
   roster?: GroupRoster;
   extractGroupRoster?: typeof extractGroupRoster;
   navigateDestination?: (destination: string) => Promise<void>;
+  runAutomatedAction?: <T>(
+    operation: () => Promise<T>,
+    options?: { navigation?: boolean },
+  ) => Promise<T>;
+  isSessionInterrupted?: () => boolean;
 }
 
 export type DestinationChangeResult =
@@ -575,10 +581,18 @@ export async function startCombustion({
   roster,
   extractGroupRoster: extractRoster,
   navigateDestination,
+  runAutomatedAction,
+  isSessionInterrupted,
 }: CombustionOptions): Promise<CombustionController> {
   const pauseGate = createPauseGate();
   const navigateToDestination = navigateDestination ?? ((destination: string) =>
     navigatePageToMessengerDestination(page, configuration, destination));
+  const runAutomated = runAutomatedAction ??
+    (<T>(operation: () => Promise<T>): Promise<T> => operation());
+  const runAutomatedInput: AutomatedInputRunner = operation => runAutomated(operation);
+  const runAutomatedNavigation = (destination: string): Promise<void> =>
+    runAutomated(() => navigateToDestination(destination), { navigation: true });
+  const isInterrupted = (): boolean => isSessionInterrupted?.() === true;
   const rosterExtractor = extractRoster ?? extractGroupRoster;
   const shouldRefreshRoster = roster !== undefined || extractRoster !== undefined;
   let groupRoster = roster ? sanitizeGroupRoster(roster) : undefined;
@@ -1227,7 +1241,7 @@ export async function startCombustion({
     startRngCooldown();
   };
   const waitForInterChunkDelay = (): Promise<void> => new Promise(resolve => {
-    if (stopRequested || pauseGate.isCancelled()) {
+    if (stopRequested || pauseGate.isCancelled() || isInterrupted()) {
       resolve();
       return;
     }
@@ -1955,7 +1969,7 @@ export async function startCombustion({
       return 'No previous destination was available for rollback.';
     }
     try {
-      await navigateToDestination(previousDestination);
+      await runAutomatedNavigation(previousDestination);
       if (stopRequested) {
         throw new Error('The engine stopped during rollback navigation.');
       }
@@ -1987,7 +2001,9 @@ export async function startCombustion({
       return undefined;
     }
     const roster = sanitizeGroupRoster(
-      await rosterExtractor(page, configuration.puppetName ?? ''),
+      await rosterExtractor(page, configuration.puppetName ?? '', {
+        runAutomatedAction: runAutomatedInput,
+      }),
     );
     if (roster.status === 'unavailable') {
       throw new Error(roster.reason ?? 'group roster extraction failed');
@@ -2032,7 +2048,7 @@ export async function startCombustion({
       packetScheduler?.discardPending();
 
       try {
-        await navigateToDestination(destination);
+        await runAutomatedNavigation(destination);
       } catch (error) {
         const reason = describeError(error);
         console.error(`[engine] Destination change rejected: ${reason}`);
@@ -2518,6 +2534,7 @@ export async function startCombustion({
               chunk,
               {
                 ...(index === 0 ? options : {}),
+                runAutomatedInput,
                 ...(slicer.enabled ? { maxCharacters: slicer.maxCharacters } : {}),
               },
             );
@@ -2544,7 +2561,7 @@ export async function startCombustion({
             }
             if (index + 1 < chunks.length) {
               await waitForInterChunkDelay();
-              if (stopRequested || pauseGate.isCancelled()) {
+              if (stopRequested || pauseGate.isCancelled() || isInterrupted()) {
                 throw new Error('Composer delivery was cancelled during the inter-chunk delay.');
               }
             }
@@ -2568,7 +2585,8 @@ export async function startCombustion({
         }
       },
       pauseGate,
-      isCurrent: packet => packetEpochs.get(packet) === destinationEpoch,
+      isCurrent: packet =>
+        packetEpochs.get(packet) === destinationEpoch && !isInterrupted(),
       isStale: packet => isPacketStale(packet as ScheduledPacket),
       debugMode,
     });

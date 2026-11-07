@@ -12,6 +12,10 @@ import { NvidiaApiKeyError } from '../src/ai/nvidia.js';
 import type { BrowserLaunchSession } from '../src/browser/launch.js';
 import type { GroupRoster } from '../src/browser/group-roster.js';
 import {
+  formatBrowserSessionIntervention,
+  type BrowserSessionGuard,
+} from '../src/browser/session-guard.js';
+import {
   DEFAULT_COMPOSER_SLICER,
   MAX_PERSONALITY_INSTRUCTION_CHARS,
   loadConfiguration,
@@ -57,6 +61,8 @@ async function captureCli(
     checkBrowserStartup: runtime?.checkBrowserStartup ?? (async () => undefined),
     closeBrowser: runtime?.closeBrowser ?? (async () => undefined),
     startCombustion: runtime?.startCombustion ?? (async () => createTestCombustionController()),
+    createBrowserSessionGuard: runtime?.createBrowserSessionGuard ??
+      (async () => createTestBrowserSessionGuard()),
   };
   const exitCode = await runCli(
     args,
@@ -71,6 +77,20 @@ async function captureCli(
     testRuntime,
   );
   return { exitCode, output, errors };
+}
+
+function createTestBrowserSessionGuard(onDispose?: () => void): BrowserSessionGuard {
+  return {
+    interrupted: false,
+    intervention: null,
+    isInterrupted: () => false,
+    async runAutomated<T>(operation: () => Promise<T>): Promise<T> {
+      return await operation();
+    },
+    async dispose() {
+      onDispose?.();
+    },
+  };
 }
 
 function createTestCombustionController(
@@ -465,6 +485,204 @@ test('start prepares the destination, remains alive after readiness, and closes 
   if (savedConfiguration.status === 'valid') {
     assert.equal(savedConfiguration.configuration.puppetName, 'Test Puppet');
   }
+});
+
+test('start reports a browser session intervention and exits with a controlled failure', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const shutdown = deferred<void>();
+  let triggerIntervention: (() => void) | undefined;
+  let guardDisposed = false;
+  let combustionStopped = false;
+  let disconnects = 0;
+  let browserCloses = 0;
+  let ownedTerminations = 0;
+
+  const start = captureCli(
+    ['start'],
+    configurationFilePath,
+    undefined,
+    undefined,
+    {
+      validateNvidiaApiKey: async () => undefined,
+      launchBrowser: async () => ({
+        endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+        browserVersion: 'Brave Chromium test',
+        disconnected: new Promise<void>(() => undefined),
+        async prepare() {
+          return stubPage;
+        },
+        async disconnect() {
+          disconnects += 1;
+        },
+        async terminateOwnedBrowser() {
+          ownedTerminations += 1;
+        },
+      }),
+      readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+      startCombustion: async () => createTestCombustionController(() => {
+        combustionStopped = true;
+      }),
+      createBrowserSessionGuard: async options => {
+        triggerIntervention = () => options.onIntervention({ reason: 'manual-mouse' });
+        return createTestBrowserSessionGuard(() => {
+          guardDisposed = true;
+        });
+      },
+      closeBrowser: async () => {
+        browserCloses += 1;
+      },
+      waitForShutdown: () => shutdown.promise,
+    },
+    message => {
+      if (message.includes('Engine ready')) ready.resolve();
+    },
+  );
+
+  await ready.promise;
+  assert.ok(triggerIntervention !== undefined);
+  triggerIntervention();
+  triggerIntervention();
+  const result = await start;
+
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(result.errors, [
+    formatBrowserSessionIntervention('manual-mouse'),
+  ]);
+  assert.equal(
+    result.output.some(message => message.includes('Shutdown requested; disconnecting Playwright.')),
+    false,
+  );
+  assert.equal(guardDisposed, true);
+  assert.equal(combustionStopped, true);
+  assert.equal(disconnects, 1);
+  assert.equal(ownedTerminations, 1);
+  assert.equal(browserCloses, 0);
+});
+
+test('normal shutdown terminates an owned browser process without using the fallback closer', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  let disconnects = 0;
+  let ownedTerminations = 0;
+  let browserCloses = 0;
+  let combustionStops = 0;
+
+  const start = captureCli(
+    ['start'],
+    configurationFilePath,
+    undefined,
+    undefined,
+    {
+      validateNvidiaApiKey: async () => undefined,
+      launchBrowser: async () => ({
+        endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+        browserVersion: 'Brave Chromium test',
+        disconnected: new Promise<void>(() => undefined),
+        async prepare() {
+          return stubPage;
+        },
+        async disconnect() {
+          disconnects += 1;
+        },
+        async terminateOwnedBrowser() {
+          ownedTerminations += 1;
+        },
+      }),
+      closeBrowser: async () => {
+        browserCloses += 1;
+      },
+      readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+      startCombustion: async () => createTestCombustionController(() => {
+        combustionStops += 1;
+      }),
+      waitForShutdown: () => new Promise<void>(() => undefined),
+    },
+    message => {
+      if (message.includes('Engine ready')) ready.resolve();
+    },
+  );
+
+  await ready.promise;
+  process.emit('SIGINT');
+  const result = await start;
+
+  assert.equal(result.exitCode, 130);
+  assert.equal(disconnects, 1);
+  assert.equal(ownedTerminations, 1);
+  assert.equal(browserCloses, 0);
+  assert.equal(combustionStops, 1);
+});
+
+test('intervention reason remains visible after the dashboard shuts down', async context => {
+  const configurationFilePath = createTemporaryConfigPath(context);
+  saveConfiguration(validConfiguration, configurationFilePath);
+  saveApplicationApiKey(configurationFilePath);
+  const ready = deferred<void>();
+  const dashboardStarted = deferred<void>();
+  const shutdown = deferred<void>();
+  let triggerIntervention: (() => void) | undefined;
+  let dashboardCloses = 0;
+
+  const start = captureCli(
+    ['start'],
+    configurationFilePath,
+    undefined,
+    undefined,
+    {
+      checkDashboardTerminal: () => ({ ok: true }),
+      validateNvidiaApiKey: async () => undefined,
+      launchBrowser: async () => ({
+        endpoint: 'ws://127.0.0.1:9222/devtools/browser/test',
+        browserVersion: 'Brave Chromium test',
+        disconnected: new Promise<void>(() => undefined),
+        async prepare() {
+          return stubPage;
+        },
+        async disconnect() {
+          return undefined;
+        },
+      }),
+      readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
+      startCombustion: async () => createTestCombustionController(),
+      createBrowserSessionGuard: async options => {
+        triggerIntervention = () => options.onIntervention({ reason: 'manual-keyboard' });
+        return createTestBrowserSessionGuard();
+      },
+      startDashboard: async () => {
+        dashboardStarted.resolve();
+        return {
+          closed: new Promise<void>(() => undefined),
+          async close() {
+            dashboardCloses += 1;
+          },
+          async refresh() {
+            return undefined;
+          },
+        };
+      },
+      waitForShutdown: () => shutdown.promise,
+    },
+    message => {
+      if (message.includes('Engine ready')) ready.resolve();
+    },
+  );
+
+  await ready.promise;
+  await dashboardStarted.promise;
+  assert.ok(triggerIntervention !== undefined);
+  triggerIntervention();
+  const result = await start;
+
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(result.errors, [
+    formatBrowserSessionIntervention('manual-keyboard'),
+  ]);
+  assert.equal(dashboardCloses, 1);
 });
 
 test('start rejects a conflicting browser profile before NVIDIA validation', async context => {
@@ -4241,7 +4459,16 @@ test('help options and no command display usage', async () => {
     const result = await captureCli(args);
 
     assert.equal(result.exitCode, 0);
-    assert.match(result.output[0], /Usage: impbot <command>/);
+    assert.match(result.output[0], /[█▀▄▌▐]/);
+    assert.match(result.output[0], /MESSENGER CONVERSATION ENGINE/);
+    assert.doesNotMatch(result.output[0], /IMPractical BOT/);
+    assert.doesNotMatch(result.output[0], /IMPRACTICAL BOT/);
+    assert.match(result.output[0], /^\s*Usage$/m);
+    assert.match(result.output[0], /^\s*impbot <command>$/m);
+    assert.match(result.output[0], /^\s*Commands$/m);
+    assert.match(result.output[0], /^\s*Composer Slicer$/m);
+    assert.match(result.output[0], /^\s*Options$/m);
+    assert.doesNotMatch(result.output[0], /\u001b\[/);
     assert.match(result.output[0], /init\s+Initialize Impractical Bot/);
     assert.match(result.output[0], /config\s+Configure Impractical Bot/);
     assert.match(result.output[0], /changebrowser\s+Change the configured browser/);
@@ -4282,7 +4509,7 @@ test('unknown commands and unexpected arguments fail with a usage hint', async (
     assert.equal(result.exitCode, 1);
     assert.deepEqual(result.output, []);
     assert.match(result.errors[0], /^Error: /);
-    assert.match(result.errors[0], /Usage: impbot <command>/);
+    assert.match(result.errors[0], /Usage\n\s+impbot <command>/);
   }
 });
 
@@ -4293,7 +4520,7 @@ test('removed dashboard flags and attach command are rejected', async context =>
 
     assert.equal(result.exitCode, 1);
     assert.deepEqual(result.output, []);
-    assert.match(result.errors[0], /Usage: impbot <command>/);
+    assert.match(result.errors[0], /Usage\n\s+impbot <command>/);
     assert.doesNotMatch(result.output.join('\n'), /--tui/);
   }
 });
@@ -5224,6 +5451,7 @@ test('startup output never bypasses console capture for the default writers', as
         }),
         readMessengerMessages: async () => ({ diagnostics: [], messages: [] }),
         startCombustion: async () => createTestCombustionController(),
+        createBrowserSessionGuard: async () => createTestBrowserSessionGuard(),
         waitForShutdown: () => shutdown.promise,
         startDebugView: async options => {
           assert.ok(options?.logBuffer);

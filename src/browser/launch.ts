@@ -52,6 +52,8 @@ export interface BrowserLaunchOptions {
   ) => Promise<Browser>;
   findProfileProcesses?: ProfileProcessFinder;
   requestProcessClose?: (processIds: number[]) => Promise<void>;
+  terminateProcessTree?: (processId: number) => Promise<void>;
+  shutdownTimeoutMs?: number;
   now?: () => number;
   delay?: (milliseconds: number) => Promise<void>;
 }
@@ -91,6 +93,8 @@ export interface BrowserLaunchSession {
   prepare(options?: { signal?: AbortSignal }): Promise<Page>;
   isWindowMinimized?(page: Page): Promise<boolean | undefined>;
   disconnect(): Promise<void>;
+  terminateOwnedBrowser?(): Promise<void>;
+  readonly ownedProcessId?: number;
 }
 
 interface ChildState {
@@ -244,6 +248,110 @@ if (-not $requested) { throw 'No dedicated browser window accepted a graceful cl
         : resolve(),
     );
   });
+}
+
+function forceTerminateWindowsProcessTree(processId: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      'taskkill',
+      ['/PID', String(processId), '/T', '/F'],
+      { windowsHide: true },
+      error => {
+        if (!error) {
+          resolve();
+          return;
+        }
+        try {
+          process.kill(processId, 0);
+        } catch (livenessError) {
+          if ((livenessError as NodeJS.ErrnoException).code === 'ESRCH') {
+            resolve();
+            return;
+          }
+        }
+        reject(new Error(`Unable to terminate the owned browser process tree ${processId}.`, {
+          cause: error,
+        }));
+      },
+    );
+  });
+}
+
+function waitForOwnedProcessExit(
+  childState: ChildState,
+  timeoutMs: number,
+  pollIntervalMs: number,
+  now: () => number,
+  delay: (milliseconds: number) => Promise<void>,
+): Promise<boolean> {
+  if (childState.exited) {
+    return Promise.resolve(true);
+  }
+  const deadline = now() + timeoutMs;
+  return (async () => {
+    while (!childState.exited && now() < deadline) {
+      const remaining = deadline - now();
+      if (remaining <= 0) {
+        break;
+      }
+      await delay(Math.min(pollIntervalMs, remaining));
+    }
+    return childState.exited;
+  })();
+}
+
+async function terminateOwnedBrowserProcess(
+  child: BrowserProcessHandle,
+  childState: ChildState,
+  options: BrowserLaunchOptions,
+): Promise<void> {
+  if (child.pid === undefined || childState.exited) {
+    return;
+  }
+
+  const processId = child.pid;
+  const shutdownTimeoutMs = options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
+  const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+  const now = options.now ?? Date.now;
+  const delay = options.delay ?? defaultDelay;
+  const requestProcessClose = options.requestProcessClose ?? requestWindowsProcessClose;
+  const terminateProcessTree = options.terminateProcessTree ?? forceTerminateWindowsProcessTree;
+
+  let gracefulRequestSucceeded = false;
+  try {
+    await requestProcessClose([processId]);
+    gracefulRequestSucceeded = true;
+  } catch {
+  }
+
+  if (gracefulRequestSucceeded &&
+      await waitForOwnedProcessExit(
+        childState,
+        shutdownTimeoutMs,
+        pollIntervalMs,
+        now,
+        delay,
+      )) {
+    return;
+  }
+  if (childState.exited) {
+    return;
+  }
+
+  await terminateProcessTree(processId);
+  if (await waitForOwnedProcessExit(
+    childState,
+    shutdownTimeoutMs,
+    pollIntervalMs,
+    now,
+    delay,
+  )) {
+    return;
+  }
+
+  throw new Error(
+    `Timed out waiting for the owned browser process ${processId} to exit after forced termination.`,
+  );
 }
 
 export async function closeConfiguredBrowser(
@@ -1242,6 +1350,10 @@ async function createBrowserLaunchSession(
   options: BrowserLaunchOptions,
   reusedExistingBrowser: boolean,
   verifyOwnership?: () => void | Promise<void>,
+  ownedProcess?: {
+    processId: number;
+    terminate: () => Promise<void>;
+  },
 ): Promise<BrowserLaunchSession> {
   try {
     if (!browser.isConnected()) {
@@ -1259,11 +1371,13 @@ async function createBrowserLaunchSession(
     }
 
     let disconnectPromise: Promise<void> | undefined;
+    let terminatePromise: Promise<void> | undefined;
     return {
       endpoint,
       browserVersion,
       disconnected,
       reusedExistingBrowser,
+      ...(ownedProcess === undefined ? {} : { ownedProcessId: ownedProcess.processId }),
       prepare(prepareOptions) {
         if (!browser.isConnected()) {
           return Promise.reject(new Error('The configured browser disconnected before startup preparation.'));
@@ -1286,6 +1400,12 @@ async function createBrowserLaunchSession(
         disconnectPromise ??= browser.isConnected() ? browser.close() : Promise.resolve();
         return disconnectPromise;
       },
+      ...(ownedProcess === undefined ? {} : {
+        terminateOwnedBrowser() {
+          terminatePromise ??= ownedProcess.terminate();
+          return terminatePromise;
+        },
+      }),
     };
   } catch (error) {
     if (browser.isConnected()) {
@@ -1416,8 +1536,10 @@ export async function launchConfiguredBrowser(
   const startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const connectionTimeoutMs = options.connectionTimeoutMs ?? DEFAULT_CONNECTION_TIMEOUT_MS;
-  if (startupTimeoutMs <= 0 || pollIntervalMs <= 0 || connectionTimeoutMs <= 0) {
-    throw new Error('Browser startup, polling, and connection timeouts must be positive.');
+  const shutdownTimeoutMs = options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
+  if (startupTimeoutMs <= 0 || pollIntervalMs <= 0 || connectionTimeoutMs <= 0 ||
+      shutdownTimeoutMs <= 0) {
+    throw new Error('Browser startup, polling, connection, and shutdown timeouts must be positive.');
   }
 
   const getProfileProcesses = options.findProfileProcesses ?? findProfileProcesses;
@@ -1505,6 +1627,10 @@ export async function launchConfiguredBrowser(
         if (childState.exited) {
           throw new Error('Playwright CDP connection verification failed.');
         }
+      },
+      {
+        processId: child.pid,
+        terminate: () => terminateOwnedBrowserProcess(child, childState, options),
       },
     );
   } catch (error) {

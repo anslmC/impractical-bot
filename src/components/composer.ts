@@ -53,16 +53,20 @@ function describeError(error: unknown): string {
     : String(error);
 }
 
+export type AutomatedInputRunner = <T>(operation: () => Promise<T>) => Promise<T>;
+
 export interface ReplyCompositionOptions {
   beforeSend?: () => Promise<void>;
   maxCharacters?: number;
+  runAutomatedInput?: AutomatedInputRunner;
 }
 
 export async function composeMessengerReply(
   page: Page,
   reply: string,
-  { beforeSend, maxCharacters }: ReplyCompositionOptions = {},
+  { beforeSend, maxCharacters, runAutomatedInput }: ReplyCompositionOptions = {},
 ): Promise<ReplyCompositionResult> {
+  const runAutomated = runAutomatedInput ?? (<T>(operation: () => Promise<T>) => operation());
   if (maxCharacters !== undefined) {
     if (!Number.isInteger(maxCharacters) || maxCharacters < 1) {
       throw new RangeError('maxCharacters must be a positive integer.');
@@ -135,7 +139,7 @@ export async function composeMessengerReply(
     ),
   );
   try {
-    await composer.fill(reply);
+    await runAutomated(() => composer.fill(reply));
   } catch (error) {
     console.log(
       `${formatComposeLog('fill-failed', 'red')}\n  ` +
@@ -200,7 +204,7 @@ export async function composeMessengerReply(
     }
   }
   try {
-    await sendButtons.click();
+    await runAutomated(() => sendButtons.click());
   } catch (error) {
     console.log(
       `${formatComposeLog('click-failed', 'red')}\n  ` +
