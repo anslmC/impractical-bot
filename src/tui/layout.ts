@@ -21,6 +21,7 @@ import {
   type DashboardTone,
   type StyledSegment,
 } from './theme.js';
+import { resolveLogScrollState, type LogScrollState } from './scroll.js';
 import {
   renderPlainWordmark,
   renderWordmarkForWidth,
@@ -57,7 +58,25 @@ export interface DashboardDimensions {
 
 export interface DashboardRenderOptions {
   color?: boolean;
+  scrollOffset?: number;
+  unseenCount?: number;
 }
+
+export type DashboardLogScrollState = LogScrollState;
+
+export interface DashboardFrame {
+  readonly lines: string[];
+  readonly state: DashboardLogScrollState;
+}
+
+const EMPTY_SCROLL_STATE: DashboardLogScrollState = {
+  offset: 0,
+  maximumOffset: 0,
+  visibleLines: 0,
+  totalLines: 0,
+  unseenCount: 0,
+  pinned: true,
+};
 
 export const DASHBOARD_UNKNOWN_VALUE = 'Unknown';
 export const DASHBOARD_EMPTY_LOGS_MESSAGE = 'Waiting for engine output...';
@@ -376,6 +395,7 @@ function footerLines(
   view: DashboardView,
   width: number,
   color: boolean,
+  scrollState?: DashboardLogScrollState,
 ): string[] {
   if (view.prompt !== undefined) {
     return promptFooterLines(view.prompt, width, color);
@@ -393,37 +413,80 @@ function footerLines(
       },
     );
   }
+  const scrollGap = width >= 96 ? '   ' : ' ';
+  if (scrollState !== undefined && !scrollState.pinned) {
+    segments.push(
+      { text: scrollGap },
+      { text: '● SCROLLBACK', tone: 'warning' },
+    );
+    if (scrollState.unseenCount > 0) {
+      segments.push({
+        text: `${scrollGap}${scrollState.unseenCount} new ` +
+          `${scrollState.unseenCount === 1 ? 'entry' : 'entries'}`,
+        tone: 'warning',
+      });
+    }
+  }
+  if (scrollState !== undefined && scrollState.maximumOffset > 0) {
+    segments.push(
+      { text: scrollGap },
+      { text: '[PgUp/PgDn]', tone: 'brandSoft' },
+      { text: ' Scroll', tone: 'value' },
+      { text: scrollGap },
+      { text: '[L]', tone: 'brandSoft' },
+      { text: ' Latest', tone: scrollState.pinned ? 'value' : 'warning' },
+    );
+  }
   return [renderLine(segments, width, color)];
 }
 
-function renderLogLines(
+function dashboardLogLines(
   entries: readonly DashboardLogEntry[],
   width: number,
-  capacity: number,
   color: boolean,
 ): string[] {
-  if (capacity <= 0) {
-    return [];
-  }
   const categoryWidth = Math.min(
     8,
-    entries.slice(-capacity).reduce(
+    entries.reduce(
       (maximum, entry) =>
         Math.max(maximum, dashboardLogCategory(entry.message)?.chip.length ?? 0),
       0,
     ),
   );
-  const lines = entries.length === 0
-    ? [renderLine([{ text: DASHBOARD_EMPTY_LOGS_MESSAGE, tone: 'muted' }], width, color)]
-    : formatDashboardLogEntries(entries, width, { color, categoryWidth })
-      .map(line => padVisible(line, width));
-  const bounded = lines.length > capacity
-    ? lines.slice(lines.length - capacity)
-    : lines;
-  while (bounded.length < capacity) {
-    bounded.push(' '.repeat(width));
+  if (entries.length === 0) {
+    return [renderLine([{ text: DASHBOARD_EMPTY_LOGS_MESSAGE, tone: 'muted' }], width, color)];
   }
-  return bounded;
+  return formatDashboardLogEntries(entries, width, { color, categoryWidth });
+}
+
+interface LogWindow {
+  readonly lines: string[];
+  readonly state: DashboardLogScrollState;
+}
+
+function windowLogLines(
+  allLines: readonly string[],
+  width: number,
+  capacity: number,
+  scrollOffset: number,
+  unseenCount: number,
+): LogWindow {
+  const state = resolveLogScrollState(
+    allLines.length,
+    capacity,
+    scrollOffset,
+    unseenCount,
+  );
+  if (capacity <= 0) {
+    return { lines: [], state };
+  }
+  const end = allLines.length - state.offset;
+  const start = Math.max(0, end - capacity);
+  const visible = allLines.slice(start, end).map(line => padVisible(line, width));
+  while (visible.length < capacity) {
+    visible.push(' '.repeat(width));
+  }
+  return { lines: visible, state };
 }
 
 interface ChromeLevel {
@@ -463,14 +526,16 @@ function fitBody(lines: string[], available: number): string[] {
   return [...lines.slice(0, available - 1), lines[lines.length - 1]];
 }
 
-function bodyLines(
+function bodyFrame(
   view: DashboardView,
   width: number,
   available: number,
   color: boolean,
-): string[] {
+  scrollOffset: number,
+  unseenCount: number,
+): DashboardFrame {
   if (available <= 0) {
-    return [];
+    return { lines: [], state: EMPTY_SCROLL_STATE };
   }
   const appearance = statusAppearance(view);
   const engineHeading = engineStatusRule(appearance.label, appearance.tone, width, color);
@@ -479,6 +544,7 @@ function bodyLines(
     ...renderFields([destinationField(view)], width, color),
   ];
   const entries = view.logs ?? [];
+  const allLogLines = dashboardLogLines(entries, width, color);
   const logsHeading = sectionRule(
     'LIVE LOGS',
     entries.length > 0 ? String(entries.length) : 'idle',
@@ -518,11 +584,21 @@ function bodyLines(
       : [...footer];
     const capacity = available - top.length - bottom.length;
     if (capacity >= level.minimumLogs) {
-      return [
-        ...top,
-        ...renderLogLines(entries, width, capacity, color),
-        ...bottom,
-      ];
+      const window = windowLogLines(
+        allLogLines,
+        width,
+        capacity,
+        scrollOffset,
+        unseenCount,
+      );
+      const sizedFooter = footerLines(view, width, color, window.state);
+      const sizedBottom = view.prompt === undefined
+        ? ['', ...sizedFooter]
+        : [...sizedFooter];
+      return {
+        lines: [...top, ...window.lines, ...sizedBottom],
+        state: window.state,
+      };
     }
   }
 
@@ -534,15 +610,20 @@ function bodyLines(
     ...chips,
     ...footer,
   ];
-  return fitBody(fallback, available);
+  return {
+    lines: fitBody(fallback, available),
+    state: resolveLogScrollState(allLogLines.length, 0, 0, 0),
+  };
 }
 
-function plainLines(
+function plainFrame(
   view: DashboardView,
   width: number,
   rows: number,
   color: boolean,
-): string[] {
+  scrollOffset: number,
+  unseenCount: number,
+): DashboardFrame {
   const appearance = statusAppearance(view);
   const footer = footerLines(view, width, color);
   const fixed = [
@@ -552,21 +633,34 @@ function plainLines(
     ...renderFields([destinationField(view)], width, color),
     ...commandChips(view, width, color),
   ];
+  const entries = view.logs ?? [];
+  const allLogLines = dashboardLogLines(entries, width, color);
   const heading = renderLine([{ text: 'LIVE LOGS', tone: 'heading' }], width, color);
   const budget = Math.max(0, rows - footer.length);
   if (fixed.length + 1 > budget) {
-    return [...fixed.slice(0, Math.max(0, budget)), ...footer].slice(0, Math.max(0, rows));
+    return {
+      lines: [...fixed.slice(0, Math.max(0, budget)), ...footer].slice(0, Math.max(0, rows)),
+      state: resolveLogScrollState(allLogLines.length, 0, 0, 0),
+    };
   }
   const capacity = budget - fixed.length - 1;
   if (capacity < 1) {
-    return [...fixed, ...footer].slice(0, Math.max(0, rows));
+    return {
+      lines: [...fixed, ...footer].slice(0, Math.max(0, rows)),
+      state: resolveLogScrollState(allLogLines.length, 0, 0, 0),
+    };
   }
-  return [
-    ...fixed,
-    heading,
-    ...renderLogLines(view.logs ?? [], width, capacity, color),
-    ...footer,
-  ].slice(0, Math.max(0, rows));
+  const window = windowLogLines(allLogLines, width, capacity, scrollOffset, unseenCount);
+  const sizedFooter = footerLines(view, width, color, window.state);
+  return {
+    lines: [
+      ...fixed,
+      heading,
+      ...window.lines,
+      ...sizedFooter,
+    ].slice(0, Math.max(0, rows)),
+    state: window.state,
+  };
 }
 
 export interface DashboardCursorPosition {
@@ -615,23 +709,35 @@ export function getDashboardPromptCursor(
   };
 }
 
+export function renderDashboardFrame(
+  view: DashboardView,
+  dimensions: DashboardDimensions,
+  options: DashboardRenderOptions = {},
+): DashboardFrame {
+  const color = options.color === true;
+  const columns = Math.max(0, Math.floor(dimensions.columns));
+  const rows = Math.max(0, Math.floor(dimensions.rows));
+  if (columns === 0 || rows === 0) {
+    return { lines: [], state: EMPTY_SCROLL_STATE };
+  }
+
+  const scrollOffset = options.scrollOffset ?? 0;
+  const unseenCount = options.unseenCount ?? 0;
+  const frame = columns < 12 || rows < 6
+    ? plainFrame(view, columns, rows, color, scrollOffset, unseenCount)
+    : bodyFrame(view, columns, rows, color, scrollOffset, unseenCount);
+  return {
+    lines: frame.lines.map(line => padVisible(line, columns)),
+    state: frame.state,
+  };
+}
+
 export function renderDashboardLines(
   view: DashboardView,
   dimensions: DashboardDimensions,
   options: DashboardRenderOptions = {},
 ): string[] {
-  const color = options.color === true;
-  const columns = Math.max(0, Math.floor(dimensions.columns));
-  const rows = Math.max(0, Math.floor(dimensions.rows));
-  if (columns === 0 || rows === 0) {
-    return [];
-  }
-
-  if (columns < 12 || rows < 6) {
-    return plainLines(view, columns, rows, color);
-  }
-
-  return bodyLines(view, columns, rows, color).map(line => padVisible(line, columns));
+  return renderDashboardFrame(view, dimensions, options).lines;
 }
 
 export function renderDashboard(

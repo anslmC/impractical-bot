@@ -6,17 +6,22 @@ import {
   DEFAULT_MAXIMUM_LOG_ENTRIES,
   DashboardLogBuffer,
   captureConsoleOutput,
+  formatDashboardLogEntries,
   type ConsoleCapture,
   type ConsoleCaptureOptions,
+  type DashboardLogBufferChange,
   type DashboardLogEntry,
 } from './logs.js';
 import {
   createInitialDashboardView,
   getDashboardPromptCursor,
-  renderDashboardLines,
+  renderDashboardFrame,
   type DashboardDimensions,
+  type DashboardFrame,
+  type DashboardLogScrollState,
   type DashboardView,
 } from './layout.js';
+import { advanceLogScroll } from './scroll.js';
 import {
   isDashboardCommandAvailable,
   maximumPersonalityInstructionLength,
@@ -53,6 +58,11 @@ export type {
   DashboardNoticeTone,
   DashboardPrompt,
 } from './commands.js';
+
+export type {
+  DashboardFrame,
+  DashboardLogScrollState,
+} from './layout.js';
 
 export {
   DEFAULT_MAXIMUM_LOG_ENTRIES,
@@ -124,7 +134,23 @@ export interface DashboardSession {
   closeForHandoff?(): Promise<TerminalHandoff | undefined>;
   refresh(): Promise<void>;
   getEntries?(): DashboardLogEntry[];
+  getScrollState?(): DashboardLogScrollState;
+  scrollBy?(lines: number): void;
+  scrollToStart?(): void;
+  scrollToEnd?(): void;
 }
+
+export interface ActiveDashboardSession extends DashboardSession {
+  closeForHandoff(): Promise<TerminalHandoff | undefined>;
+  getScrollState(): DashboardLogScrollState;
+  scrollBy(lines: number): void;
+  scrollToStart(): void;
+  scrollToEnd(): void;
+}
+
+export type DashboardSessionFactory = (
+  options?: DashboardOptions,
+) => Promise<DashboardSession>;
 
 function getDimensions(output: NodeJS.WriteStream): DashboardDimensions {
   return {
@@ -154,7 +180,7 @@ interface CommandOutcome {
 
 export async function startDashboard(
   options: DashboardOptions = {},
-): Promise<DashboardSession> {
+): Promise<ActiveDashboardSession> {
   const input = options.input ?? process.stdin;
   const output = options.output ?? process.stdout;
   const terminal = checkDashboardTerminal(input, output);
@@ -187,6 +213,9 @@ export async function startDashboard(
   let prompt: DashboardPrompt | undefined;
   let notice: DashboardNotice | undefined;
   let pending = false;
+  let scrollOffset = 0;
+  let unseenCount = 0;
+  let knownTotalLines = 0;
   let timer: ReturnType<typeof setInterval> | undefined;
   let pendingLogRender: NodeJS.Immediate | undefined;
   let noticeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -210,20 +239,88 @@ export async function startDashboard(
     commandsEnabled: commands !== undefined,
   });
 
+  const frameAt = (offset: number, unseen: number): DashboardFrame => {
+    const dimensions = getDimensions(output);
+    return renderDashboardFrame(buildView(), dimensions, {
+      color: colorEnabled,
+      scrollOffset: offset,
+      unseenCount: unseen,
+    });
+  };
+
+  const commitFrame = (offset: number, unseen: number): DashboardFrame => {
+    const dimensions = getDimensions(output);
+    const view = buildView();
+    let frame = renderDashboardFrame(view, dimensions, {
+      color: colorEnabled,
+      scrollOffset: offset,
+      unseenCount: unseen,
+    });
+    if (frame.state.offset === 0 && unseen !== 0) {
+      frame = renderDashboardFrame(view, dimensions, {
+        color: colorEnabled,
+        scrollOffset: 0,
+        unseenCount: 0,
+      });
+    }
+    scrollOffset = frame.state.offset;
+    unseenCount = frame.state.unseenCount;
+    knownTotalLines = frame.state.totalLines;
+    if (scrollOffset === 0) {
+      unseenCount = 0;
+    }
+    terminalSession?.render(frame.lines, {
+      cursor: getDashboardPromptCursor(view, dimensions),
+    });
+    return frame;
+  };
+
   const render = (): void => {
     if (closed || terminalSession === undefined) {
       return;
     }
     try {
-      const dimensions = getDimensions(output);
-      const view = buildView();
-      const lines = renderDashboardLines(view, dimensions, { color: colorEnabled });
-      terminalSession.render(lines, {
-        cursor: getDashboardPromptCursor(view, dimensions),
-      });
+      commitFrame(scrollOffset, unseenCount);
     } catch {
       void close();
     }
+  };
+
+  const applyScroll = (next: number): void => {
+    if (closed || terminalSession === undefined) {
+      return;
+    }
+    try {
+      commitFrame(next, unseenCount);
+    } catch {
+      void close();
+    }
+  };
+
+  const pageAmount = (): number =>
+    Math.max(1, frameAt(scrollOffset, unseenCount).state.visibleLines);
+
+  const scrollToStart = (): void => applyScroll(Number.MAX_SAFE_INTEGER);
+  const scrollToEnd = (): void => applyScroll(0);
+
+  const handleLogEntry = (change?: DashboardLogBufferChange): void => {
+    if (closed) {
+      return;
+    }
+    const measurement = frameAt(scrollOffset, unseenCount).state;
+    const appendedLines = change === undefined
+      ? undefined
+      : formatDashboardLogEntries(change.added, getDimensions(output).columns).length;
+    const next = advanceLogScroll(
+      { offset: scrollOffset, unseenCount, knownTotalLines },
+      measurement.totalLines,
+      measurement.maximumOffset,
+      appendedLines,
+    );
+    scrollOffset = next.offset;
+    unseenCount = next.unseenCount;
+    knownTotalLines = next.knownTotalLines;
+    scheduleLogRender();
   };
 
   const scheduleLogRender = (): void => {
@@ -688,6 +785,10 @@ export async function startDashboard(
       }
       return;
     }
+    if (character === 'l' || character === 'L') {
+      scrollToEnd();
+      return;
+    }
     if (pending) {
       return;
     }
@@ -747,7 +848,29 @@ export async function startDashboard(
       handleEscapeKey();
       return;
     }
+    if (key === 'pageUp') {
+      applyScroll(scrollOffset + pageAmount());
+      return;
+    }
+    if (key === 'pageDown') {
+      applyScroll(scrollOffset - pageAmount());
+      return;
+    }
     if (prompt === undefined) {
+      switch (key) {
+        case 'up':
+          applyScroll(scrollOffset + 1);
+          return;
+        case 'down':
+          applyScroll(scrollOffset - 1);
+          return;
+        case 'home':
+          scrollToStart();
+          return;
+        case 'end':
+          scrollToEnd();
+          return;
+      }
       return;
     }
     switch (key) {
@@ -762,8 +885,6 @@ export async function startDashboard(
       case 'down':
       case 'home':
       case 'end':
-      case 'pageUp':
-      case 'pageDown':
       case 'tab':
         return;
     }
@@ -860,7 +981,7 @@ export async function startDashboard(
     }
     terminalSession.start();
     render();
-    unsubscribeLogs = logBuffer.subscribe(scheduleLogRender);
+    unsubscribeLogs = logBuffer.subscribe(handleLogEntry);
     timer = setInterval(() => {
       void requestStatusSafely();
     }, pollIntervalMs);
@@ -876,5 +997,9 @@ export async function startDashboard(
     closeForHandoff,
     refresh: requestStatusSafely,
     getEntries: () => logBuffer.getEntries(),
+    getScrollState: () => frameAt(scrollOffset, unseenCount).state,
+    scrollBy: lines => applyScroll(scrollOffset + lines),
+    scrollToStart,
+    scrollToEnd,
   };
 }

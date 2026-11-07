@@ -104,6 +104,7 @@ import {
   startDebugView,
   type ConsoleCapture,
   type DashboardSession,
+  type DashboardSessionFactory,
   type DashboardTerminalCheck,
   type DebugViewportSession,
   type TerminalHandoff,
@@ -144,7 +145,7 @@ export interface CliRuntimeOptions {
   discoverBrowsers?: (options?: BrowserDiscoveryOptions) => Promise<BrowserCandidate[]>;
   browserExecutableExists?: (path: string) => boolean;
   checkDashboardTerminal?: () => DashboardTerminalCheck;
-  startDashboard?: typeof startDashboard;
+  startDashboard?: DashboardSessionFactory;
   startDebugView?: typeof startDebugView;
 }
 

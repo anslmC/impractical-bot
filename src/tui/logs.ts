@@ -788,10 +788,14 @@ export function formatDashboardLogLine(
   return renderSegments(segments, width, color);
 }
 
+export interface DashboardLogBufferChange {
+  readonly added: readonly DashboardLogEntry[];
+}
+
 export class DashboardLogBuffer {
   readonly capacity: number;
   private readonly entries: DashboardLogEntry[] = [];
-  private readonly listeners = new Set<() => void>();
+  private readonly listeners = new Set<(change: DashboardLogBufferChange) => void>();
 
   constructor(capacity = DEFAULT_MAXIMUM_LOG_ENTRIES) {
     const normalized = Math.floor(capacity);
@@ -805,8 +809,9 @@ export class DashboardLogBuffer {
     if (this.entries.length > this.capacity) {
       this.entries.splice(0, this.entries.length - this.capacity);
     }
+    const change: DashboardLogBufferChange = { added: [entry] };
     for (const listener of this.listeners) {
-      listener();
+      listener(change);
     }
   }
 
@@ -818,7 +823,7 @@ export class DashboardLogBuffer {
     return this.entries.length;
   }
 
-  subscribe(listener: () => void): () => void {
+  subscribe(listener: (change: DashboardLogBufferChange) => void): () => void {
     this.listeners.add(listener);
     return () => {
       this.listeners.delete(listener);
