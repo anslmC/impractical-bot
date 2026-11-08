@@ -1,10 +1,8 @@
+import { escapeRegExp } from './escape-regexp.js';
+
 export interface MentionIdentity {
   name?: string;
   aliases?: readonly string[];
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function mentionForms({ name = '', aliases = [] }: MentionIdentity): string[] {

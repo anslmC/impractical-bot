@@ -1,18 +1,8 @@
-import {
-  closeSync,
-  existsSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
-  fsyncSync,
-} from 'node:fs';
-import { randomUUID } from 'node:crypto';
-import { basename, dirname, join } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { config as loadDotenv, parse } from 'dotenv';
 import { resolveConfigurationPaths } from '../config/configuration.js';
+import { writeFileAtomically } from '../config/atomic-write.js';
 import {
   CONVERSATION_METADATA_RETRY_INSTRUCTION,
   appendActiveTurnInstruction,
@@ -139,6 +129,10 @@ function sanitizePreview(text: string, limit = 80): string {
   return compact.length > limit ? `${compact.slice(0, limit)}...` : compact;
 }
 
+function conversationDiagnosticsEnabled(): boolean {
+  return process.env.IMPBOT_DEBUG === '1';
+}
+
 function logRequestDiagnostics(
   diagnostics: NvidiaRequestDiagnostics,
   turns: readonly ConversationTurn[],
@@ -156,10 +150,13 @@ function logRequestDiagnostics(
     `restoredOutgoing=${diagnostics.restoredOutgoingMessageIds?.join(',') || 'none'} ` +
     `mergedPending=${diagnostics.mergedPendingMessageIds?.join(',') || 'none'}`,
   );
+  const includePreviews = conversationDiagnosticsEnabled();
   for (const turn of turns) {
+    const preview = includePreviews
+      ? ` preview=${JSON.stringify(sanitizePreview(turn.content))}`
+      : '';
     console.log(
-      `[request] role=${turn.role} id=${turn.messageId ?? 'unavailable'} ` +
-      `preview=${JSON.stringify(sanitizePreview(turn.content))}`,
+      `[request] role=${turn.role} id=${turn.messageId ?? 'unavailable'}${preview}`,
     );
   }
 }
@@ -264,31 +261,10 @@ export function saveNvidiaApiKey(environmentFilePath: string, apiKey: string): v
   const content = `${Object.entries(variables)
     .map(([name, value]) => `${name}=${JSON.stringify(value)}`)
     .join('\n')}\n`;
-  const directory = dirname(environmentFilePath);
-  const temporaryPath = join(directory, `.${basename(environmentFilePath)}.${randomUUID()}.tmp`);
-  let descriptor: number | undefined;
 
   try {
-    mkdirSync(directory, { recursive: true });
-    descriptor = openSync(temporaryPath, 'wx', 0o600);
-    writeFileSync(descriptor, content, 'utf8');
-    fsyncSync(descriptor);
-    closeSync(descriptor);
-    descriptor = undefined;
-    renameSync(temporaryPath, environmentFilePath);
+    writeFileAtomically(environmentFilePath, content);
   } catch {
-    if (descriptor !== undefined) {
-      try {
-        closeSync(descriptor);
-      } catch {
-      }
-    }
-    try {
-      if (existsSync(temporaryPath)) {
-        unlinkSync(temporaryPath);
-      }
-    } catch {
-    }
     throw new Error('Unable to save the application NVIDIA API key.');
   }
 }
@@ -477,7 +453,7 @@ function logExistenceDiagnostic(
   if (!diagnostics) {
     return;
   }
-  const match = diagnostic.match
+  const match = conversationDiagnosticsEnabled() && diagnostic.match
     ? ` match=${JSON.stringify(sanitizePreview(diagnostic.match, 60))}`
     : '';
   console.log(

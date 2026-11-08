@@ -2331,7 +2331,9 @@ test('a first draft accepted immediately is reported as the accepted first attem
   );
 });
 
-test('request diagnostics log the resolved trigger, bounded turn previews, and history restoration', async () => {
+test('request diagnostics log metadata without exposing conversation content by default', async () => {
+  const originalDebugMode = process.env.IMPBOT_DEBUG;
+  delete process.env.IMPBOT_DEBUG;
   const logs: string[] = [];
   const originalLog = console.log;
   console.log = (...values: unknown[]) => {
@@ -2356,6 +2358,11 @@ test('request diagnostics log the resolved trigger, bounded turn previews, and h
     });
   } finally {
     console.log = originalLog;
+    if (originalDebugMode === undefined) {
+      delete process.env.IMPBOT_DEBUG;
+    } else {
+      process.env.IMPBOT_DEBUG = originalDebugMode;
+    }
   }
 
   const summary = logs.find(line => line.startsWith('[request] packet='));
@@ -2365,6 +2372,48 @@ test('request diagnostics log the resolved trigger, bounded turn previews, and h
   assert.match(summary ?? '', /incoming=2 assistant=1/u);
   assert.match(summary ?? '', /restoredOutgoing=out-1/u);
   assert.match(summary ?? '', /mergedPending=pending-outgoing-1/u);
+  const turnLines = logs.filter(line => line.startsWith('[request] role='));
+  assert.equal(turnLines.length, 3);
+  assert.ok(turnLines.every(line => !line.includes('preview=')));
+  assert.ok(logs.every(line =>
+    !line.includes('what did we decide?') &&
+    !line.includes('We decided on the blue plan.') &&
+    !line.includes('remind me again?'),
+  ));
+});
+
+test('request diagnostics include conversation previews when IMPBOT_DEBUG is enabled', async () => {
+  const originalDebugMode = process.env.IMPBOT_DEBUG;
+  process.env.IMPBOT_DEBUG = '1';
+  const logs: string[] = [];
+  const originalLog = console.log;
+  console.log = (...values: unknown[]) => {
+    logs.push(values.map(String).join(' '));
+  };
+
+  try {
+    await generateNvidiaReply('nvapi-test-key', [
+      messengerMessage('in-1', 'Alex', 'INCOMING', 'what did we decide?'),
+      messengerMessage('out-1', 'You', 'OUTGOING', 'We decided on the blue plan.'),
+      messengerMessage('in-2', 'Alex', 'INCOMING', 'remind me again?'),
+    ], {
+      systemInstruction: 'Production instruction.',
+      identity: { name: 'Yukinon' },
+      requestDiagnostics: {
+        packetId: 'packet-007',
+        packetType: 'mention',
+      },
+      fetch: async () => successfulCompletion('The blue plan.'),
+    });
+  } finally {
+    console.log = originalLog;
+    if (originalDebugMode === undefined) {
+      delete process.env.IMPBOT_DEBUG;
+    } else {
+      process.env.IMPBOT_DEBUG = originalDebugMode;
+    }
+  }
+
   const turnPreviews = logs.filter(line => line.startsWith('[request] role='));
   assert.equal(turnPreviews.length, 3);
   assert.ok(turnPreviews.every(line => line.length < 220));

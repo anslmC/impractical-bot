@@ -1151,6 +1151,25 @@ test('conversation navigation rejects the Messenger inbox fallback without waiti
   assert.equal(page.events.includes('conversation-verified'), false);
 });
 
+test('conversation navigation rejects an authentication redirect', async () => {
+  const destination = 'https://www.facebook.com/messages/t/987654321';
+  const page = new StartupPage('no-pin');
+  page.loginDetected = true;
+  page.destinationAfterNavigation = 'https://www.facebook.com/login/?next=%2Fmessages';
+
+  await assert.rejects(
+    navigatePageToMessengerDestination(
+      page as unknown as Page,
+      baseConfiguration,
+      destination,
+    ),
+    /redirected to Facebook authentication/,
+  );
+
+  assert.deepEqual(page.gotoUrls, [destination]);
+  assert.equal(page.events.includes('conversation-verified'), false);
+});
+
 test('conversation navigation rejects a client-side inbox fallback reported by readiness polling', async () => {
   const destination = 'https://www.facebook.com/messages/t/987654321';
   const page = new StartupPage('no-pin');

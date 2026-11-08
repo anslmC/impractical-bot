@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, win32 } from 'node:path';
 import { test } from 'node:test';
 import { discoverBrowsers, validateBrowserExecutablePath } from '../src/browser/discovery.js';
+import { browserForExecutableName } from '../src/browser/browser-definitions.js';
 import { BROWSER_IDS, type BrowserId } from '../src/config/configuration.js';
 
 const environment: NodeJS.ProcessEnv = {
@@ -27,6 +28,14 @@ function knownPath(browser: BrowserId, root = environment.ProgramFiles as string
 function normalized(path: string): string {
   return win32.normalize(path).replace(/\\+$/, '').toLowerCase();
 }
+
+test('maps executable names to supported browsers case-insensitively', () => {
+  assert.equal(browserForExecutableName('brave.exe'), 'brave');
+  assert.equal(browserForExecutableName('CHROME.EXE'), 'chrome');
+  assert.equal(browserForExecutableName('msedge.exe'), 'edge');
+  assert.equal(browserForExecutableName('firefox.exe'), undefined);
+  assert.equal(browserForExecutableName(''), undefined);
+});
 
 test('discovers each supported browser from known installation paths', async () => {
   const expectedDisplayNames = {

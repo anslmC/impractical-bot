@@ -182,15 +182,6 @@ export function createUnavailableGroupRoster(
   };
 }
 
-export function createNotGroupRoster(): GroupRoster {
-  return {
-    status: 'not-group',
-    members: [],
-    puppet: null,
-    duplicateFirstNames: [],
-  };
-}
-
 function buildRoster(snapshot: RosterRowSnapshot, puppetName: string): GroupRoster {
   const configuredPuppet = normalizeDisplayName(puppetName);
   if (snapshot.members.length === 0) {
@@ -627,5 +618,3 @@ export async function extractGroupRoster(
     }
   }
 }
-
-export const readGroupRoster = extractGroupRoster;

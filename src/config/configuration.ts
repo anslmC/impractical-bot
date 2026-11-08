@@ -1,19 +1,17 @@
+import { readFileSync } from 'node:fs';
+import { win32 } from 'node:path';
+import { writeFileAtomically } from './atomic-write.js';
 import {
-  closeSync,
-  existsSync,
-  fsyncSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
-} from 'node:fs';
-import { basename, dirname, join, win32 } from 'node:path';
-import { randomUUID } from 'node:crypto';
+  BROWSER_IDS,
+  browserForExecutableName,
+  isFullyQualifiedWindowsPath,
+  type BrowserId,
+} from '../browser/browser-definitions.js';
+
+export { BROWSER_IDS };
+export type { BrowserId };
 
 export const CONFIGURATION_VERSION = 1;
-export const BROWSER_IDS = ['brave', 'chrome', 'edge'] as const;
 export const BOT_TEMPERAMENTS = ['quiet', 'balanced', 'talkative'] as const;
 export const DEFAULT_BOT_TEMPERAMENT = 'balanced' as const;
 
@@ -36,7 +34,6 @@ export const DEFAULT_COMPOSER_SLICER: ComposerSlicerSettings = {
   maxCharacters: DEFAULT_COMPOSER_SLICER_MAX_CHARACTERS,
 };
 
-export type BrowserId = typeof BROWSER_IDS[number];
 export type BotTemperament = typeof BOT_TEMPERAMENTS[number];
 export type BotPersonalityMode = typeof BOT_PERSONALITY_MODES[number];
 
@@ -146,15 +143,6 @@ const CONFIGURATION_KEYS = new Set([
   'composerSlicer',
 ]);
 const COMPOSER_SLICER_KEYS = new Set(['enabled', 'maxCharacters']);
-const BROWSER_EXECUTABLE_NAMES: Record<BrowserId, string> = {
-  brave: 'brave.exe',
-  chrome: 'chrome.exe',
-  edge: 'msedge.exe',
-};
-
-function isFullyQualifiedWindowsPath(value: string): boolean {
-  return win32.isAbsolute(value) && win32.parse(value).root !== '\\';
-}
 
 export function resolveConfigurationPaths(
   environment: NodeJS.ProcessEnv = process.env,
@@ -191,6 +179,15 @@ function requireWindowsAbsolutePath(value: unknown, field: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+export function isHttpOrHttpsUrl(value: string): boolean {
+  try {
+    const protocol = new URL(value).protocol;
+    return protocol === 'http:' || protocol === 'https:';
+  } catch {
+    return false;
+  }
 }
 
 function validateComposerSlicer(value: unknown): ComposerSlicerOverrides {
@@ -246,7 +243,7 @@ function validateConfigurationFields(value: unknown): ConfigurationWithoutPin {
   if (win32.extname(executablePath).toLowerCase() !== '.exe') {
     throw new Error('executablePath must point to a Windows .exe file.');
   }
-  if (win32.basename(executablePath).toLowerCase() !== BROWSER_EXECUTABLE_NAMES[value.browser as BrowserId]) {
+  if (browserForExecutableName(win32.basename(executablePath)) !== (value.browser as BrowserId)) {
     throw new Error('executablePath must match the selected browser.');
   }
   const profilePath = requireWindowsAbsolutePath(value.profilePath, 'profilePath');
@@ -266,29 +263,17 @@ function validateConfigurationFields(value: unknown): ConfigurationWithoutPin {
   ) {
     throw new Error('cdpPort must be an integer between 1 and 65535.');
   }
-  if (value.startupUrl !== undefined) {
-    if (typeof value.startupUrl !== 'string') {
-      throw new Error('startupUrl must be a valid HTTP or HTTPS URL.');
-    }
-    try {
-      if (!['http:', 'https:'].includes(new URL(value.startupUrl).protocol)) {
-        throw new Error('startupUrl must be a valid HTTP or HTTPS URL.');
-      }
-    } catch {
-      throw new Error('startupUrl must be a valid HTTP or HTTPS URL.');
-    }
+  if (
+    value.startupUrl !== undefined &&
+    (typeof value.startupUrl !== 'string' || !isHttpOrHttpsUrl(value.startupUrl))
+  ) {
+    throw new Error('startupUrl must be a valid HTTP or HTTPS URL.');
   }
-  if (value.messageDestination !== undefined) {
-    if (typeof value.messageDestination !== 'string') {
-      throw new Error('messageDestination must be a valid HTTP or HTTPS URL.');
-    }
-    try {
-      if (!['http:', 'https:'].includes(new URL(value.messageDestination).protocol)) {
-        throw new Error('messageDestination must be a valid HTTP or HTTPS URL.');
-      }
-    } catch {
-      throw new Error('messageDestination must be a valid HTTP or HTTPS URL.');
-    }
+  if (
+    value.messageDestination !== undefined &&
+    (typeof value.messageDestination !== 'string' || !isHttpOrHttpsUrl(value.messageDestination))
+  ) {
+    throw new Error('messageDestination must be a valid HTTP or HTTPS URL.');
   }
   if (
     value.puppetName !== undefined &&
@@ -474,33 +459,7 @@ export function saveConfiguration(value: unknown, filePath?: string): Configurat
     );
   }
 
-  const directory = dirname(selectedPath);
-  mkdirSync(directory, { recursive: true });
-  const temporaryPath = join(directory, `.${basename(selectedPath)}.${randomUUID()}.tmp`);
-  let descriptor: number | undefined;
-
-  try {
-    descriptor = openSync(temporaryPath, 'wx', 0o600);
-    writeFileSync(descriptor, `${JSON.stringify(configuration, null, 2)}\n`, 'utf8');
-    fsyncSync(descriptor);
-    closeSync(descriptor);
-    descriptor = undefined;
-    renameSync(temporaryPath, selectedPath);
-  } catch (error) {
-    if (descriptor !== undefined) {
-      try {
-        closeSync(descriptor);
-      } catch {
-      }
-    }
-    try {
-      if (existsSync(temporaryPath)) {
-        unlinkSync(temporaryPath);
-      }
-    } catch {
-    }
-    throw error;
-  }
+  writeFileAtomically(selectedPath, `${JSON.stringify(configuration, null, 2)}\n`);
 
   return configuration;
 }

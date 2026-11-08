@@ -8,6 +8,7 @@ import {
   DEFAULT_BOT_TEMPERAMENT,
   DEFAULT_BOT_PERSONALITY_MODE,
   getBotTemperamentYesProbability,
+  isHttpOrHttpsUrl,
   loadConfiguration,
   resolveConfigurationPaths,
   saveConfiguration,
@@ -229,13 +230,8 @@ async function promptMessageDestination(
     }
 
     const messageDestination = answer.trim();
-    try {
-      if (['http:', 'https:'].includes(new URL(messageDestination).protocol)) {
-        return messageDestination;
-      }
-    } catch {
-      writeError('Message destination must be a valid HTTP or HTTPS URL.');
-      continue;
+    if (isHttpOrHttpsUrl(messageDestination)) {
+      return messageDestination;
     }
     writeError('Message destination must be a valid HTTP or HTTPS URL.');
   }

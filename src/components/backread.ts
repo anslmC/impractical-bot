@@ -13,7 +13,6 @@ export { classifyMessageLabel };
 
 const MESSAGE_SELECTOR =
   '[data-scope="messages_table"][aria-roledescription="message"][data-message-id]';
-const DEBUG_BACKREAD = false;
 const TARGET_MESSAGE_COUNT = 30;
 const TOP_SETTLE_MAX_SNAPSHOTS = 5;
 const TOP_SETTLE_STABLE_COMPARISONS = 2;
@@ -323,28 +322,6 @@ export async function readMessengerMessages(page: Page): Promise<BackreadResult>
       ariaLabel: message.ariaLabel,
     };
   });
-
-  const aggregateMessages = messages.flatMap(message => {
-    const lines: string[] = [];
-    if (message.sender === 'UNKNOWN' || message.direction === 'UNKNOWN') {
-      const rawLabel = message.ariaLabel === null
-        ? '(missing)'
-        : JSON.stringify(message.ariaLabel);
-      lines.push(`UNKNOWN diagnostic | ID: ${message.id} | raw aria-label: ${rawLabel}`);
-    }
-    const text = message.message.replace(/\s+/g, ' ') || '(no text content)';
-    lines.push(
-      `${message.id} | ${JSON.stringify(message.timestamp)} | ${message.sender} | ` +
-      `${message.direction} | ${text}`,
-    );
-    return lines;
-  });
-  if (DEBUG_BACKREAD) {
-    diagnostics.push([
-      `Collected ${messages.length} unique messages (oldest to newest):`,
-      ...aggregateMessages,
-    ].map(line => `[DEBUG] ${line}`).join('\n'));
-  }
 
   return { messages, diagnostics };
 }

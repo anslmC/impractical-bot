@@ -17,6 +17,7 @@ import {
   getBotTemperamentCooldownMs,
   getBotTemperamentYesProbability,
   isBotPersonalityMode,
+  isHttpOrHttpsUrl,
   loadConfiguration,
   resolveBotPersonalityMode,
   resolveComposerSlicer,
@@ -168,6 +169,27 @@ test('validation rejects invalid browsers, paths, and CDP ports', () => {
       () => validateConfiguration({ ...validConfiguration, messageDestination }),
       /messageDestination must be a valid HTTP or HTTPS URL/,
     );
+  }
+});
+
+test('HTTP URL validation accepts only HTTP and HTTPS URLs', () => {
+  for (const value of [
+    'http://example.test',
+    'https://example.test/path?query=1',
+    'HTTPS://EXAMPLE.TEST',
+    ' https://example.test ',
+  ]) {
+    assert.equal(isHttpOrHttpsUrl(value), true, value);
+  }
+  for (const value of [
+    '',
+    'not a URL',
+    'ftp://example.test',
+    'javascript:alert(1)',
+    'file:///C:/test',
+    'mailto:test@example.test',
+  ]) {
+    assert.equal(isHttpOrHttpsUrl(value), false, value);
   }
 });
 

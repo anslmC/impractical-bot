@@ -3,7 +3,11 @@ import { test } from 'node:test';
 import { runInNewContext } from 'node:vm';
 import type { Page } from 'playwright';
 import { generateAliases } from '../src/components/alias-engine.js';
-import { startCombustion, shouldRngRespond } from '../src/components/combustion.js';
+import {
+  isEngineDebugEnabled,
+  startCombustion,
+  shouldRngRespond,
+} from '../src/components/combustion.js';
 import { createContextStore } from '../src/components/context-store.js';
 import {
   appendRetryInstruction,
@@ -3606,6 +3610,26 @@ test('RNG decision boundaries follow each temperament without sampling randomnes
   assert.equal(shouldRngRespond('talkative', 0.9499), true);
   assert.equal(shouldRngRespond('talkative', 0.85), true);
   assert.equal(shouldRngRespond('talkative', 0.95), false);
+});
+
+test('engine debugging is disabled by default and enabled by IMPBOT_DEBUG', () => {
+  const originalDebugMode = process.env.IMPBOT_DEBUG;
+  try {
+    delete process.env.IMPBOT_DEBUG;
+    assert.equal(isEngineDebugEnabled(), false);
+
+    process.env.IMPBOT_DEBUG = '1';
+    assert.equal(isEngineDebugEnabled(), true);
+
+    process.env.IMPBOT_DEBUG = '0';
+    assert.equal(isEngineDebugEnabled(), false);
+  } finally {
+    if (originalDebugMode === undefined) {
+      delete process.env.IMPBOT_DEBUG;
+    } else {
+      process.env.IMPBOT_DEBUG = originalDebugMode;
+    }
+  }
 });
 
 // The RNG cadence is a 7-second roll deadline checked at the end of each poll,

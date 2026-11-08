@@ -5,10 +5,7 @@ import {
 import {
   DEFAULT_MAXIMUM_LOG_ENTRIES,
   DashboardLogBuffer,
-  captureConsoleOutput,
   formatDashboardLogEntries,
-  type ConsoleCapture,
-  type ConsoleCaptureOptions,
   type DashboardLogBufferChange,
   type DashboardLogEntry,
 } from './logs.js';
@@ -44,10 +41,10 @@ import {
 } from './errors.js';
 import {
   DashboardTerminalError,
-  TerminalSession,
   checkDashboardTerminal,
   type TerminalHandoff,
 } from './terminal.js';
+import { TerminalViewLifecycle } from './session.js';
 import type { TerminalKey } from './input.js';
 
 export type {
@@ -219,16 +216,8 @@ export async function startDashboard(
   let timer: ReturnType<typeof setInterval> | undefined;
   let pendingLogRender: NodeJS.Immediate | undefined;
   let noticeTimer: ReturnType<typeof setTimeout> | undefined;
-  let capturedConsole: ConsoleCapture | undefined;
-  let unsubscribeLogs: (() => void) | undefined;
   let inFlight = false;
   let lastStatusFailure: string | undefined;
-  let finalized = false;
-  let closed = false;
-  let resolveClosed!: () => void;
-  const closedPromise = new Promise<void>(resolve => {
-    resolveClosed = resolve;
-  });
 
   const buildView = (): DashboardView => ({
     ...statusView,
@@ -251,32 +240,22 @@ export async function startDashboard(
   const commitFrame = (offset: number, unseen: number): DashboardFrame => {
     const dimensions = getDimensions(output);
     const view = buildView();
-    let frame = renderDashboardFrame(view, dimensions, {
+    const frame = renderDashboardFrame(view, dimensions, {
       color: colorEnabled,
       scrollOffset: offset,
       unseenCount: unseen,
     });
-    if (frame.state.offset === 0 && unseen !== 0) {
-      frame = renderDashboardFrame(view, dimensions, {
-        color: colorEnabled,
-        scrollOffset: 0,
-        unseenCount: 0,
-      });
-    }
     scrollOffset = frame.state.offset;
     unseenCount = frame.state.unseenCount;
     knownTotalLines = frame.state.totalLines;
-    if (scrollOffset === 0) {
-      unseenCount = 0;
-    }
-    terminalSession?.render(frame.lines, {
+    lifecycle.render(frame.lines, {
       cursor: getDashboardPromptCursor(view, dimensions),
     });
     return frame;
   };
 
   const render = (): void => {
-    if (closed || terminalSession === undefined) {
+    if (lifecycle.isClosed) {
       return;
     }
     try {
@@ -287,7 +266,7 @@ export async function startDashboard(
   };
 
   const applyScroll = (next: number): void => {
-    if (closed || terminalSession === undefined) {
+    if (lifecycle.isClosed) {
       return;
     }
     try {
@@ -304,7 +283,7 @@ export async function startDashboard(
   const scrollToEnd = (): void => applyScroll(0);
 
   const handleLogEntry = (change?: DashboardLogBufferChange): void => {
-    if (closed) {
+    if (lifecycle.isClosed) {
       return;
     }
     const measurement = frameAt(scrollOffset, unseenCount).state;
@@ -324,7 +303,7 @@ export async function startDashboard(
   };
 
   const scheduleLogRender = (): void => {
-    if (closed || pendingLogRender !== undefined) {
+    if (lifecycle.isClosed || pendingLogRender !== undefined) {
       return;
     }
     pendingLogRender = setImmediate(() => {
@@ -334,13 +313,13 @@ export async function startDashboard(
   };
 
   const requestStatusSafely = async (): Promise<void> => {
-    if (closed || inFlight) {
+    if (lifecycle.isClosed || inFlight) {
       return;
     }
     inFlight = true;
     try {
       const result = await requestStatus(options.configurationFilePath);
-      if (closed) {
+      if (lifecycle.isClosed) {
         return;
       }
       lastStatusFailure = undefined;
@@ -360,7 +339,7 @@ export async function startDashboard(
       }
       render();
     } catch (error) {
-      if (!closed) {
+      if (!lifecycle.isClosed) {
         const detail = describeError(error);
         if (detail !== lastStatusFailure) {
           lastStatusFailure = detail;
@@ -391,7 +370,7 @@ export async function startDashboard(
     message: string,
     transient: boolean,
   ): void => {
-    if (closed) {
+    if (lifecycle.isClosed) {
       return;
     }
     clearNoticeTimer();
@@ -403,7 +382,7 @@ export async function startDashboard(
     if (timeoutMs !== undefined) {
       noticeTimer = setTimeout(() => {
         noticeTimer = undefined;
-        if (closed || notice !== next) {
+        if (lifecycle.isClosed || notice !== next) {
           return;
         }
         notice = undefined;
@@ -422,7 +401,7 @@ export async function startDashboard(
   };
 
   const openPrompt = (next: DashboardPrompt): void => {
-    if (closed) {
+    if (lifecycle.isClosed) {
       return;
     }
     discardNotice();
@@ -454,7 +433,7 @@ export async function startDashboard(
     operation: (api: DashboardCommandApi) => Promise<T>,
     interpret: (result: T) => CommandOutcome,
   ): Promise<void> => {
-    if (closed || pending) {
+    if (lifecycle.isClosed || pending) {
       return;
     }
     if (commands === undefined) {
@@ -469,12 +448,12 @@ export async function startDashboard(
 
     try {
       const result = await operation(commands);
-      if (closed) {
+      if (lifecycle.isClosed) {
         return;
       }
       await settleOutcome(interpret(result));
     } catch (error) {
-      if (closed) {
+      if (lifecycle.isClosed) {
         return;
       }
       pending = false;
@@ -891,7 +870,7 @@ export async function startDashboard(
   };
 
   const handleText = (text: string): void => {
-    if (closed) {
+    if (lifecycle.isClosed) {
       return;
     }
     for (const character of text) {
@@ -903,64 +882,20 @@ export async function startDashboard(
     }
   };
 
-  const finalize = (): void => {
-    if (finalized) {
-      return;
-    }
-    finalized = true;
-    closed = true;
-    if (timer !== undefined) {
-      clearInterval(timer);
-      timer = undefined;
-    }
-    if (pendingLogRender !== undefined) {
-      clearImmediate(pendingLogRender);
-      pendingLogRender = undefined;
-    }
-    if (noticeTimer !== undefined) {
-      clearTimeout(noticeTimer);
-      noticeTimer = undefined;
-    }
-    unsubscribeLogs?.();
-    unsubscribeLogs = undefined;
-    try {
-      capturedConsole?.restore();
-    } catch {
-      // Console restoration is best effort during teardown.
-    }
-    capturedConsole = undefined;
-    resolveClosed();
-  };
-
-  async function closeWithOptions(
-    preserveState: boolean,
-  ): Promise<TerminalHandoff | undefined> {
-    if (closed) {
-      return undefined;
-    }
-    closed = true;
-    const session = terminalSession;
-    const handoff = session === undefined
-      ? undefined
-      : await session.close({ preserveState });
-    finalize();
-    return handoff;
-  }
-
-  async function close(): Promise<void> {
-    await closeWithOptions(false);
-  }
-
+  const close = (): Promise<void> => lifecycle.close();
   const closeForHandoff = (): Promise<TerminalHandoff | undefined> =>
-    closeWithOptions(true);
+    lifecycle.closeForHandoff();
 
-  const terminalSession = new TerminalSession({
+  const lifecycle = new TerminalViewLifecycle({
     input,
     output,
     handoff: options.handoff,
     escapeTimeoutMs: options.escapeTimeoutMs,
+    logBuffer,
+    captureConsoleOutput: options.captureConsoleOutput,
+    now: options.now,
     onKey: key => {
-      if (!closed) {
+      if (!lifecycle.isClosed) {
         handleKey(key);
       }
     },
@@ -968,20 +903,25 @@ export async function startDashboard(
     onResize: () => {
       render();
     },
+    onLogEntry: handleLogEntry,
+    onFinalize: () => {
+      if (timer !== undefined) {
+        clearInterval(timer);
+        timer = undefined;
+      }
+      if (pendingLogRender !== undefined) {
+        clearImmediate(pendingLogRender);
+        pendingLogRender = undefined;
+      }
+      if (noticeTimer !== undefined) {
+        clearTimeout(noticeTimer);
+        noticeTimer = undefined;
+      }
+    },
   });
-  void terminalSession.closed.then(finalize);
 
   try {
-    const captureOptions: ConsoleCaptureOptions = {
-      now: options.now,
-      buffer: logBuffer,
-    };
-    if (options.captureConsoleOutput) {
-      capturedConsole = captureConsoleOutput(logBuffer.capacity, captureOptions);
-    }
-    terminalSession.start();
-    render();
-    unsubscribeLogs = logBuffer.subscribe(handleLogEntry);
+    await lifecycle.start(render);
     timer = setInterval(() => {
       void requestStatusSafely();
     }, pollIntervalMs);
@@ -992,7 +932,7 @@ export async function startDashboard(
   }
 
   return {
-    closed: closedPromise,
+    closed: lifecycle.closed,
     close,
     closeForHandoff,
     refresh: requestStatusSafely,

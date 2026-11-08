@@ -129,7 +129,6 @@ export class TerminalSession {
   private ownsTerminal = false;
   private enteredAlternateScreen = false;
   private rawModeSet = false;
-  private resumedInput = false;
   private resolveClosed!: () => void;
 
   constructor(options: TerminalSessionOptions = {}) {
@@ -198,7 +197,6 @@ export class TerminalSession {
       this.output.on('resize', this.handleResize);
       this.output.on('error', this.handleOutputError);
       this.input.resume();
-      this.resumedInput = true;
       this.started = true;
     } catch (error) {
       void this.close();
@@ -280,7 +278,6 @@ export class TerminalSession {
       });
       this.rawModeSet = false;
       this.enteredAlternateScreen = false;
-      this.resumedInput = false;
     }
     if (this.ownsTerminal) {
       this.ownsTerminal = false;

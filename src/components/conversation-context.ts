@@ -92,13 +92,6 @@ export function formatConversationTimestamp(
   return original || 'unknown';
 }
 
-export function participantLabelForSender(
-  sender: string,
-  fallback: string,
-): string {
-  return sender && sender !== 'UNKNOWN' ? sender : fallback;
-}
-
 function quoted(value: string): string {
   return JSON.stringify(value);
 }

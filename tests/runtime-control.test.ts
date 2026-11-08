@@ -162,11 +162,179 @@ test('runtime control refuses to send stop to an unrelated pipe listener', async
   );
 });
 
+test('runtime control validates the handshake before every request', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  const endpoint = getRuntimeControlEndpoint(configurationPath);
+  let receivedData = false;
+  const unrelatedServer = createServer(socket => {
+    socket.write('IMPBOT_RUNTIME/1 not-an-instance-id\n');
+    socket.on('data', () => {
+      receivedData = true;
+    });
+    socket.on('error', () => undefined);
+  });
+  await new Promise<void>((resolve, reject) => {
+    unrelatedServer.once('error', reject);
+    unrelatedServer.listen(endpoint, resolve);
+  });
+  context.after(async () => {
+    await new Promise<void>(resolve => unrelatedServer.close(() => resolve()));
+  });
+
+  const expectations: Array<[() => Promise<unknown>, string]> = [
+    [
+      () => requestRuntimePause(configurationPath),
+      'The runtime-control endpoint is not owned by an impractical-bot engine; no pause request was sent.',
+    ],
+    [
+      () => requestRuntimeResume(configurationPath),
+      'The runtime-control endpoint is not owned by an impractical-bot engine; no resume request was sent.',
+    ],
+    [
+      () => requestRuntimeChangeDestination(
+        configurationPath,
+        'https://www.facebook.com/messages/t/987654321',
+      ),
+      'The runtime-control endpoint is not owned by an impractical-bot engine; no destination change request was sent.',
+    ],
+    [
+      () => requestRuntimeSetTemperament(configurationPath, 'quiet'),
+      'The runtime-control endpoint is not owned by an impractical-bot engine; no temperament change request was sent.',
+    ],
+    [
+      () => requestRuntimeSetPersonality(configurationPath, 'custom', 'deadpan'),
+      'The runtime-control endpoint is not owned by an impractical-bot engine; no personality change request was sent.',
+    ],
+    [
+      () => requestRuntimeStatusSnapshot(configurationPath),
+      'The runtime-control endpoint is not owned by an impractical-bot engine; no status request was sent.',
+    ],
+    [
+      () => requestRuntimeStatus(configurationPath),
+      'The runtime-control endpoint is not owned by an impractical-bot engine.',
+    ],
+  ];
+
+  for (const [request, message] of expectations) {
+    await assert.rejects(request(), (error: unknown) => {
+      assert.ok(error instanceof RuntimeControlEndpointError);
+      assert.equal(error.message, message);
+      return true;
+    });
+  }
+  assert.equal(receivedData, false);
+});
+
+test('runtime control reports operation-specific invalid response errors', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  const endpoint = getRuntimeControlEndpoint(configurationPath);
+  const instanceId = '11111111-1111-1111-1111-111111111111';
+  const server = createServer(socket => {
+    socket.on('error', () => undefined);
+    socket.write(`IMPBOT_RUNTIME/1 ${instanceId}\n`);
+    socket.once('data', () => socket.end('BOGUS\n'));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(endpoint, resolve);
+  });
+  context.after(async () => {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  });
+
+  await assert.rejects(
+    requestRuntimePause(configurationPath),
+    /The engine returned an invalid pause response\./,
+  );
+  await assert.rejects(
+    requestRuntimeResume(configurationPath),
+    /The engine returned an invalid resume response\./,
+  );
+  await assert.rejects(
+    requestRuntimeChangeDestination(
+      configurationPath,
+      'https://www.facebook.com/messages/t/987654321',
+    ),
+    /The engine returned an invalid destination change response\./,
+  );
+  await assert.rejects(
+    requestRuntimeSetTemperament(configurationPath, 'quiet'),
+    /The engine returned an invalid temperament change response\./,
+  );
+  await assert.rejects(
+    requestRuntimeSetPersonality(configurationPath, 'custom', 'deadpan'),
+    /The engine returned an invalid personality change response\./,
+  );
+  await assert.rejects(
+    requestRuntimeStatusSnapshot(configurationPath),
+    /The engine returned an invalid status response\./,
+  );
+  await assert.rejects(
+    requestRuntimeStop(configurationPath, { responseTimeoutMs: 5_000 }),
+    /The engine returned an invalid stop response\./,
+  );
+});
+
+test('runtime control preserves engine rejection reasons per operation', async context => {
+  const configurationPath = temporaryConfigurationPath(context);
+  const endpoint = getRuntimeControlEndpoint(configurationPath);
+  const instanceId = '11111111-1111-1111-1111-111111111111';
+  const server = createServer(socket => {
+    socket.on('error', () => undefined);
+    socket.write(`IMPBOT_RUNTIME/1 ${instanceId}\n`);
+    socket.once('data', () => socket.end(`ERROR ${instanceId} DENIED\n`));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(endpoint, resolve);
+  });
+  context.after(async () => {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  });
+
+  await assert.rejects(
+    requestRuntimePause(configurationPath),
+    /The engine rejected the pause request \(DENIED\)\./,
+  );
+  await assert.rejects(
+    requestRuntimeResume(configurationPath),
+    /The engine rejected the resume request \(DENIED\)\./,
+  );
+  await assert.rejects(
+    requestRuntimeChangeDestination(
+      configurationPath,
+      'https://www.facebook.com/messages/t/987654321',
+    ),
+    /The engine rejected the destination change request \(DENIED\)\./,
+  );
+  await assert.rejects(
+    requestRuntimeSetTemperament(configurationPath, 'quiet'),
+    /The engine rejected the temperament change request \(DENIED\)\./,
+  );
+  await assert.rejects(
+    requestRuntimeSetPersonality(configurationPath, 'custom', 'deadpan'),
+    /The engine rejected the personality change request \(DENIED\)\./,
+  );
+  await assert.rejects(
+    requestRuntimeStatusSnapshot(configurationPath),
+    /The engine could not provide its runtime status \(DENIED\)\./,
+  );
+  await assert.rejects(
+    requestRuntimeStop(configurationPath, { responseTimeoutMs: 5_000 }),
+    /The engine returned an invalid stop response\./,
+  );
+});
+
 test('runtime stop, pause, and resume report not-running when no owner exists', async context => {
   const configurationPath = temporaryConfigurationPath(context);
   assert.deepEqual(await requestRuntimeStop(configurationPath), { status: 'not-running' });
   assert.deepEqual(await requestRuntimePause(configurationPath), { status: 'not-running' });
   assert.deepEqual(await requestRuntimeResume(configurationPath), { status: 'not-running' });
+  assert.deepEqual(await requestRuntimeStatus(configurationPath), { status: 'not-running' });
+  assert.deepEqual(
+    await requestRuntimeStatusSnapshot(configurationPath),
+    { status: 'not-running' },
+  );
   assert.deepEqual(
     await requestRuntimeChangeDestination(
       configurationPath,

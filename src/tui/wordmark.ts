@@ -134,13 +134,6 @@ export function renderWordmarkForWidth(
   return rows?.map(line => centerVisible(line, width));
 }
 
-export function renderWordmarkCentered(
-  width: number,
-  { color = true }: { color?: boolean } = {},
-): string[] {
-  return renderWordmark({ color }).map(line => centerVisible(line, width));
-}
-
 export function renderPlainWordmark({ color = true }: { color?: boolean } = {}): string {
   return renderLine(
     [

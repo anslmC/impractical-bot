@@ -3945,7 +3945,9 @@ test('config reports persisted settings and puppet name', async context => {
   assert.match(result.output[0], /Executable: C:\\Program Files\\BraveSoftware/);
   assert.match(result.output[0], /Profile: C:\\Users\\test/);
   assert.match(result.output[0], /Skip PIN restoration: false/);
-  assert.match(result.output[0], /Messenger restoration PIN: 001234/);
+  assert.match(result.output[0], /Messenger restoration PIN: \[redacted\]/);
+  assert.doesNotMatch(result.output.join('\n'), /001234/);
+  assert.doesNotMatch(result.errors.join('\n'), /001234/);
   assert.match(result.output[0], /CDP port: 9222/);
   assert.match(result.output[0], /Startup URL: https:\/\/www\.facebook\.com/);
   assert.match(result.output[0], /Message destination: https:\/\/www\.facebook\.com\/messages\/t\/1618007223454558/);
@@ -3960,7 +3962,8 @@ test('config reports persisted settings and puppet name', async context => {
     messageDestination: 'https://www.facebook.com/messages/t/1618007223454558',
   }, filePath);
   const skippedPinResult = await captureCli(['config'], filePath);
-  assert.match(skippedPinResult.output[0], /Messenger restoration PIN: null/);
+  assert.match(skippedPinResult.output[0], /Messenger restoration PIN: not configured/);
+  assert.doesNotMatch(skippedPinResult.output.join('\n'), /\bnull\b/);
   assert.match(skippedPinResult.output[0], /Puppet name: Not set/);
 
   saveConfiguration({ ...validConfiguration, puppetName: '' }, filePath);

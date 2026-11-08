@@ -109,6 +109,10 @@ const DEFAULT_CONNECTION_TIMEOUT_MS = 10_000;
 const DEFAULT_EXISTING_BROWSER_TIMEOUT_MS = 2_000;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
 const defaultFileSystem: BrowserLaunchFileSystem = { mkdir };
+const defaultConnectOverCDP = (
+  endpoint: string,
+  options: ConnectOverCDPOptions,
+): Promise<Browser> => chromium.connectOverCDP(endpoint, options);
 
 function findProfileProcesses(
   executablePath: string,
@@ -649,8 +653,12 @@ async function dismissNotificationDialog(page: Page): Promise<void> {
   console.log(startupStatus('Challenge 0: notification dialog dismissed.', 'green'));
 }
 
+function isAuthenticationPath(pathname: string): boolean {
+  return /^\/(?:login(?:\.php)?|checkpoint)(?:\/|$)/.test(pathname);
+}
+
 function isAuthenticationRedirect(url: URL): boolean {
-  return /^\/(?:login(?:\.php)?|checkpoint)(?:\/|$)/.test(url.pathname);
+  return isAuthenticationPath(url.pathname);
 }
 
 function isMessengerPage(url: URL): boolean {
@@ -674,6 +682,13 @@ function destinationUrlFailure(url: URL, expectedConversationId: string): string
 function assertNavigationNotAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) {
     throw new Error('Conversation navigation was cancelled before the destination was verified.');
+  }
+}
+
+async function waitForNetworkIdle(page: Page): Promise<void> {
+  try {
+    await page.waitForLoadState('networkidle', { timeout: 5_000 });
+  } catch {
   }
 }
 
@@ -843,10 +858,7 @@ async function navigateAndVerifyMessengerDestination(
   }
 
   if (options.waitForNetworkIdle !== false) {
-    try {
-      await page.waitForLoadState('networkidle', { timeout: 5_000 });
-    } catch {
-    }
+    await waitForNetworkIdle(page);
   }
 
   assertNavigationNotAborted(options.signal);
@@ -1153,8 +1165,7 @@ export async function navigateConfiguredBrowserToMessageDestination(
     throw new Error('Browser connection and navigation timeouts must be positive.');
   }
 
-  const connectOverCDP = options.connectOverCDP ?? ((endpoint, connectOptions) =>
-    chromium.connectOverCDP(endpoint, connectOptions));
+  const connectOverCDP = options.connectOverCDP ?? defaultConnectOverCDP;
   const browser = await connectOverCDP(
     `http://127.0.0.1:${validatedConfiguration.cdpPort}`,
     { isLocal: true, noDefaults: true, timeout: connectionTimeoutMs },
@@ -1175,10 +1186,7 @@ export async function navigateConfiguredBrowserToMessageDestination(
       });
     }
 
-    try {
-      await page.waitForLoadState('networkidle', { timeout: 5_000 });
-    } catch {
-    }
+    await waitForNetworkIdle(page);
 
     if (page.isClosed()) {
       throw new Error('The selected Facebook tab closed before navigation could be verified.');
@@ -1200,9 +1208,7 @@ export async function navigateConfiguredBrowserToMessageDestination(
           resultingPath === expectedPath &&
           (!destinationUrl.search || resultingUrl.search === destinationUrl.search)
     );
-    const authenticationRedirect = /^\/(?:login(?:\.php)?|checkpoint)(?:\/|$)/.test(
-      resultingUrl.pathname,
-    );
+    const authenticationRedirect = isAuthenticationPath(resultingUrl.pathname);
     const pageContextVerified = expectedConversationId
       ? await page.getByRole('heading').filter({ visible: true }).count() > 0
       : await page.locator('body').isVisible();
@@ -1422,8 +1428,7 @@ async function attachToExistingBrowser(
   connectionTimeoutMs: number,
 ): Promise<BrowserLaunchSession> {
   const cdpPort = configuration.cdpPort!;
-  const connectOverCDP = options.connectOverCDP ?? ((url, connectOptions) =>
-    chromium.connectOverCDP(url, connectOptions));
+  const connectOverCDP = options.connectOverCDP ?? defaultConnectOverCDP;
   let browser: Browser;
   try {
     browser = await connectOverCDP(inspection.endpoint, {
@@ -1610,8 +1615,7 @@ export async function launchConfiguredBrowser(
       throw new Error('Unable to verify that the launched process owns the configured CDP endpoint; refusing to attach.');
     }
 
-    const connectOverCDP = options.connectOverCDP ?? ((url, connectOptions) =>
-      chromium.connectOverCDP(url, connectOptions));
+    const connectOverCDP = options.connectOverCDP ?? defaultConnectOverCDP;
     const browser = await connectOverCDP(endpoint, {
       isLocal: true,
       timeout: connectionTimeoutMs,

@@ -1,3 +1,5 @@
+import { escapeRegExp } from './escape-regexp.js';
+
 export type IdentityViolationReason =
   | 'provider-model-identity'
   | 'participant-impersonation'
@@ -166,10 +168,6 @@ const NON_IDENTITY_TARGETS = new Set([
   'november',
   'december',
 ]);
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
 
 function normalizeText(value: string): string {
   return value.normalize('NFC').replace(/\s+/gu, ' ').trim();

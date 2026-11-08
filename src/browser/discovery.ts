@@ -1,7 +1,13 @@
 import { execFile } from 'node:child_process';
 import { existsSync, statSync } from 'node:fs';
 import { win32 } from 'node:path';
-import { BROWSER_IDS, type BrowserId } from '../config/configuration.js';
+import {
+  BROWSER_DEFINITIONS,
+  BROWSER_IDS,
+  browserForExecutableName,
+  isFullyQualifiedWindowsPath,
+  type BrowserId,
+} from './browser-definitions.js';
 
 export interface BrowserCandidate {
   browser: BrowserId;
@@ -15,34 +21,6 @@ export interface BrowserDiscoveryOptions {
   fileExists?: (path: string) => boolean;
   registryLookup?: (browser: BrowserId) => Promise<readonly string[]>;
   pathLookup?: (executableName: string) => Promise<readonly string[]>;
-}
-
-interface BrowserDefinition {
-  displayName: string;
-  executableName: string;
-  installationSubpath: string;
-}
-
-const BROWSER_DEFINITIONS: Record<BrowserId, BrowserDefinition> = {
-  brave: {
-    displayName: 'Brave Browser',
-    executableName: 'brave.exe',
-    installationSubpath: 'BraveSoftware\\Brave-Browser\\Application\\brave.exe',
-  },
-  chrome: {
-    displayName: 'Google Chrome',
-    executableName: 'chrome.exe',
-    installationSubpath: 'Google\\Chrome\\Application\\chrome.exe',
-  },
-  edge: {
-    displayName: 'Microsoft Edge',
-    executableName: 'msedge.exe',
-    installationSubpath: 'Microsoft\\Edge\\Application\\msedge.exe',
-  },
-};
-
-function isFullyQualifiedWindowsPath(value: string): boolean {
-  return win32.isAbsolute(value) && win32.parse(value).root !== '\\';
 }
 
 function normalizeExecutablePath(value: string): string {
@@ -68,10 +46,7 @@ export function validateBrowserExecutablePath(value: unknown): BrowserCandidate 
     throw new Error('Executable path must be a fully qualified Windows path without surrounding whitespace.');
   }
 
-  const executableName = win32.basename(value).toLowerCase();
-  const browser = BROWSER_IDS.find(
-    browserId => BROWSER_DEFINITIONS[browserId].executableName === executableName,
-  );
+  const browser = browserForExecutableName(win32.basename(value));
   if (!browser) {
     throw new Error('Executable must be brave.exe, chrome.exe, or msedge.exe.');
   }

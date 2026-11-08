@@ -4,6 +4,7 @@ import { win32 } from 'node:path';
 import { resolveConfigurationPaths, isBotTemperament, isBotPersonalityMode, BROWSER_IDS, type BotTemperament, type BotPersonalityMode, type BrowserId } from './config/configuration.js';
 
 const PROTOCOL = 'IMPBOT_RUNTIME/1';
+const RUNTIME_NOT_OWNED_PREFIX = 'The runtime-control endpoint is not owned by an impractical-bot engine';
 const HANDSHAKE_TIMEOUT_MS = 5_000;
 const MAX_LINE_LENGTH = 65_536;
 const SHUTDOWN_CONFIRMATION_TIMEOUT_MS = 30_000;
@@ -31,46 +32,51 @@ export class RuntimeControlTimeoutError extends RuntimeControlEndpointError {
   }
 }
 
+type RuntimeNotRunning = { status: 'not-running' };
+
+type RuntimeChangeSuccess = { status: 'changed' };
+type RuntimeChangeFailure = { status: 'failed'; reason: string };
+
 export type RuntimeStopResult =
   | { status: 'stopped'; instanceId: string }
-  | { status: 'not-running' };
+  | RuntimeNotRunning;
 
 export type RuntimePauseResult =
   | { status: 'paused'; instanceId: string }
-  | { status: 'not-running' };
+  | RuntimeNotRunning;
 
 export type RuntimeResumeResult =
   | { status: 'resumed'; instanceId: string }
-  | { status: 'not-running' };
+  | RuntimeNotRunning;
 
-export type RuntimeDestinationChangeResult =
+type RuntimeDestinationChangeOutcome =
   | { status: 'changed'; resumed: boolean }
   | { status: 'rejected'; reason: string; resumed?: boolean }
   | { status: 'failed'; reason: string; resumed?: boolean };
 
+export type RuntimeDestinationChangeResult = RuntimeDestinationChangeOutcome;
+
 export type RuntimeChangeDestinationResult =
-  | { status: 'changed'; instanceId: string; resumed: boolean }
-  | { status: 'rejected'; instanceId: string; reason: string; resumed?: boolean }
-  | { status: 'failed'; instanceId: string; reason: string; resumed?: boolean }
-  | { status: 'not-running' };
+  | (RuntimeDestinationChangeOutcome & { instanceId: string })
+  | RuntimeNotRunning;
 
 export type RuntimeTemperamentChangeResult =
-  | { status: 'changed' }
-  | { status: 'failed'; reason: string };
+  | RuntimeChangeSuccess
+  | RuntimeChangeFailure;
 
 export type RuntimeSetTemperamentResult =
   | { status: 'changed'; instanceId: string; temperament: BotTemperament }
-  | { status: 'failed'; instanceId: string; reason: string }
-  | { status: 'not-running' };
+  | (RuntimeChangeFailure & { instanceId: string })
+  | RuntimeNotRunning;
 
 export type RuntimePersonalityChangeResult =
-  | { status: 'changed' }
-  | { status: 'failed'; reason: string };
+  | RuntimeChangeSuccess
+  | RuntimeChangeFailure;
 
 export type RuntimeSetPersonalityResult =
   | { status: 'changed'; instanceId: string; mode: BotPersonalityMode; instruction: string }
-  | { status: 'failed'; instanceId: string; reason: string }
-  | { status: 'not-running' };
+  | (RuntimeChangeFailure & { instanceId: string })
+  | RuntimeNotRunning;
 
 export type RuntimeEngineState = 'starting' | 'running' | 'paused' | 'changing' | 'stopping';
 
@@ -117,11 +123,7 @@ function encodeProtocolText(value: string): string {
 }
 
 function decodeProtocolText(value: string): string {
-  try {
-    return Buffer.from(value, 'base64url').toString('utf8');
-  } catch {
-    return '';
-  }
+  return Buffer.from(value, 'base64url').toString('utf8');
 }
 
 function parseDestinationFailureResponse(value: string): {
@@ -157,6 +159,16 @@ export function getRuntimeControlEndpoint(configurationFilePath?: string): strin
 function isPipeMissing(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'code' in error &&
     ['ENOENT', 'ECONNREFUSED'].includes(String(error.code));
+}
+
+function assertWindowsRuntimeSupport(): void {
+  if (process.platform !== 'win32') {
+    throw new RuntimeControlEndpointError('Runtime control is only supported on Windows.');
+  }
+}
+
+function parseRuntimeHandshake(greeting: string): string | undefined {
+  return greeting.match(new RegExp(`^${PROTOCOL} ([0-9a-f-]{36})$`, 'i'))?.[1];
 }
 
 function listen(server: Server, endpoint: string): Promise<void> {
@@ -221,8 +233,7 @@ async function hasRuntimeProtocol(endpoint: string): Promise<boolean> {
   }
 
   try {
-    const greeting = await readLine(socket);
-    return new RegExp(`^${PROTOCOL} [0-9a-f-]{36}$`, 'i').test(greeting);
+    return parseRuntimeHandshake(await readLine(socket)) !== undefined;
   } catch {
     return false;
   } finally {
@@ -234,9 +245,7 @@ export async function createRuntimeControl(
   configurationFilePath: string | undefined,
   handlers: RuntimeControlHandlers | (() => void),
 ): Promise<RuntimeControl> {
-  if (process.platform !== 'win32') {
-    throw new RuntimeControlEndpointError('Runtime control is only supported on Windows.');
-  }
+  assertWindowsRuntimeSupport();
 
   const runtimeHandlers: RuntimeControlHandlers = typeof handlers === 'function'
     ? { requestShutdown: handlers }
@@ -562,53 +571,29 @@ export async function createRuntimeControl(
 
 type RuntimeTransitionCommand = 'PAUSE' | 'RESUME';
 
-async function requestRuntimeTransition(
+interface RuntimeConnection {
+  instanceId: string;
+  socket: Socket;
+}
+
+interface RuntimeConnectionOptions<T> {
+  notOwnedMessage: string;
+  run: (connection: RuntimeConnection) => Promise<T>;
+}
+
+async function withRuntimeConnection<T>(
   configurationFilePath: string | undefined,
-  command: RuntimeTransitionCommand,
-): Promise<{ status: 'paused' | 'resumed'; instanceId: string } | { status: 'not-running' }> {
-  if (process.platform !== 'win32') {
-    throw new RuntimeControlEndpointError('Runtime control is only supported on Windows.');
-  }
+  options: RuntimeConnectionOptions<T>,
+): Promise<T | RuntimeNotRunning> {
+  assertWindowsRuntimeSupport();
+  const socket = createConnection(getRuntimeControlEndpoint(configurationFilePath));
 
-  const endpoint = getRuntimeControlEndpoint(configurationFilePath);
-  const socket = createConnection(endpoint);
   try {
-    let instanceId: string;
-    try {
-      const greeting = await readLine(socket);
-      const match = greeting.match(new RegExp(`^${PROTOCOL} ([0-9a-f-]{36})$`, 'i'));
-      if (!match) {
-        throw new RuntimeControlEndpointError(
-          `The runtime-control endpoint is not owned by an impractical-bot engine; no ${command.toLowerCase()} request was sent.`,
-        );
-      }
-      instanceId = match[1];
-    } catch (error) {
-      if (isPipeMissing(error)) {
-        return { status: 'not-running' };
-      }
-      throw error;
+    const instanceId = parseRuntimeHandshake(await readLine(socket));
+    if (!instanceId) {
+      throw new RuntimeControlEndpointError(options.notOwnedMessage);
     }
-
-    socket.setTimeout(0);
-    socket.write(`${command} ${instanceId}\n`);
-    const response = await readLine(socket, 0);
-    const expected = command === 'PAUSE' ? `PAUSED ${instanceId}` : `RESUMED ${instanceId}`;
-    if (response === expected) {
-      return {
-        status: command === 'PAUSE' ? 'paused' : 'resumed',
-        instanceId,
-      };
-    }
-    if (response.startsWith(`ERROR ${instanceId} `)) {
-      const reason = response.slice(`ERROR ${instanceId} `.length);
-      throw new RuntimeControlEndpointError(
-        `The engine rejected the ${command.toLowerCase()} request (${reason}).`,
-      );
-    }
-    throw new RuntimeControlEndpointError(
-      `The engine returned an invalid ${command.toLowerCase()} response.`,
-    );
+    return await options.run({ instanceId, socket });
   } catch (error) {
     if (isPipeMissing(error)) {
       return { status: 'not-running' };
@@ -617,138 +602,131 @@ async function requestRuntimeTransition(
   } finally {
     socket.destroy();
   }
+}
+
+async function requestRuntimeResponse(
+  socket: Socket,
+  command: string,
+  timeoutMs = 0,
+): Promise<string> {
+  socket.setTimeout(0);
+  socket.write(`${command}\n`);
+  return readLine(socket, timeoutMs);
+}
+
+function runtimeErrorReason(response: string, instanceId: string): string | undefined {
+  const prefix = `ERROR ${instanceId} `;
+  return response.startsWith(prefix) ? response.slice(prefix.length) : undefined;
+}
+
+async function requestRuntimeTransition(
+  configurationFilePath: string | undefined,
+  command: RuntimeTransitionCommand,
+): Promise<{ status: 'paused' | 'resumed'; instanceId: string } | RuntimeNotRunning> {
+  return withRuntimeConnection(configurationFilePath, {
+    notOwnedMessage:
+      `${RUNTIME_NOT_OWNED_PREFIX}; no ${command.toLowerCase()} request was sent.`,
+    run: async ({ instanceId, socket }) => {
+      const response = await requestRuntimeResponse(socket, `${command} ${instanceId}`);
+      const expected = command === 'PAUSE' ? `PAUSED ${instanceId}` : `RESUMED ${instanceId}`;
+      if (response === expected) {
+        return {
+          status: command === 'PAUSE' ? 'paused' : 'resumed',
+          instanceId,
+        };
+      }
+      const reason = runtimeErrorReason(response, instanceId);
+      if (reason !== undefined) {
+        throw new RuntimeControlEndpointError(
+          `The engine rejected the ${command.toLowerCase()} request (${reason}).`,
+        );
+      }
+      throw new RuntimeControlEndpointError(
+        `The engine returned an invalid ${command.toLowerCase()} response.`,
+      );
+    },
+  });
 }
 
 export async function requestRuntimeChangeDestination(
   configurationFilePath: string | undefined,
   destination: string,
 ): Promise<RuntimeChangeDestinationResult> {
-  if (process.platform !== 'win32') {
-    throw new RuntimeControlEndpointError('Runtime control is only supported on Windows.');
-  }
-
-  const endpoint = getRuntimeControlEndpoint(configurationFilePath);
-  const socket = createConnection(endpoint);
-  try {
-    let instanceId: string;
-    try {
-      const greeting = await readLine(socket);
-      const match = greeting.match(new RegExp(`^${PROTOCOL} ([0-9a-f-]{36})$`, 'i'));
-      if (!match) {
+  return withRuntimeConnection(configurationFilePath, {
+    notOwnedMessage:
+      `${RUNTIME_NOT_OWNED_PREFIX}; no destination change request was sent.`,
+    run: async ({ instanceId, socket }) => {
+      const response = await requestRuntimeResponse(
+        socket,
+        `DESTINATION ${instanceId} ${encodeProtocolText(destination)}`,
+      );
+      if (response === `CHANGED ${instanceId} RUNNING`) {
+        return { status: 'changed', instanceId, resumed: true };
+      }
+      if (response === `CHANGED ${instanceId} PAUSED`) {
+        return { status: 'changed', instanceId, resumed: false };
+      }
+      const rejectedPrefix = `REJECTED ${instanceId} `;
+      if (response.startsWith(rejectedPrefix)) {
+        const { resumed, reason } = parseDestinationFailureResponse(
+          response.slice(rejectedPrefix.length),
+        );
+        return { status: 'rejected', instanceId, reason, resumed };
+      }
+      const failedPrefix = `FAILED ${instanceId} `;
+      if (response.startsWith(failedPrefix)) {
+        const { resumed, reason } = parseDestinationFailureResponse(
+          response.slice(failedPrefix.length),
+        );
+        return { status: 'failed', instanceId, reason, resumed };
+      }
+      const reason = runtimeErrorReason(response, instanceId);
+      if (reason !== undefined) {
         throw new RuntimeControlEndpointError(
-          'The runtime-control endpoint is not owned by an impractical-bot engine; ' +
-          'no destination change request was sent.',
+          `The engine rejected the destination change request (${reason}).`,
         );
       }
-      instanceId = match[1];
-    } catch (error) {
-      if (isPipeMissing(error)) {
-        return { status: 'not-running' };
-      }
-      throw error;
-    }
-
-    socket.setTimeout(0);
-    socket.write(`DESTINATION ${instanceId} ${encodeProtocolText(destination)}\n`);
-    const response = await readLine(socket, 0);
-    if (response === `CHANGED ${instanceId} RUNNING`) {
-      return { status: 'changed', instanceId, resumed: true };
-    }
-    if (response === `CHANGED ${instanceId} PAUSED`) {
-      return { status: 'changed', instanceId, resumed: false };
-    }
-    const rejectedPrefix = `REJECTED ${instanceId} `;
-    if (response.startsWith(rejectedPrefix)) {
-      const { resumed, reason } = parseDestinationFailureResponse(
-        response.slice(rejectedPrefix.length),
-      );
-      return { status: 'rejected', instanceId, reason, resumed };
-    }
-    const failedPrefix = `FAILED ${instanceId} `;
-    if (response.startsWith(failedPrefix)) {
-      const { resumed, reason } = parseDestinationFailureResponse(
-        response.slice(failedPrefix.length),
-      );
-      return { status: 'failed', instanceId, reason, resumed };
-    }
-    if (response.startsWith(`ERROR ${instanceId} `)) {
-      const reason = response.slice(`ERROR ${instanceId} `.length);
       throw new RuntimeControlEndpointError(
-        `The engine rejected the destination change request (${reason}).`,
+        'The engine returned an invalid destination change response.',
       );
-    }
-    throw new RuntimeControlEndpointError(
-      'The engine returned an invalid destination change response.',
-    );
-  } catch (error) {
-    if (isPipeMissing(error)) {
-      return { status: 'not-running' };
-    }
-    throw error;
-  } finally {
-    socket.destroy();
-  }
+    },
+  });
 }
 
 export async function requestRuntimeSetTemperament(
   configurationFilePath: string | undefined,
   temperament: BotTemperament,
 ): Promise<RuntimeSetTemperamentResult> {
-  if (process.platform !== 'win32') {
-    throw new RuntimeControlEndpointError('Runtime control is only supported on Windows.');
-  }
-
-  const endpoint = getRuntimeControlEndpoint(configurationFilePath);
-  const socket = createConnection(endpoint);
-  try {
-    let instanceId: string;
-    try {
-      const greeting = await readLine(socket);
-      const match = greeting.match(new RegExp(`^${PROTOCOL} ([0-9a-f-]{36})$`, 'i'));
-      if (!match) {
+  return withRuntimeConnection(configurationFilePath, {
+    notOwnedMessage:
+      `${RUNTIME_NOT_OWNED_PREFIX}; no temperament change request was sent.`,
+    run: async ({ instanceId, socket }) => {
+      const response = await requestRuntimeResponse(
+        socket,
+        `TEMPERAMENT ${instanceId} ${encodeProtocolText(temperament)}`,
+      );
+      if (response === `CHANGED ${instanceId}`) {
+        return { status: 'changed', instanceId, temperament };
+      }
+      const failedPrefix = `FAILED ${instanceId} `;
+      if (response.startsWith(failedPrefix)) {
+        return {
+          status: 'failed',
+          instanceId,
+          reason: decodeProtocolText(response.slice(failedPrefix.length)),
+        };
+      }
+      const reason = runtimeErrorReason(response, instanceId);
+      if (reason !== undefined) {
         throw new RuntimeControlEndpointError(
-          'The runtime-control endpoint is not owned by an impractical-bot engine; ' +
-          'no temperament change request was sent.',
+          `The engine rejected the temperament change request (${reason}).`,
         );
       }
-      instanceId = match[1];
-    } catch (error) {
-      if (isPipeMissing(error)) {
-        return { status: 'not-running' };
-      }
-      throw error;
-    }
-
-    socket.setTimeout(0);
-    socket.write(`TEMPERAMENT ${instanceId} ${encodeProtocolText(temperament)}\n`);
-    const response = await readLine(socket, 0);
-    if (response === `CHANGED ${instanceId}`) {
-      return { status: 'changed', instanceId, temperament };
-    }
-    if (response.startsWith(`FAILED ${instanceId} `)) {
-      return {
-        status: 'failed',
-        instanceId,
-        reason: decodeProtocolText(response.slice(`FAILED ${instanceId} `.length)),
-      };
-    }
-    if (response.startsWith(`ERROR ${instanceId} `)) {
-      const reason = response.slice(`ERROR ${instanceId} `.length);
       throw new RuntimeControlEndpointError(
-        `The engine rejected the temperament change request (${reason}).`,
+        'The engine returned an invalid temperament change response.',
       );
-    }
-    throw new RuntimeControlEndpointError(
-      'The engine returned an invalid temperament change response.',
-    );
-  } catch (error) {
-    if (isPipeMissing(error)) {
-      return { status: 'not-running' };
-    }
-    throw error;
-  } finally {
-    socket.destroy();
-  }
+    },
+  });
 }
 
 export async function requestRuntimeSetPersonality(
@@ -756,70 +734,45 @@ export async function requestRuntimeSetPersonality(
   mode: BotPersonalityMode,
   instruction: string,
 ): Promise<RuntimeSetPersonalityResult> {
-  if (process.platform !== 'win32') {
-    throw new RuntimeControlEndpointError('Runtime control is only supported on Windows.');
-  }
-
-  const endpoint = getRuntimeControlEndpoint(configurationFilePath);
-  const socket = createConnection(endpoint);
-  try {
-    let instanceId: string;
-    try {
-      const greeting = await readLine(socket);
-      const match = greeting.match(new RegExp(`^${PROTOCOL} ([0-9a-f-]{36})$`, 'i'));
-      if (!match) {
+  return withRuntimeConnection(configurationFilePath, {
+    notOwnedMessage:
+      `${RUNTIME_NOT_OWNED_PREFIX}; no personality change request was sent.`,
+    run: async ({ instanceId, socket }) => {
+      const response = await requestRuntimeResponse(
+        socket,
+        `PERSONALITY ${instanceId} ${encodeProtocolText(mode)} ${encodeProtocolText(instruction)}`,
+      );
+      if (response === `CHANGED ${instanceId}`) {
+        return { status: 'changed', instanceId, mode, instruction };
+      }
+      const failedPrefix = `FAILED ${instanceId} `;
+      if (response.startsWith(failedPrefix)) {
+        return {
+          status: 'failed',
+          instanceId,
+          reason: decodeProtocolText(response.slice(failedPrefix.length)),
+        };
+      }
+      const reason = runtimeErrorReason(response, instanceId);
+      if (reason !== undefined) {
         throw new RuntimeControlEndpointError(
-          'The runtime-control endpoint is not owned by an impractical-bot engine; ' +
-          'no personality change request was sent.',
+          `The engine rejected the personality change request (${reason}).`,
         );
       }
-      instanceId = match[1];
-    } catch (error) {
-      if (isPipeMissing(error)) {
-        return { status: 'not-running' };
-      }
-      throw error;
-    }
-
-    socket.setTimeout(0);
-    socket.write(`PERSONALITY ${instanceId} ${encodeProtocolText(mode)} ${encodeProtocolText(instruction)}\n`);
-    const response = await readLine(socket, 0);
-    if (response === `CHANGED ${instanceId}`) {
-      return { status: 'changed', instanceId, mode, instruction };
-    }
-    if (response.startsWith(`FAILED ${instanceId} `)) {
-      return {
-        status: 'failed',
-        instanceId,
-        reason: decodeProtocolText(response.slice(`FAILED ${instanceId} `.length)),
-      };
-    }
-    if (response.startsWith(`ERROR ${instanceId} `)) {
-      const reason = response.slice(`ERROR ${instanceId} `.length);
       throw new RuntimeControlEndpointError(
-        `The engine rejected the personality change request (${reason}).`,
+        'The engine returned an invalid personality change response.',
       );
-    }
-    throw new RuntimeControlEndpointError(
-      'The engine returned an invalid personality change response.',
-    );
-  } catch (error) {
-    if (isPipeMissing(error)) {
-      return { status: 'not-running' };
-    }
-    throw error;
-  } finally {
-    socket.destroy();
-  }
+    },
+  });
 }
 
-export type RuntimeStatusResult =
-  | { status: 'running'; instanceId: string }
-  | { status: 'not-running' };
+type RuntimeRunningStatus = { status: 'running'; instanceId: string };
+
+export type RuntimeStatusResult = RuntimeRunningStatus | RuntimeNotRunning;
 
 export type RuntimeStatusSnapshotResult =
-  | ({ status: 'running'; instanceId: string } & RuntimeStatusSnapshot)
-  | { status: 'not-running' }
+  | (RuntimeRunningStatus & RuntimeStatusSnapshot)
+  | RuntimeNotRunning
   | { status: 'unsupported'; instanceId: string };
 
 function isRuntimeEngineState(value: string): value is RuntimeEngineState {
@@ -833,109 +786,60 @@ function isBrowserId(value: string): value is BrowserId {
 export async function requestRuntimeStatusSnapshot(
   configurationFilePath?: string,
 ): Promise<RuntimeStatusSnapshotResult> {
-  if (process.platform !== 'win32') {
-    throw new RuntimeControlEndpointError('Runtime control is only supported on Windows.');
-  }
-
-  const endpoint = getRuntimeControlEndpoint(configurationFilePath);
-  const socket = createConnection(endpoint);
-  try {
-    let instanceId: string;
-    try {
-      const greeting = await readLine(socket);
-      const match = greeting.match(new RegExp(`^${PROTOCOL} ([0-9a-f-]{36})$`, 'i'));
-      if (!match) {
-        throw new RuntimeControlEndpointError(
-          'The runtime-control endpoint is not owned by an impractical-bot engine; ' +
-          'no status request was sent.',
-        );
+  return withRuntimeConnection(configurationFilePath, {
+    notOwnedMessage: `${RUNTIME_NOT_OWNED_PREFIX}; no status request was sent.`,
+    run: async ({ instanceId, socket }) => {
+      const response = await requestRuntimeResponse(socket, `STATUS ${instanceId}`);
+      const responsePrefix = `STATUS ${instanceId} `;
+      if (response.startsWith(responsePrefix)) {
+        const [state, browser, temperament, personality, encodedDestination, ...extra] =
+          response.slice(responsePrefix.length).split(' ');
+        if (
+          extra.length > 0 ||
+          !isRuntimeEngineState(state) ||
+          !isBrowserId(browser) ||
+          !isBotTemperament(temperament) ||
+          !isBotPersonalityMode(personality) ||
+          encodedDestination === undefined
+        ) {
+          throw new RuntimeControlEndpointError(
+            'The engine returned an invalid status response.',
+          );
+        }
+        return {
+          status: 'running',
+          instanceId,
+          state,
+          browser,
+          temperament,
+          personality,
+          messengerDestination: decodeProtocolText(encodedDestination),
+        };
       }
-      instanceId = match[1];
-    } catch (error) {
-      if (isPipeMissing(error)) {
-        return { status: 'not-running' };
-      }
-      throw error;
-    }
-
-    socket.setTimeout(0);
-    socket.write(`STATUS ${instanceId}\n`);
-    const response = await readLine(socket, 0);
-    const responsePrefix = `STATUS ${instanceId} `;
-    if (response.startsWith(responsePrefix)) {
-      const [state, browser, temperament, personality, encodedDestination, ...extra] =
-        response.slice(responsePrefix.length).split(' ');
       if (
-        extra.length > 0 ||
-        !isRuntimeEngineState(state) ||
-        !isBrowserId(browser) ||
-        !isBotTemperament(temperament) ||
-        !isBotPersonalityMode(personality) ||
-        encodedDestination === undefined
+        response === `ERROR ${instanceId} UNSUPPORTED` ||
+        response === `ERROR ${instanceId} INVALID_REQUEST`
       ) {
+        return { status: 'unsupported', instanceId };
+      }
+      const reason = runtimeErrorReason(response, instanceId);
+      if (reason !== undefined) {
         throw new RuntimeControlEndpointError(
-          'The engine returned an invalid status response.',
+          `The engine could not provide its runtime status (${reason}).`,
         );
       }
-      return {
-        status: 'running',
-        instanceId,
-        state,
-        browser,
-        temperament,
-        personality,
-        messengerDestination: decodeProtocolText(encodedDestination),
-      };
-    }
-    if (
-      response === `ERROR ${instanceId} UNSUPPORTED` ||
-      response === `ERROR ${instanceId} INVALID_REQUEST`
-    ) {
-      return { status: 'unsupported', instanceId };
-    }
-    if (response.startsWith(`ERROR ${instanceId} `)) {
-      const reason = response.slice(`ERROR ${instanceId} `.length);
-      throw new RuntimeControlEndpointError(
-        `The engine could not provide its runtime status (${reason}).`,
-      );
-    }
-    throw new RuntimeControlEndpointError('The engine returned an invalid status response.');
-  } catch (error) {
-    if (isPipeMissing(error)) {
-      return { status: 'not-running' };
-    }
-    throw error;
-  } finally {
-    socket.destroy();
-  }
+      throw new RuntimeControlEndpointError('The engine returned an invalid status response.');
+    },
+  });
 }
 
 export async function requestRuntimeStatus(
   configurationFilePath?: string,
 ): Promise<RuntimeStatusResult> {
-  if (process.platform !== 'win32') {
-    throw new RuntimeControlEndpointError('Runtime control is only supported on Windows.');
-  }
-
-  const endpoint = getRuntimeControlEndpoint(configurationFilePath);
-  const socket = createConnection(endpoint);
-  try {
-    const greeting = await readLine(socket);
-    const match = greeting.match(new RegExp(`^${PROTOCOL} ([0-9a-f-]{36})$`, 'i'));
-    if (!match) {
-      throw new RuntimeControlEndpointError(
-        'The runtime-control endpoint is not owned by an impractical-bot engine.',
-      );
-    }
-    return { status: 'running', instanceId: match[1] };
-  } catch (error) {
-    if (isPipeMissing(error)) {
-      return { status: 'not-running' };
-    }
-    throw error;
-  } finally {
-    socket.destroy();
-  }
+  return withRuntimeConnection(configurationFilePath, {
+    notOwnedMessage: `${RUNTIME_NOT_OWNED_PREFIX}.`,
+    run: async ({ instanceId }) => ({ status: 'running', instanceId }),
+  });
 }
 
 export async function requestRuntimePause(
@@ -964,66 +868,44 @@ export async function requestRuntimeStop(
   configurationFilePath?: string,
   options: RuntimeStopOptions = {},
 ): Promise<RuntimeStopResult> {
-  if (process.platform !== 'win32') {
-    throw new RuntimeControlEndpointError('Runtime control is only supported on Windows.');
-  }
+  assertWindowsRuntimeSupport();
 
   const responseTimeoutMs = options.responseTimeoutMs ?? STOP_RESPONSE_TIMEOUT_MS;
   if (responseTimeoutMs <= 0) {
     throw new RuntimeControlEndpointError('Runtime stop response timeout must be positive.');
   }
 
-  const endpoint = getRuntimeControlEndpoint(configurationFilePath);
-  const socket = createConnection(endpoint);
-  try {
-    let instanceId: string;
-    try {
-      const greeting = await readLine(socket);
-      const match = greeting.match(new RegExp(`^${PROTOCOL} ([0-9a-f-]{36})$`, 'i'));
-      if (!match) {
+  return withRuntimeConnection(configurationFilePath, {
+    notOwnedMessage: `${RUNTIME_NOT_OWNED_PREFIX}; no stop request was sent.`,
+    run: async ({ instanceId, socket }) => {
+      let response: string;
+      try {
+        response = await requestRuntimeResponse(
+          socket,
+          `STOP ${instanceId}`,
+          responseTimeoutMs,
+        );
+      } catch (error) {
+        if (error instanceof RuntimeControlTimeoutError) {
+          throw new RuntimeControlTimeoutError(
+            'Timed out waiting for the runtime-control stop response; the engine may have ' +
+            'stopped, so shutdown is not confirmed.',
+          );
+        }
+        throw error;
+      }
+      if (response === `STOPPED ${instanceId} 0` || response === `STOPPED ${instanceId} 130`) {
+        return { status: 'stopped', instanceId };
+      }
+      const failedPrefix = `FAILED ${instanceId} `;
+      if (response.startsWith(failedPrefix)) {
         throw new RuntimeControlEndpointError(
-          'The runtime-control endpoint is not owned by an impractical-bot engine; no stop request was sent.',
+          `The engine received the stop request but shutdown failed (exit code ${response.slice(failedPrefix.length)}).`,
         );
       }
-      instanceId = match[1];
-    } catch (error) {
-      if (isPipeMissing(error)) {
-        return { status: 'not-running' };
-      }
-      throw error;
-    }
-
-    socket.setTimeout(0);
-    socket.write(`STOP ${instanceId}\n`);
-    let response: string;
-    try {
-      response = await readLine(socket, responseTimeoutMs);
-    } catch (error) {
-      if (error instanceof RuntimeControlTimeoutError) {
-        throw new RuntimeControlTimeoutError(
-          'Timed out waiting for the runtime-control stop response; the engine may have ' +
-          'stopped, so shutdown is not confirmed.',
-        );
-      }
-      throw error;
-    }
-    if (response === `STOPPED ${instanceId} 0` || response === `STOPPED ${instanceId} 130`) {
-      return { status: 'stopped', instanceId };
-    }
-    if (response.startsWith(`FAILED ${instanceId} `)) {
-      throw new RuntimeControlEndpointError(
-        `The engine received the stop request but shutdown failed (exit code ${response.slice(`FAILED ${instanceId} `.length)}).`,
-      );
-    }
-    throw new RuntimeControlEndpointError('The engine returned an invalid stop response.');
-  } catch (error) {
-    if (isPipeMissing(error)) {
-      return { status: 'not-running' };
-    }
-    throw error;
-  } finally {
-    socket.destroy();
-  }
+      throw new RuntimeControlEndpointError('The engine returned an invalid stop response.');
+    },
+  });
 }
 
 export type RuntimeShutdownWaitResult =

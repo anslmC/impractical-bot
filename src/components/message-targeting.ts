@@ -1,3 +1,5 @@
+import { escapeRegExp } from './escape-regexp.js';
+import { appendOrReplaceInstructionSection } from './instruction-section.js';
 import {
   buildParticipantNameForms,
   participantNameKey,
@@ -71,10 +73,6 @@ const CALLER_TARGET =
   /^@?([\p{L}\p{N}][\p{L}\p{N}._' -]*?)\s+(?:is|was)\s+(?:calling|looking\s+for|asking\s+for|waiting\s+for|trying\s+to\s+reach|needs|wants)\s+@?([\p{L}\p{N}][\p{L}\p{N}._' -]*)/iu;
 const ABOUT_MARKERS =
   /\b(?:about|talking|mentioned|said|told|asked|saw|seen|met|know|knows|with|to|for|from|again|today|yesterday|tomorrow|tonight|now|later|always|never|still|already|because|when|if|while|after|before)\b/iu;
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
 
 function buildNameEntries(awareness: ParticipantAwareness): NameEntry[] {
   const entries = new Map<string, NameEntry>();
@@ -635,13 +633,9 @@ export function appendMessageTargetingInstruction(
   if (!instruction) {
     return systemInstruction;
   }
-  const sections = systemInstruction.split(/\n{2,}/u);
-  const index = sections.findIndex(section =>
-    section.trimStart().startsWith(MESSAGE_TARGETING_INSTRUCTION_MARKER)
+  return appendOrReplaceInstructionSection(
+    systemInstruction,
+    instruction,
+    MESSAGE_TARGETING_INSTRUCTION_MARKER,
   );
-  if (index >= 0) {
-    sections[index] = instruction;
-    return sections.join('\n\n');
-  }
-  return [systemInstruction.trim(), instruction].filter(Boolean).join('\n\n');
 }

@@ -1,3 +1,5 @@
+import { escapeRegExp } from './escape-regexp.js';
+
 export interface SelfIdentity {
   name: string;
   aliases?: readonly string[];
@@ -14,10 +16,6 @@ const PROHIBITION_CUE =
   /\b(?:not|never|stop|dont|don't|doesn't|quit|anymore)\b|\bno more\b/i;
 const CONTINUATION_CUE =
   /^(?:no,?\s+)?(?:again|repeat(?:\s+it)?|one more(?:\s+time)?|once more|say it again|do it again)\b/i;
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
 
 function selfReferenceForms({ name, aliases = [] }: SelfIdentity): string[] {
   const forms = new Set<string>();

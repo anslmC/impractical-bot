@@ -1,12 +1,9 @@
 import {
   DEFAULT_MAXIMUM_LOG_ENTRIES,
   DashboardLogBuffer,
-  captureConsoleOutput,
   dashboardLogCategory,
   formatDebugLogEntries,
   sanitizeLogText,
-  type ConsoleCapture,
-  type ConsoleCaptureOptions,
   type DashboardLogEntry,
 } from './logs.js';
 import {
@@ -19,12 +16,13 @@ import {
 } from './theme.js';
 import {
   DashboardTerminalError,
-  TerminalSession,
   checkDashboardTerminal,
   type TerminalDimensions,
   type TerminalHandoff,
 } from './terminal.js';
 import type { TerminalKey } from './input.js';
+import { advanceLogScroll, resolveLogScrollState, type LogScrollState } from './scroll.js';
+import { TerminalViewLifecycle } from './session.js';
 import { renderPlainWordmark } from './wordmark.js';
 
 export const DEBUG_VIEWPORT_SUBTITLE = 'DEBUG VIEWPORT';
@@ -58,14 +56,7 @@ export interface DebugViewportOptions {
   readonly spinnerIntervalMs?: number;
 }
 
-export interface DebugScrollState {
-  readonly offset: number;
-  readonly maximumOffset: number;
-  readonly visibleLines: number;
-  readonly totalLines: number;
-  readonly unseenCount: number;
-  readonly pinned: boolean;
-}
+export type DebugScrollState = LogScrollState;
 
 export interface DebugViewportSession {
   readonly closed: Promise<void>;
@@ -220,14 +211,7 @@ function buildDebugFrame(
   if (columns === 0 || rows === 0) {
     return {
       lines: [],
-      state: {
-        offset: 0,
-        maximumOffset: 0,
-        visibleLines: 0,
-        totalLines: 0,
-        unseenCount,
-        pinned: true,
-      },
+      state: resolveLogScrollState(0, 0, 0, unseenCount),
     };
   }
 
@@ -236,19 +220,7 @@ function buildDebugFrame(
   const all = debugLogLines(displayed, columns, color);
   const footerHeight = 2;
   const capacity = Math.max(0, rows - header.length - footerHeight);
-  const maximumOffset = Math.max(0, all.length - capacity);
-  const offset = Math.max(
-    0,
-    Math.min(Math.floor(Number.isFinite(scrollOffset) ? scrollOffset : 0), maximumOffset),
-  );
-  const state: DebugScrollState = {
-    offset,
-    maximumOffset,
-    visibleLines: Math.min(capacity, all.length),
-    totalLines: all.length,
-    unseenCount,
-    pinned: offset === 0,
-  };
+  const state = resolveLogScrollState(all.length, capacity, scrollOffset, unseenCount);
   const footer = debugFooter(state, columns, color);
 
   if (capacity < 1) {
@@ -262,7 +234,7 @@ function buildDebugFrame(
     return { lines: compact, state };
   }
 
-  const end = all.length - offset;
+  const end = all.length - state.offset;
   const start = Math.max(0, end - capacity);
   const visible = all.slice(start, end);
   while (visible.length < capacity) {
@@ -331,14 +303,6 @@ export async function startDebugView(
   let activityMessage: string | undefined;
   let activityFrameIndex = 0;
   let activityTimer: ReturnType<typeof setInterval> | undefined;
-  let capturedConsole: ConsoleCapture | undefined;
-  let unsubscribeLogs: (() => void) | undefined;
-  let finalized = false;
-  let closed = false;
-  let resolveClosed!: () => void;
-  const closedPromise = new Promise<void>(resolve => {
-    resolveClosed = resolve;
-  });
 
   const spinnerFrame = (): string | undefined => activityMessage === undefined
     ? undefined
@@ -351,10 +315,7 @@ export async function startDebugView(
     }
   };
 
-  const dimensions = (): TerminalDimensions => terminalSession?.dimensions ?? {
-    columns: output.columns ?? 80,
-    rows: output.rows ?? 24,
-  };
+  const dimensions = (): TerminalDimensions => lifecycle.dimensions;
 
   const frameAt = (
     offset: number,
@@ -371,31 +332,21 @@ export async function startDebugView(
 
   const state = (): DebugScrollState => frameAt(scrollOffset, unseenCount).state;
 
-  const totalLines = (): number => debugLogLines(
-    entriesWithActivity(logBuffer.getEntries(), activityMessage, spinnerFrame()),
-    Math.max(0, Math.floor(dimensions().columns)),
-    colorEnabled,
-  ).length;
-
-  const render = (): void => {
-    if (closed || terminalSession === undefined) {
+  const commitFrame = (next: number): void => {
+    if (lifecycle.isClosed) {
       return;
     }
-    let frame = frameAt(scrollOffset, unseenCount);
-    if (frame.state.offset === 0 && unseenCount !== 0) {
-      unseenCount = 0;
-      frame = frameAt(scrollOffset, unseenCount);
-    }
+    const frame = frameAt(next, unseenCount);
     scrollOffset = frame.state.offset;
+    unseenCount = frame.state.unseenCount;
     knownTotalLines = frame.state.totalLines;
-    if (scrollOffset === 0) {
-      unseenCount = 0;
-    }
-    terminalSession.render(frame.lines);
+    lifecycle.render(frame.lines);
   };
 
+  const render = (): void => commitFrame(scrollOffset);
+
   const scheduleRender = (): void => {
-    if (closed || pendingRender !== undefined) {
+    if (lifecycle.isClosed || pendingRender !== undefined) {
       return;
     }
     pendingRender = setImmediate(() => {
@@ -405,7 +356,7 @@ export async function startDebugView(
   };
 
   const startActivity = (message: string): void => {
-    if (closed || terminalSession === undefined || message.length === 0) {
+    if (lifecycle.isClosed || message.length === 0) {
       return;
     }
     clearActivityTimer();
@@ -418,7 +369,7 @@ export async function startDebugView(
       ? Math.floor(requestedInterval)
       : DEBUG_SPINNER_INTERVAL_MS;
     activityTimer = setInterval(() => {
-      if (closed || activityMessage === undefined) {
+      if (lifecycle.isClosed || activityMessage === undefined) {
         return;
       }
       activityFrameIndex = (activityFrameIndex + 1) % DEBUG_SPINNER_FRAMES.length;
@@ -440,45 +391,22 @@ export async function startDebugView(
   };
 
   const handleEntry = (): void => {
-    if (closed) {
+    if (lifecycle.isClosed) {
       return;
     }
-    const after = totalLines();
-    if (scrollOffset > 0) {
-      unseenCount += 1;
-      const added = after - knownTotalLines;
-      if (added > 0) {
-        scrollOffset += added;
-      }
-      const maximumOffset = frameAt(scrollOffset, unseenCount).state.maximumOffset;
-      scrollOffset = Math.min(scrollOffset, maximumOffset);
-      if (scrollOffset <= 0) {
-        scrollOffset = 0;
-        unseenCount = 0;
-      }
-    } else {
-      knownTotalLines = after;
-      unseenCount = 0;
-    }
+    const measurement = frameAt(scrollOffset, unseenCount).state;
+    const next = advanceLogScroll(
+      { offset: scrollOffset, unseenCount, knownTotalLines },
+      measurement.totalLines,
+      measurement.maximumOffset,
+    );
+    scrollOffset = next.offset;
+    unseenCount = next.unseenCount;
+    knownTotalLines = next.knownTotalLines;
     scheduleRender();
   };
 
-  const applyScroll = (next: number): void => {
-    if (closed || terminalSession === undefined) {
-      return;
-    }
-    let frame = frameAt(next, unseenCount);
-    if (frame.state.offset === 0 && unseenCount !== 0) {
-      unseenCount = 0;
-      frame = frameAt(frame.state.offset, unseenCount);
-    }
-    scrollOffset = frame.state.offset;
-    knownTotalLines = frame.state.totalLines;
-    if (scrollOffset === 0) {
-      unseenCount = 0;
-    }
-    terminalSession.render(frame.lines);
-  };
+  const applyScroll = (next: number): void => commitFrame(next);
 
   const pageAmount = (): number => Math.max(1, state().visibleLines);
 
@@ -496,7 +424,7 @@ export async function startDebugView(
   };
 
   const handleKey = (key: TerminalKey): void => {
-    if (closed) {
+    if (lifecycle.isClosed) {
       return;
     }
     switch (key) {
@@ -532,7 +460,7 @@ export async function startDebugView(
   };
 
   const handleText = (text: string): void => {
-    if (closed) {
+    if (lifecycle.isClosed) {
       return;
     }
     for (const character of text) {
@@ -550,86 +478,39 @@ export async function startDebugView(
     }
   };
 
-  const finalize = (): void => {
-    if (finalized) {
-      return;
-    }
-    finalized = true;
-    closed = true;
-    clearActivityTimer();
-    activityMessage = undefined;
-    activityFrameIndex = 0;
-    if (pendingRender !== undefined) {
-      clearImmediate(pendingRender);
-      pendingRender = undefined;
-    }
-    unsubscribeLogs?.();
-    unsubscribeLogs = undefined;
-    try {
-      capturedConsole?.restore();
-    } catch {
-      // Console restoration is best effort during teardown.
-    }
-    capturedConsole = undefined;
-    resolveClosed();
-  };
-
-  async function closeWithOptions(
-    preserveState: boolean,
-  ): Promise<TerminalHandoff | undefined> {
-    if (closed) {
-      return undefined;
-    }
-    closed = true;
-    const session = terminalSession;
-    const handoff = session === undefined
-      ? undefined
-      : await session.close({ preserveState });
-    finalize();
-    return handoff;
-  }
-
-  async function close(): Promise<void> {
-    await closeWithOptions(false);
-  }
-
+  const close = (): Promise<void> => lifecycle.close();
   const closeForHandoff = (): Promise<TerminalHandoff | undefined> =>
-    closeWithOptions(true);
+    lifecycle.closeForHandoff();
 
-  const terminalSession = new TerminalSession({
+  const lifecycle = new TerminalViewLifecycle({
     input,
     output,
     handoff: options.handoff,
     escapeTimeoutMs: options.escapeTimeoutMs,
+    logBuffer,
+    captureConsoleOutput: options.captureConsoleOutput,
+    now: options.now,
     onKey: handleKey,
     onText: handleText,
     onResize: () => {
       render();
     },
+    onLogEntry: handleEntry,
+    onFinalize: () => {
+      clearActivityTimer();
+      activityMessage = undefined;
+      activityFrameIndex = 0;
+      if (pendingRender !== undefined) {
+        clearImmediate(pendingRender);
+        pendingRender = undefined;
+      }
+    },
   });
-  void terminalSession.closed.then(finalize);
 
-  if (options.captureConsoleOutput) {
-    const captureOptions: ConsoleCaptureOptions = {
-      now: options.now,
-      buffer: logBuffer,
-    };
-    capturedConsole = captureConsoleOutput(logBuffer.capacity, captureOptions);
-  }
-
-  try {
-    terminalSession.start();
-    render();
-  } catch (error) {
-    await close();
-    throw error;
-  }
-
-  unsubscribeLogs = logBuffer.subscribe(handleEntry);
-  knownTotalLines = totalLines();
+  await lifecycle.start(render);
 
   return {
-    closed: closedPromise,
+    closed: lifecycle.closed,
     close,
     closeForHandoff,
     refresh: render,

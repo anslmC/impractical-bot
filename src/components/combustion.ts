@@ -120,7 +120,10 @@ const MESSAGE_HISTORY_LIMIT = 200;
 const PENDING_OUTGOING_REPLY_TTL_MS = 120000;
 const MAX_PENDING_OUTGOING_REPLIES = 8;
 const LOG_PREFIX = '__MESSENGER_WAKER__:';
-const DEBUG_ENGINE = true;
+
+export function isEngineDebugEnabled(): boolean {
+  return process.env.IMPBOT_DEBUG === '1';
+}
 
 const styled = formatTerminalText;
 
@@ -1351,7 +1354,7 @@ export async function startCombustion({
     }
     clearTimeout(idleTimer);
     idleDeadline = Date.now() + IDLE_THRESHOLD_MS;
-    if (DEBUG_ENGINE) {
+    if (isEngineDebugEnabled()) {
       console.log(formatSubsystemStatus(
         'idle',
         `Timer reset (${styled(`${IDLE_THRESHOLD_MS / 1000}s`, 'bold')}).`,
@@ -1536,7 +1539,7 @@ export async function startCombustion({
       messageSelector: WAKER_MESSAGE_SELECTOR,
       logSelector: LOG_SELECTOR,
       logPrefix: LOG_PREFIX,
-      debug: DEBUG_ENGINE,
+      debug: isEngineDebugEnabled(),
     });
     observerAttached = true;
   };
@@ -1556,7 +1559,7 @@ export async function startCombustion({
       return;
     }
     const diagnostic = text.slice(LOG_PREFIX.length);
-    console.log(DEBUG_ENGINE
+    console.log(isEngineDebugEnabled()
       ? `[waker] Potential DOM activity; ${diagnostic}`
       : '[waker] Potential DOM activity detected.');
     signalPollerWake();
@@ -2817,7 +2820,7 @@ export async function startCombustion({
         ));
       }
     }
-    console.log(DEBUG_ENGINE
+    console.log(isEngineDebugEnabled()
       ? formatSubsystemStatus(
         'rng',
         `Opportunities evaluated with the poller; at most one roll every ` +
@@ -2827,7 +2830,7 @@ export async function startCombustion({
         `${styled(`${getBotTemperamentCooldownMs(botTemperament) / 1000}s`, 'bold')} cooldown.`,
       )
       : formatSubsystemStatus('rng', 'Opportunities evaluated with the poller.'));
-    console.log(DEBUG_ENGINE
+    console.log(isEngineDebugEnabled()
       ? formatSubsystemStatus(
         'poller',
         `Active; sampling every ${styled(String(POLL_INTERVAL_MS), 'bold')} ms.`,

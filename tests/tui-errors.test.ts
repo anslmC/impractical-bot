@@ -283,6 +283,32 @@ test('dashboard startup failures stay concise while retaining terminal diagnosti
   assert.match(detail, /stdin is not an interactive terminal/);
 });
 
+test('dashboard startup failures after terminal start restore listeners and capture', async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  const originalLog = console.log;
+  output.write = () => {
+    throw new Error('output unavailable');
+  };
+
+  await assert.rejects(
+    startDashboard({
+      input: streamInput(input),
+      output: streamOutput(output),
+      requestStatus: async () => runningStatus,
+      captureConsoleOutput: true,
+    }),
+    /output unavailable/,
+  );
+
+  assert.equal(console.log, originalLog);
+  assert.equal(input.listenerCount('data'), 0);
+  assert.equal(input.listenerCount('error'), 0);
+  assert.equal(output.listenerCount('resize'), 0);
+  assert.equal(output.listenerCount('error'), 0);
+  assert.deepEqual(input.rawModes, []);
+});
+
 test('status polling failures are logged once per identical detail without flooding', async () => {
   const input = new FakeInput();
   const output = new FakeOutput();

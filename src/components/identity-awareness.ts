@@ -1,3 +1,5 @@
+import { appendOrReplaceInstructionSection } from './instruction-section.js';
+
 export const IDENTITY_AWARENESS_INSTRUCTION_MARKER = 'Identity and recipient awareness:';
 
 export interface IdentityAwarenessOptions {
@@ -65,13 +67,9 @@ export function appendIdentityAwarenessInstruction(
   if (!instruction) {
     return systemInstruction;
   }
-  const sections = systemInstruction.split(/\n{2,}/u);
-  const awarenessIndex = sections.findIndex(section =>
-    section.trimStart().startsWith(IDENTITY_AWARENESS_INSTRUCTION_MARKER)
+  return appendOrReplaceInstructionSection(
+    systemInstruction,
+    instruction,
+    IDENTITY_AWARENESS_INSTRUCTION_MARKER,
   );
-  if (awarenessIndex >= 0) {
-    sections[awarenessIndex] = instruction;
-    return sections.join('\n\n');
-  }
-  return [systemInstruction.trim(), instruction].filter(Boolean).join('\n\n');
 }

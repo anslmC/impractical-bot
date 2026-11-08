@@ -109,6 +109,19 @@ test('appending enriched awareness replaces the composed section without duplica
   assert.match(enriched, /Other identified participants in this conversation: Alex, Blair\./);
 });
 
+test('appending awareness adds the section when no marker exists', () => {
+  const options = {
+    identity: { name: 'TestBot', aliases: ['@TestBot'] },
+    participantNames: ['Alex', 'Blair'],
+  };
+  const instruction = buildIdentityAwarenessInstruction(options);
+
+  assert.equal(
+    appendIdentityAwarenessInstruction('Base instruction.', options),
+    `Base instruction.\n\n${instruction}`,
+  );
+});
+
 test('malformed participant data falls back without blocking the system instruction', () => {
   const participantNames = [{
     trim: () => {

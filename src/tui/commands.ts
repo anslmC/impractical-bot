@@ -2,6 +2,7 @@ import {
   BOT_PERSONALITY_MODES,
   BOT_TEMPERAMENTS,
   MAX_PERSONALITY_INSTRUCTION_CHARS,
+  isHttpOrHttpsUrl,
   type BotPersonalityMode,
   type BotTemperament,
 } from '../config/configuration.js';
@@ -168,24 +169,13 @@ export type DestinationValidation =
 
 export function validateDestinationInput(value: string): DestinationValidation {
   const destination = value.trim();
-  if (destination.length === 0) {
+  if (destination.length === 0 || !isHttpOrHttpsUrl(destination)) {
     return {
       ok: false,
       message: 'Enter a valid HTTP or HTTPS URL.',
     };
   }
-  try {
-    const parsed = new URL(destination);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      throw new Error('unsupported protocol');
-    }
-    return { ok: true, value: destination };
-  } catch {
-    return {
-      ok: false,
-      message: 'Enter a valid HTTP or HTTPS URL.',
-    };
-  }
+  return { ok: true, value: destination };
 }
 
 export interface PromptInputRender {

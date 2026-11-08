@@ -471,6 +471,41 @@ test('new log entries never reset a manually selected scroll position', async ()
   }
 });
 
+test('new debug entries keep the viewport anchored across buffer eviction', async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  output.rows = 12;
+  const buffer = new DashboardLogBuffer(40);
+  for (let index = 0; index < 40; index += 1) {
+    buffer.add(logEntry(`entry-${index + 1}`));
+  }
+  const session = await startDebugView({
+    input: streamInput(input),
+    output: streamOutput(output),
+    logBuffer: buffer,
+  });
+
+  try {
+    input.emit('data', Buffer.from('\u001b[5~'));
+    const before = session.getScrollState();
+    assert.equal(before.pinned, false);
+    assert.ok(before.offset > 0);
+
+    buffer.add(logEntry('arrived-after-eviction'));
+    const after = session.getScrollState();
+    assert.equal(after.totalLines, before.totalLines);
+    assert.equal(after.offset, before.offset);
+    assert.equal(after.unseenCount, 1);
+    assert.equal(after.pinned, false);
+
+    input.emit('data', Buffer.from('\u001b[6~'));
+    assert.equal(session.getScrollState().offset, 0);
+    assert.equal(session.getScrollState().pinned, true);
+  } finally {
+    await session.close();
+  }
+});
+
 test('multiline entries are counted and rendered as separate rows', () => {
   const entries = [logEntry('first line\nsecond line\nthird line')];
   const rows = renderDebugLines(entries, { columns: 40, rows: 12 });

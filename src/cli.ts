@@ -59,12 +59,9 @@ import {
   validateConfiguration,
   type ComposerSlicerOverrides,
   type Configuration,
+  type ConfigurationLoadResult,
 } from './config/configuration.js';
-import {
-  composeMessengerReply,
-  type ReplyCompositionResult,
-} from './components/composer.js';
-import { composeProductionSystemInstruction } from './components/personality.js';
+import { composeMessengerReply } from './components/composer.js';
 import { generateAliases } from './components/alias-engine.js';
 import {
   formatTerminalDiagnostic,
@@ -403,7 +400,7 @@ function handleConfig(writeOutput: Output, writeError: Output, filePath?: string
     `  Executable: ${configuration.executablePath}`,
     `  Profile: ${configuration.profilePath}`,
     `  Skip PIN restoration: ${configuration.skipPinRestoration}`,
-    `  Messenger restoration PIN: ${configuration.pin}`,
+    `  Messenger restoration PIN: ${configuration.pin === null ? 'not configured' : '[redacted]'}`,
     `  CDP port: ${configuration.cdpPort ?? 'not configured'}`,
     `  Startup URL: ${configuration.startupUrl ?? 'not configured'}`,
     `  Message destination: ${configuration.messageDestination ?? 'not configured'}`,
@@ -669,108 +666,118 @@ async function updatePuppetName(
   }
 }
 
-function loadLatestConfiguration(
-  configurationFilePath: string | undefined,
-  writeError: Output,
-  failurePrefix: string,
-): Configuration | undefined {
-  let result;
-  try {
-    result = loadConfiguration(configurationFilePath);
-  } catch (error) {
-    writeError(`${failurePrefix}: ${error instanceof Error ? error.message : String(error)}`);
-    return undefined;
-  }
+type ConfigurationReadFailure =
+  | { kind: 'error'; error: unknown }
+  | { kind: 'missing' }
+  | { kind: 'malformed'; message: string }
+  | { kind: 'unsupported-version'; version: number }
+  | { kind: 'pin-required' };
 
-  if (result.status === 'missing') {
-    writeError(`${failurePrefix}: the configuration file no longer exists.`);
-    return undefined;
-  }
-  if (result.status === 'malformed') {
-    writeError(`${failurePrefix}: ${result.message}`);
-    return undefined;
-  }
-  if (result.status === 'unsupported-version') {
-    writeError(`${failurePrefix}: schema version ${result.version} is not supported.`);
-    return undefined;
-  }
-  if (result.status === 'pin-required') {
-    writeError(`${failurePrefix}: Messenger PIN configuration is required.`);
-    return undefined;
-  }
-  return result.configuration;
-}
+type ConfigurationReadResult =
+  | { status: 'valid'; configuration: Configuration }
+  | { status: 'failure'; failure: ConfigurationReadFailure };
 
 type OwnedWriteConfiguration =
   | { status: 'valid'; configuration: Configuration }
   | { status: 'invalid'; reason: string };
 
-function readConfigurationForOwnedWrite(
+function readConfigurationResult(
   configurationFilePath: string | undefined,
-): OwnedWriteConfiguration {
-  let result;
+): ConfigurationReadResult {
+  let result: ConfigurationLoadResult;
   try {
     result = loadConfiguration(configurationFilePath);
   } catch (error) {
-    return {
-      status: 'invalid',
-      reason: `Unable to load configuration: ${error instanceof Error ? error.message : String(error)}`,
-    };
+    return { status: 'failure', failure: { kind: 'error', error } };
   }
 
-  if (result.status === 'missing') {
-    return {
-      status: 'invalid',
-      reason: 'Configuration has not been initialized. Run `impbot init` first.',
-    };
+  switch (result.status) {
+    case 'valid':
+      return { status: 'valid', configuration: result.configuration };
+    case 'missing':
+      return { status: 'failure', failure: { kind: 'missing' } };
+    case 'malformed':
+      return { status: 'failure', failure: { kind: 'malformed', message: result.message } };
+    case 'unsupported-version':
+      return {
+        status: 'failure',
+        failure: { kind: 'unsupported-version', version: result.version },
+      };
+    case 'pin-required':
+      return { status: 'failure', failure: { kind: 'pin-required' } };
   }
-  if (result.status === 'malformed') {
-    return { status: 'invalid', reason: `Configuration is malformed: ${result.message}` };
+}
+
+function describeOwnedWriteFailure(failure: ConfigurationReadFailure): string {
+  switch (failure.kind) {
+    case 'error':
+      return `Unable to load configuration: ${failure.error instanceof Error
+        ? failure.error.message
+        : String(failure.error)}`;
+    case 'missing':
+      return 'Configuration has not been initialized. Run `impbot init` first.';
+    case 'malformed':
+      return `Configuration is malformed: ${failure.message}`;
+    case 'unsupported-version':
+      return `Configuration schema version ${failure.version} is not supported.`;
+    case 'pin-required':
+      return 'Messenger PIN configuration is required. Run `impbot init` to reconfigure it.';
   }
-  if (result.status === 'unsupported-version') {
-    return {
-      status: 'invalid',
-      reason: `Configuration schema version ${result.version} is not supported.`,
-    };
+}
+
+function describePrefixedFailure(
+  failure: ConfigurationReadFailure,
+  failurePrefix: string,
+): string {
+  switch (failure.kind) {
+    case 'error':
+      return `${failurePrefix}: ${failure.error instanceof Error
+        ? failure.error.message
+        : String(failure.error)}`;
+    case 'missing':
+      return `${failurePrefix}: the configuration file no longer exists.`;
+    case 'malformed':
+      return `${failurePrefix}: ${failure.message}`;
+    case 'unsupported-version':
+      return `${failurePrefix}: schema version ${failure.version} is not supported.`;
+    case 'pin-required':
+      return `${failurePrefix}: Messenger PIN configuration is required.`;
   }
-  if (result.status === 'pin-required') {
-    return {
-      status: 'invalid',
-      reason: 'Messenger PIN configuration is required. Run `impbot init` to reconfigure it.',
-    };
+}
+
+function readConfigurationForOwnedWrite(
+  configurationFilePath: string | undefined,
+): OwnedWriteConfiguration {
+  const result = readConfigurationResult(configurationFilePath);
+  if (result.status === 'valid') {
+    return { status: 'valid', configuration: result.configuration };
   }
-  return { status: 'valid', configuration: result.configuration };
+  return { status: 'invalid', reason: describeOwnedWriteFailure(result.failure) };
 }
 
 function loadChangeBrowserConfiguration(
   configurationFilePath: string | undefined,
   writeError: Output,
 ): Configuration | undefined {
-  let result;
-  try {
-    result = loadConfiguration(configurationFilePath);
-  } catch (error) {
-    writeError(`Unable to load configuration: ${error instanceof Error ? error.message : String(error)}`);
-    return undefined;
+  const result = readConfigurationForOwnedWrite(configurationFilePath);
+  if (result.status === 'valid') {
+    return result.configuration;
   }
+  writeError(result.reason);
+  return undefined;
+}
 
-  if (result.status === 'missing') {
-    writeError('Configuration has not been initialized. Run `impbot init` first.');
-    return undefined;
+function loadLatestConfiguration(
+  configurationFilePath: string | undefined,
+  writeError: Output,
+  failurePrefix: string,
+): Configuration | undefined {
+  const result = readConfigurationResult(configurationFilePath);
+  if (result.status === 'valid') {
+    return result.configuration;
   }
-  if (result.status === 'malformed') {
-    writeError(`Configuration is malformed: ${result.message}`);
-    return undefined;
-  }
-  if (result.status === 'unsupported-version') {
-    writeError(`Configuration schema version ${result.version} is not supported.`);
-    return undefined;
-  }
-  if (result.status === 'pin-required') {
-    writeError('Messenger PIN configuration is required. Run `impbot init` to reconfigure it.');
-    return undefined;
-  }
-  return result.configuration;
+  writeError(describePrefixedFailure(result.failure, failurePrefix));
+  return undefined;
 }
 
 async function handleChangeBrowser(
@@ -1350,7 +1357,6 @@ async function handleStart(
   }
 
   const DEBUG_MODE = process.env.IMPRACTICAL_BOT_DEBUG === '1';
-  const ENABLE_DEBUG_AUTO_RESPONSE = false;
   let apiKey = '';
   try {
     const environmentFilePath = resolveNvidiaEnvironmentPath(configurationFilePath);
@@ -1430,7 +1436,7 @@ async function handleStart(
   }
   stopStartupActivity();
   writeOutput(formatTerminalMilestone('BROWSER', 'Browser configuration verified.'));
-  if (!DEBUG_MODE || ENABLE_DEBUG_AUTO_RESPONSE) {
+  if (!DEBUG_MODE) {
     startStartupActivity(
       formatTerminalMilestone('STARTUP', 'Validating NVIDIA API key.'),
       false,
@@ -2013,58 +2019,6 @@ async function handleStart(
           'CONTEXT',
           `Historical context seeded: ${contextStore.getState().size} messages.`,
         ));
-
-        if (ENABLE_DEBUG_AUTO_RESPONSE) {
-          let reply: string | undefined;
-          const debugIdentity = {
-            name: configurationResult.configuration.puppetName ?? '',
-            aliases: aliasData.valids,
-          };
-          const debugSystemInstruction = composeProductionSystemInstruction({
-            identity: debugIdentity,
-            personalityMode: resolveBotPersonalityMode(configurationResult.configuration),
-            customPersonalityInstruction:
-              configurationResult.configuration.customPersonalityInstruction,
-            roster: groupRoster,
-          });
-          try {
-            reply = await (runtime.generateNvidiaReply ?? generateNvidiaReply)(
-              apiKey,
-              backread.messages,
-              {
-                systemInstruction: debugSystemInstruction,
-                identity: debugIdentity,
-                roster: groupRoster,
-              },
-            );
-          } catch (error) {
-            writeError(getSafeNvidiaError(error, 'Unable to generate a Messenger reply.'));
-          }
-          if (reply !== undefined) {
-            writeOutput('Generated reply; checking the composer before automatic send.');
-            try {
-              const composition: ReplyCompositionResult = await (
-                runtime.composeMessengerReply ?? composeMessengerReply
-              )(preparationResult.page, reply);
-              if (composition.status === 'sent') {
-                writeOutput('Send control clicked; delivery is not confirmed.');
-              } else {
-                const failures: Record<typeof composition.reason, string> = {
-                  'composer-region-missing': 'the Thread composer region was not found',
-                  'composer-region-ambiguous': 'the Thread composer region was not unique',
-                  'send-control-missing': 'the matching Send control was not found',
-                  'send-control-ambiguous': 'the matching Send control was not unique',
-                  hidden: 'the matching Send control was hidden',
-                  disabled: 'the matching Send control was disabled',
-                  'payload-too-long': 'the reply exceeded the configured character maximum',
-                };
-                writeError(`Automatic send blocked; ${failures[composition.reason]}. The reply remains unsent.`);
-              }
-            } catch (error) {
-              writeError(`Unable to prepare the Messenger reply: ${error instanceof Error ? error.message : String(error)}`);
-            }
-          }
-        }
 
         startupStage = 'combustion';
         startStartupActivity(

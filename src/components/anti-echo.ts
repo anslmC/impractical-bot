@@ -1,4 +1,5 @@
 import { extractConversationMessageBody } from './conversation-context.js';
+import { escapeRegExp } from './escape-regexp.js';
 
 export interface AntiEchoMessage {
   message: string;
@@ -41,10 +42,6 @@ const TRAILING_EMOJI =
 
 export interface EchoNormalizationOptions {
   participantNames?: readonly string[];
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function normalizeParticipantName(name: string): string {

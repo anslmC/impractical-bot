@@ -31,10 +31,3 @@ const RUNNING_ENGINE_COMMAND_NAMES: ReadonlySet<string> = new Set([
 
 export const RUNNING_ENGINE_COMMANDS: readonly CliCommandDefinition[] =
   CLI_COMMANDS.filter(command => RUNNING_ENGINE_COMMAND_NAMES.has(command.name));
-
-export function formatCliCommand(
-  command: CliCommandDefinition,
-  nameWidth = CLI_COMMAND_NAME_WIDTH,
-): string {
-  return `${command.name.padEnd(nameWidth)}${command.description}`;
-}
