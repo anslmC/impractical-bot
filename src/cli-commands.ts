@@ -14,6 +14,7 @@ export const CLI_COMMANDS: readonly CliCommandDefinition[] = [
   { name: 'setpersonality', description: 'Set bot personality' },
   { name: 'setcomposerslicer', description: 'Configure Composer Slicer' },
   { name: 'updatekey', description: 'Replace the NVIDIA API key' },
+  { name: 'deletealldata', description: 'Delete all local application data' },
   { name: 'start', description: 'Start Impractical Bot' },
   { name: 'pause', description: 'Pause Impractical Bot' },
   { name: 'resume', description: 'Resume Impractical Bot' },

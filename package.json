@@ -1,8 +1,8 @@
 {
   "name": "impractical-bot",
   "version": "1.0.0",
-  "description": "An experimental local Node.js bot project",
-  "license": "ISC",
+  "description": "A local Node.js CLI for a safety-conscious Facebook Messenger bot",
+  "license": "MIT",
   "bin": {
     "impbot": "./dist/src/cli.js"
   },

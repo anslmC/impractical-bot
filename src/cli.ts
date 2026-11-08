@@ -102,6 +102,11 @@ import {
   formatCliHelp,
 } from './cli-help.js';
 import {
+  deleteApplicationDataDirectory,
+  inspectApplicationDataDirectory,
+  type ApplicationDataDirectoryOptions,
+} from './data-directory.js';
+import {
   captureConsoleOutput,
   checkDashboardTerminal,
   DashboardLogBuffer,
@@ -155,6 +160,8 @@ export interface CliRuntimeOptions {
   checkDashboardTerminal?: () => DashboardTerminalCheck;
   startDashboard?: DashboardSessionFactory;
   startDebugView?: typeof startDebugView;
+  resolveConfigurationPaths?: typeof resolveConfigurationPaths;
+  applicationDataOptions?: ApplicationDataDirectoryOptions;
 }
 
 const composerSlicerCommandReference = [
@@ -2335,6 +2342,119 @@ async function handleStop(
   }
 }
 
+async function handleDeleteAllData(
+  writeOutput: Output,
+  writeError: Output,
+  prompt: TerminalPrompt,
+  runtime: CliRuntimeOptions,
+): Promise<number> {
+  let paths;
+  try {
+    paths = (runtime.resolveConfigurationPaths ?? resolveConfigurationPaths)();
+  } catch (error) {
+    writeError(
+      'Unable to resolve the application data directory: ' +
+      `${error instanceof Error ? error.message : String(error)}`,
+    );
+    writeError('No application data was deleted.');
+    return 1;
+  }
+
+  const applicationDataOptions = runtime.applicationDataOptions ?? {};
+  let state;
+  try {
+    state = inspectApplicationDataDirectory(paths, applicationDataOptions);
+  } catch (error) {
+    writeError(
+      'Refusing to delete the application data directory: ' +
+      `${error instanceof Error ? error.message : String(error)}`,
+    );
+    writeError('No application data was deleted.');
+    return 1;
+  }
+
+  if (state === 'missing') {
+    writeOutput(
+      'Nothing to delete. The application data directory does not exist: ' +
+      `${paths.directory}`,
+    );
+    return 0;
+  }
+
+  let runtimeStatus: RuntimeStatusResult;
+  try {
+    runtimeStatus = await (runtime.requestRuntimeStatus ?? requestRuntimeStatus)();
+  } catch (error) {
+    writeError(
+      'Unable to check whether impractical-bot is running: ' +
+      `${error instanceof Error ? error.message : String(error)}`,
+    );
+    writeError('No application data was deleted.');
+    return 1;
+  }
+  if (runtimeStatus.status === 'running') {
+    writeError(
+      'An impractical-bot engine is running for this configuration. Run `impbot stop` before ' +
+      'running `impbot deletealldata`. No application data was deleted.',
+    );
+    return 1;
+  }
+
+  const interactive = runtime.isInteractive?.() ??
+    (stdin.isTTY === true || prompt !== promptTerminal);
+  if (!interactive) {
+    writeError(
+      'Deleting application data requires an interactive terminal. No application data was ' +
+      'deleted.',
+    );
+    return 1;
+  }
+
+  writeOutput([
+    'WARNING: This permanently deletes local Impractical Bot application data.',
+    '',
+    `Target directory: ${paths.directory}`,
+    '',
+    'This removes configuration (config.json), NVIDIA API credentials (.env), stored PIN data, ' +
+      'browser profiles stored inside this directory, and other application-generated files.',
+    'This action cannot be undone.',
+    '',
+    'Browser profiles configured outside this directory are not included and will not be ' +
+      'deleted.',
+    '',
+  ].join('\n'));
+
+  const answer = await prompt('Type DELETE to permanently delete this directory: ');
+  if (answer === null) {
+    writeOutput('Deletion cancelled. No application data was deleted.');
+    return 0;
+  }
+  if (answer !== 'DELETE') {
+    writeOutput('Deletion cancelled. No application data was deleted.');
+    return 0;
+  }
+
+  try {
+    deleteApplicationDataDirectory(paths, applicationDataOptions);
+  } catch (error) {
+    writeError(
+      `Unable to delete the application data directory at ${paths.directory}: ` +
+      `${error instanceof Error ? error.message : String(error)}`,
+    );
+    writeError(
+      'The application data directory may have been partially deleted. Review the directory ' +
+      'and retry after closing any processes that use it.',
+    );
+    return 1;
+  }
+
+  writeOutput(`Deleted application data directory: ${paths.directory}`);
+  writeOutput(
+    'Externally configured browser profiles outside this directory were not deleted.',
+  );
+  return 0;
+}
+
 function getVersion(): string {
   const packagePath = resolve(__dirname, '../../package.json');
   const packageMetadata = JSON.parse(readFileSync(packagePath, 'utf8')) as {
@@ -2412,6 +2532,7 @@ export async function runCli(
       runtime,
     ),
     updatekey: () => handleUpdateKey(writeOutput, writeError, configurationFilePath, runtime),
+    deletealldata: () => handleDeleteAllData(writeOutput, writeError, prompt, runtime),
     start: () => handleStart(writeOutput, writeError, configurationFilePath, runtime, debug),
     pause: () => handlePause(writeOutput, writeError, configurationFilePath, runtime),
     resume: () => handleResume(writeOutput, writeError, configurationFilePath, runtime),
