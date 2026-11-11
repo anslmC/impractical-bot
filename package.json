@@ -1,10 +1,13 @@
 {
-  "name": "impbot",
+  "name": "@anselm000/impbot",
   "version": "1.0.0",
   "description": "A local Node.js CLI for a safety-conscious Facebook Messenger bot",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "bin": {
-    "impbot": "./dist/src/cli.js"
+    "impbot": "dist/src/cli.js"
   },
   "files": [
     "dist/src"

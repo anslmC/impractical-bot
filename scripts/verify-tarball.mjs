@@ -140,8 +140,8 @@ if (typeof manifest !== 'object' || manifest === null || Array.isArray(manifest)
   fail('package.json in the tarball is not a JSON object');
 }
 
-if (manifest.name !== 'impbot') {
-  fail(`expected package name 'impbot', found '${manifest.name}'`);
+if (manifest.name !== '@anselm000/impbot') {
+  fail(`expected package name '@anselm000/impbot', found '${manifest.name}'`);
 }
 
 const allowlistMatches = Array.isArray(manifest.files) &&
