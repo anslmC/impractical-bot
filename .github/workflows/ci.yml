@@ -111,6 +111,7 @@ jobs:
           try {
             $versionOutput = & $executable --version
             $versionExitCode = $LASTEXITCODE
+            Write-Host "impbot --version exit code: $versionExitCode"
             $version = ($versionOutput | Out-String).Trim()
             if ($versionExitCode -ne 0) {
               throw "impbot --version exited with code $versionExitCode."
@@ -121,6 +122,7 @@ jobs:
 
             $helpOutput = & $executable --help
             $helpExitCode = $LASTEXITCODE
+            Write-Host "impbot --help exit code: $helpExitCode"
             $help = ($helpOutput | Out-String)
             if ($helpExitCode -ne 0) {
               throw "impbot --help exited with code $helpExitCode."
@@ -131,12 +133,16 @@ jobs:
 
             $invalidOutput = & $executable definitely-not-a-command 2>&1
             $invalidExitCode = $LASTEXITCODE
+            Write-Host "invalid command exit code: $invalidExitCode"
             if ($invalidExitCode -eq 0) {
               throw "An invalid command unexpectedly exited with code 0."
             }
             if (-not $invalidOutput) {
               throw "An invalid command did not produce an error message."
             }
+
+            $global:LASTEXITCODE = 0
+            Write-Host 'Smoke test passed.'
           } finally {
             Pop-Location
             Remove-Item -LiteralPath $workingDirectory -Recurse -Force -ErrorAction SilentlyContinue
