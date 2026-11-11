@@ -1,18 +1,23 @@
 {
-  "name": "impractical-bot",
+  "name": "impbot",
   "version": "1.0.0",
   "description": "A local Node.js CLI for a safety-conscious Facebook Messenger bot",
   "license": "MIT",
   "bin": {
     "impbot": "./dist/src/cli.js"
   },
+  "files": [
+    "dist/src"
+  ],
   "engines": {
     "node": ">=22.13.0"
   },
   "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "tsc -p tsconfig.json",
     "lint": "eslint .",
-    "test": "npm run build && node --test dist/tests/*.test.js"
+    "test": "npm run build && node --test dist/tests/*.test.js",
+    "prepack": "npm run clean && npm run build"
   },
   "dependencies": {
     "dotenv": "^18.0.8",

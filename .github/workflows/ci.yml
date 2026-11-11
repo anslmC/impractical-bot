@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Build, test, and verify package
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.13.0'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build production CLI and create npm tarball
+        shell: pwsh
+        run: |
+          $packDirectory = Join-Path $env:RUNNER_TEMP 'impbot-package'
+          if (Test-Path -LiteralPath $packDirectory) {
+            Remove-Item -LiteralPath $packDirectory -Recurse -Force
+          }
+          New-Item -ItemType Directory -Force -Path $packDirectory | Out-Null
+
+          npm pack --pack-destination $packDirectory
+          if ($LASTEXITCODE -ne 0) {
+            throw "npm pack failed with exit code $LASTEXITCODE."
+          }
+
+          $tarballs = @(Get-ChildItem -LiteralPath $packDirectory -Filter '*.tgz' -File)
+          if ($tarballs.Count -ne 1) {
+            throw "Expected exactly one npm tarball, found $($tarballs.Count)."
+          }
+
+          "IMPBOT_TARBALL=$($tarballs[0].FullName)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify tarball contents
+        shell: pwsh
+        run: node scripts/verify-tarball.mjs "$env:IMPBOT_TARBALL"
+
+      - name: Install tarball into isolated global prefix
+        shell: pwsh
+        run: |
+          $prefix = Join-Path $env:RUNNER_TEMP 'impbot-global-prefix'
+          if (Test-Path -LiteralPath $prefix) {
+            Remove-Item -LiteralPath $prefix -Recurse -Force
+          }
+          New-Item -ItemType Directory -Force -Path $prefix | Out-Null
+
+          npm install --global --prefix $prefix --no-audit --no-fund $env:IMPBOT_TARBALL
+          if ($LASTEXITCODE -ne 0) {
+            throw "npm install of the tarball failed with exit code $LASTEXITCODE."
+          }
+
+          "IMPBOT_PREFIX=$prefix" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Smoke test installed CLI
+        shell: pwsh
+        run: |
+          $executableCandidates = @(
+            (Join-Path $env:IMPBOT_PREFIX 'impbot.cmd'),
+            (Join-Path $env:IMPBOT_PREFIX 'bin\impbot.cmd'),
+            (Join-Path $env:IMPBOT_PREFIX 'impbot.ps1'),
+            (Join-Path $env:IMPBOT_PREFIX 'bin\impbot.ps1'),
+            (Join-Path $env:IMPBOT_PREFIX 'impbot'),
+            (Join-Path $env:IMPBOT_PREFIX 'bin\impbot')
+          )
+          $executable = $executableCandidates |
+            Where-Object { Test-Path -LiteralPath $_ } |
+            Select-Object -First 1
+          if (-not $executable) {
+            throw "Unable to locate the installed impbot executable under $env:IMPBOT_PREFIX."
+          }
+          Write-Host "Using installed executable: $executable"
+
+          $workingDirectory = Join-Path $env:RUNNER_TEMP 'impbot-smoke-cwd'
+          if (Test-Path -LiteralPath $workingDirectory) {
+            Remove-Item -LiteralPath $workingDirectory -Recurse -Force
+          }
+          New-Item -ItemType Directory -Force -Path $workingDirectory | Out-Null
+
+          $expectedVersion = (
+            node -e "process.stdout.write(require(process.env.GITHUB_WORKSPACE + '/package.json').version)"
+          ).Trim()
+
+          Push-Location $workingDirectory
+          try {
+            $versionOutput = & $executable --version
+            $versionExitCode = $LASTEXITCODE
+            $version = ($versionOutput | Out-String).Trim()
+            if ($versionExitCode -ne 0) {
+              throw "impbot --version exited with code $versionExitCode."
+            }
+            if ($version -ne $expectedVersion) {
+              throw "Version mismatch: expected '$expectedVersion', received '$version'."
+            }
+
+            $helpOutput = & $executable --help
+            $helpExitCode = $LASTEXITCODE
+            $help = ($helpOutput | Out-String)
+            if ($helpExitCode -ne 0) {
+              throw "impbot --help exited with code $helpExitCode."
+            }
+            if ($help -notmatch 'Usage' -or $help -notmatch 'impbot') {
+              throw "impbot --help did not print the expected usage output."
+            }
+
+            $invalidOutput = & $executable definitely-not-a-command 2>&1
+            $invalidExitCode = $LASTEXITCODE
+            if ($invalidExitCode -eq 0) {
+              throw "An invalid command unexpectedly exited with code 0."
+            }
+            if (-not $invalidOutput) {
+              throw "An invalid command did not produce an error message."
+            }
+          } finally {
+            Pop-Location
+            Remove-Item -LiteralPath $workingDirectory -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Clean up temporary package artifacts
+        if: always()
+        shell: pwsh
+        run: |
+          $knownPrefix = Join-Path $env:RUNNER_TEMP 'impbot-global-prefix'
+          $paths = @(
+            $knownPrefix,
+            (Join-Path $env:RUNNER_TEMP 'impbot-package'),
+            (Join-Path $env:RUNNER_TEMP 'impbot-smoke-cwd')
+          )
+          if ($env:IMPBOT_PREFIX -and $env:IMPBOT_PREFIX -ne $knownPrefix) {
+            $paths += $env:IMPBOT_PREFIX
+          }
+          foreach ($path in $paths) {
+            if (Test-Path -LiteralPath $path) {
+              Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
