@@ -1,6 +1,12 @@
+<p align="center">
+  <img src="assets/readme-wordmark.svg" alt="Impractical Bot block-letter wordmark with the tagline Messenger Conversation Engine" width="740">
+</p>
+
 # impractical-bot
 
 A local Node.js CLI for a safety-conscious Facebook Messenger bot. It observes messages, answers explicitly incoming mentions, and can participate through a temperament-driven RNG path.
+
+Published as [`@anselm000/impbot`](https://www.npmjs.com/package/@anselm000/impbot). The installed command is `impbot`.
 
 ## Overview
 
@@ -8,22 +14,36 @@ In normal operation, the CLI validates the NVIDIA API key, launches and prepares
 
 The runtime launches the configured browser with a dedicated profile and connects Playwright through a loopback-only CDP endpoint. It tracks ownership of the browser process it launches and does not terminate unrelated browser instances. Continuous observation, mention replies, and RNG participation run through the same engine.
 
-The standalone JavaScript maintenance utilities in `Tools/utilities/` are optional local tools and are not part of the CLI build. Brave, Google Chrome, and Microsoft Edge are supported; Firefox is not. See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime pipeline and current limitations.
+The standalone JavaScript maintenance utilities in `Tools/utilities/` (source repository only) are optional local tools and are not part of the CLI build. See [Requirements](#requirements) for supported browsers and operating systems, and [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime pipeline and current limitations.
 
 ## Requirements
 
-- Node.js 22.13 or newer
+- Windows (the CLI uses Windows paths, local browser discovery, and PowerShell process checks)
+- Node.js 22.13.0 or newer
 - npm compatible with the installed Node.js release
+- Brave, Google Chrome, or Microsoft Edge installed; Firefox is not supported
+- A Facebook/Messenger account with access to the conversation you want to use
+- An NVIDIA API key accepted by NVIDIA's chat completions API
+- Network access to Facebook/Messenger and NVIDIA
 
 ## Installation
 
+Install the published package globally:
+
 ```powershell
-npm install
-npm run build
-npm link
+npm install -g @anselm000/impbot
+impbot --version
 ```
 
-`npm link` links the local package into your global npm prefix so the `impbot` command is available. Run `impbot --help` to verify the installation.
+This installs `@anselm000/impbot` and makes the `impbot` command available. Run `impbot --help` to see the full command list.
+
+## Initial setup
+
+1. Run `impbot init`.
+2. Select a supported browser and enter the Messenger conversation URL you want the bot to watch. You can copy it from the conversation's address bar in Messenger; the destination must be a Messenger conversation URL such as `https://www.facebook.com/messages/t/<conversation-id>`. The bot uses a dedicated browser profile, separate from your normal browser profile, so your existing browser session is not reused.
+3. Choose the bot temperament and personality, and decide whether to skip Messenger PIN restoration. If you enable PIN restoration, have the six-digit Messenger PIN ready; it is stored locally in plaintext in `config.json` (see [Security](#security)).
+4. Enter your NVIDIA API key when prompted. `impbot init` validates the key before saving it to the application's `.env` file.
+5. Start the bot with `impbot start`. If the managed browser profile is not signed in, sign in to Facebook/Messenger in that browser window. Startup waits for login, handles the Messenger startup dialogs, seeds context from recent messages, and then begins observing the conversation.
 
 ## Usage
 
@@ -33,16 +53,40 @@ impbot start
 impbot pause
 impbot resume
 impbot stop
+impbot config
+impbot updatekey
 impbot deletealldata
 ```
 
-`impbot init` configures the browser, Messenger destination, bot temperament, personality, and optional Messenger PIN restoration. `impbot config` prints the current configuration. `impbot updatekey` replaces the NVIDIA API key, and `impbot start --debug` opens the debug log view. Run `impbot --help` for the full command list.
+`impbot init` configures the browser, Messenger destination, bot temperament, personality, and optional Messenger PIN restoration. `impbot config` prints the current configuration; it does not change settings. `impbot updatekey` replaces the NVIDIA API key, and `impbot start --debug` starts the bot in the debug log view. Run `impbot --help` for the full command list.
+
+Other configuration commands are `impbot changebrowser`, `impbot changemsgUrl`, `impbot setbottemp`, and `impbot setpersonality`. Composer Slicer uses `impbot setcomposerslicer enabled <true|false>`, `impbot setcomposerslicer maxCharacters <positive-integer>`, or `impbot setcomposerslicer status`; changes to Composer Slicer take effect after the engine restarts. `impbot changebrowser` stops a running engine before saving the new browser.
 
 `impbot deletealldata` permanently deletes the default local application data directory at `%LOCALAPPDATA%\Impractical Bot`. This removes application configuration, locally stored NVIDIA credentials, default browser profiles and session data, and other application-generated files within that directory. The command requires you to type `DELETE` to confirm and refuses to run while the bot engine is active; run `impbot stop` first. Browser profiles stored outside the application data directory are not included. This command does not uninstall the application or remove its npm package.
+
+## Troubleshooting
+
+- `impbot` is not recognized: Reopen the terminal after installation so the updated PATH is loaded, then run `impbot --help`. If it still fails, check that your npm global prefix is on PATH.
+- `Configuration has not been initialized`: Run `impbot init`.
+- `NVIDIA API key is missing` or key validation fails: Run `impbot updatekey` with a valid NVIDIA API key. Normal `impbot start` validates the key before launching the browser.
+- An engine is already running: Run `impbot stop` before `impbot init`, `impbot updatekey`, or `impbot deletealldata`. If a command stopped the engine, wait for its window to exit before retrying.
+- Browser discovery fails or the configured browser is missing: Install Brave, Google Chrome, or Microsoft Edge, then run `impbot init` or `impbot changebrowser`.
+- Login, PIN, or destination errors: Complete Facebook/Messenger sign-in in the managed browser window. Make sure the destination is a Messenger conversation URL, and check the PIN if PIN restoration is enabled.
+- For startup diagnostics, run `impbot start --debug` to use the debug log view.
 
 ## Development
 
 The runtime is written in TypeScript under `src/`, compiled for Node.js using the NodeNext module model. Automated tests use Node's built-in test runner. Standalone maintenance utilities remain in `Tools/utilities/` and are not part of the production build.
+
+For contributors working from a source checkout:
+
+```powershell
+npm install
+npm run build
+npm link
+```
+
+`npm link` makes the local build available as `impbot`. For normal use, install the published package as described under [Installation](#installation) instead.
 
 - `npm run build` compiles TypeScript into `dist/`.
 - `npm run lint` runs ESLint against the project, excluding `Tools/` and generated output.
@@ -54,7 +98,7 @@ Automated tests cover the offline runtime pipeline. They do not validate live Me
 
 ## Local Data and Secrets
 
-The configuration is stored under `%LOCALAPPDATA%\Impractical Bot` on Windows by default. The bot temperament (`quiet`, `balanced`, or `talkative`) is saved in `config.json` and sets RNG probability/cooldown independently: Quiet is 10%/25 seconds, Balanced is 50%/15 seconds, and Talkative is 95%/6 seconds; `balanced` is the default. These settings do not change the 1500 ms runtime poll interval. The NVIDIA API key is stored as `NVIDIA_API_KEY` in an ignored `.env` file beside `config.json`; a custom configuration path uses its containing directory. `init` and `updatekey` validate keys before saving. Normal `start` validates the application key before launching the browser; setting `IMPRACTICAL_BOT_DEBUG=1` skips that validation for local troubleshooting. Shell-provided `NVIDIA_API_KEY` values are not used. Credentials, recovery PINs, API keys, browser session data, and runtime state must remain outside the repository.
+The configuration is stored under `%LOCALAPPDATA%\Impractical Bot` on Windows by default. The bot temperament (`quiet`, `balanced`, or `talkative`) is saved in `config.json` and sets RNG probability/cooldown independently: Quiet is 10%/25 seconds, Balanced is 50%/15 seconds, and Talkative is 95%/6 seconds; `balanced` is the default. These settings do not change the 1500 ms runtime poll interval. The NVIDIA API key is stored as `NVIDIA_API_KEY` in an `.env` file beside `config.json`. `init` and `updatekey` validate keys before saving. Normal `start` validates the application key before launching the browser; setting `IMPRACTICAL_BOT_DEBUG=1` skips that validation for local troubleshooting. Shell-provided `NVIDIA_API_KEY` values are not used. Credentials, recovery PINs, API keys, browser session data, and runtime state must remain outside the repository.
 
 See [Privacy](#privacy) and [Security](#security) below for the full data-flow, logging, and deletion details.
 
@@ -86,7 +130,7 @@ By default, application data is stored under `%LOCALAPPDATA%\Impractical Bot` on
 - The running engine uses a local named pipe for control and status requests, including pause, resume, stop, destination changes, temperament changes, personality changes, and status polling. It is not a file and disappears when the engine exits.
 - Atomic configuration writes briefly create a hidden temporary file in the same directory; it is removed after a successful write and on handled failures.
 
-If you use a custom configuration path, these files are stored beside that path instead. The `profilePath` recorded in `config.json` is the authoritative location of the browser profile.
+The published CLI uses this default location. If the CLI is run with a non-default configuration path, these files are stored beside that path instead. The `profilePath` recorded in `config.json` is the authoritative location of the browser profile.
 
 ### Logging
 
