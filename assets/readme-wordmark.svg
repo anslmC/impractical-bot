@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="740" height="120" viewBox="0 0 740 120" role="img" aria-labelledby="wordmark-title wordmark-desc" shape-rendering="crispEdges">
+<svg xmlns="http://www.w3.org/2000/svg" width="780" height="156" viewBox="0 0 780 156" role="img" aria-labelledby="wordmark-title wordmark-desc" shape-rendering="crispEdges">
   <title id="wordmark-title">Impractical Bot</title>
   <desc id="wordmark-desc">Block-letter wordmark with the tagline MESSENGER CONVERSATION ENGINE.</desc>
-  <rect width="740" height="120" fill="#0c0c0c"/>
+  <rect width="780" height="156" fill="#0c0c0c"/>
+  <g transform="translate(20,20)">
   <g fill="#ffffff">
     <rect x="0" y="0" width="10" height="20"/>
     <rect x="10" y="0" width="10" height="20"/>
@@ -180,5 +181,6 @@
     <rect x="710" y="80" width="10" height="20"/>
     <rect x="720" y="80" width="10" height="20"/>
   </g>
-  <text x="220" y="116" fill="#666666" font-family="ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace" font-size="16" textLength="290" lengthAdjust="spacing">MESSENGER CONVERSATION ENGINE</text>
+  <text x="225" y="116" fill="#666666" font-family="ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace" font-size="16" textLength="290" lengthAdjust="spacing">MESSENGER CONVERSATION ENGINE</text>
+  </g>
 </svg>
